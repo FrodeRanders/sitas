@@ -1,6 +1,6 @@
 use std::thread;
 
-use shardstar::ShardedKv;
+use sitas::ShardedKv;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kv = ShardedKv::start(4)?;

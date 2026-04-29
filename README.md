@@ -1,6 +1,6 @@
-# shardstar
+# Sitas
 
-`shardstar` is a small Rust experiment in shard-local service ownership, typed
+`sitas` is a small Rust experiment in shard-local service ownership, typed
 message passing, and executor internals.
 
 The project is inspired by Seastar's shard-per-core, shared-nothing model, but
@@ -79,7 +79,7 @@ later low-level runtime work, especially for CPU affinity and `io_uring`.
 ## Example
 
 ```rust
-use shardstar::{ShardId, ShardedKv};
+use sitas::{ShardId, ShardedKv};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kv = ShardedKv::start(4)?;

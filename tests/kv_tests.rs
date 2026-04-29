@@ -1,5 +1,5 @@
-use shardstar::placement::Placement;
-use shardstar::{RuntimeSnapshot, ShardError, ShardId, ShardSnapshot, ShardedKv, ShardedKvConfig};
+use sitas::placement::Placement;
+use sitas::{RuntimeSnapshot, ShardError, ShardId, ShardSnapshot, ShardedKv, ShardedKvConfig};
 use std::error::Error;
 use std::thread;
 use std::time::Duration;
@@ -25,7 +25,7 @@ fn starting_with_one_shard_succeeds() {
     let kv = ShardedKv::start(1).unwrap();
 
     assert_eq!(kv.shard_count(), 1);
-    assert_eq!(kv.mailbox_capacity(), shardstar::DEFAULT_MAILBOX_CAPACITY);
+    assert_eq!(kv.mailbox_capacity(), sitas::DEFAULT_MAILBOX_CAPACITY);
 
     kv.stop().unwrap();
 }

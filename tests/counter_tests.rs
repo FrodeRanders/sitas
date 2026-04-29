@@ -1,4 +1,4 @@
-use shardstar::{
+use sitas::{
     CounterShardSnapshot, RuntimeSnapshot, ShardError, ShardId, ShardedCounter,
     ShardedCounterConfig, DEFAULT_MAILBOX_CAPACITY,
 };

@@ -1,4 +1,4 @@
-//! `shardstar` is an experiment in Rust-native shard-local service ownership.
+//! `sitas` is an experiment in Rust-native shard-local service ownership.
 //!
 //! The project is inspired by Seastar's shard-per-core, shared-nothing model,
 //! but this first milestone deliberately uses only the Rust standard library to

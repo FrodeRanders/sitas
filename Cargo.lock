@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "shardstar"
+name = "sitas"
 version = "0.1.0"

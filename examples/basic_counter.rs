@@ -1,4 +1,4 @@
-use shardstar::{ShardId, ShardedCounter};
+use sitas::{ShardId, ShardedCounter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let counter = ShardedCounter::start(4)?;

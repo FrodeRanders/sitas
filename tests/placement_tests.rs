@@ -1,5 +1,5 @@
-use shardstar::placement::{shard_for_hash, HashPlacement, Placement};
-use shardstar::{ShardId, ShardedKv};
+use sitas::placement::{shard_for_hash, HashPlacement, Placement};
+use sitas::{ShardId, ShardedKv};
 
 #[test]
 fn shard_for_hash_returns_shard_inside_range() {

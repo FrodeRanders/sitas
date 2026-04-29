@@ -1,5 +1,5 @@
-use shardstar::placement::Placement;
-use shardstar::{ShardId, ShardedKv, ShardedKvConfig};
+use sitas::placement::Placement;
+use sitas::{ShardId, ShardedKv, ShardedKvConfig};
 
 #[derive(Debug, Clone, Copy)]
 struct FirstBytePlacement;

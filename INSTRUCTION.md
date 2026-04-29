@@ -1,4 +1,4 @@
-You are helping me create a new Rust project called `shardstar`.
+You are helping me create a new Rust project called `sitas`.
 
 The goal is to experiment with a Rust-native architecture inspired by Seastar, but not to clone Seastar directly.
 
@@ -64,11 +64,11 @@ The first concrete service should be a sharded key-value store.
 
 Project name:
 
-    shardstar
+    sitas
 
 Suggested layout:
 
-    shardstar/
+    sitas/
       Cargo.toml
       src/
         lib.rs
@@ -440,7 +440,7 @@ Create:
 
 Example:
 
-    use shardstar::{ShardId, ShardedKv};
+    use sitas::{ShardId, ShardedKv};
 
     fn main() -> Result<(), Box<dyn std::error::Error>> {
         let kv = ShardedKv::start(4)?;
@@ -581,7 +581,7 @@ Milestone 8: CPU pinning
 Milestone 9: Procedural macro service generation
 
 - Add a separate crate:
-      shardstar-macros
+      sitas-macros
 - Generate command enums and client stubs from a service trait.
 - Example future target:
 

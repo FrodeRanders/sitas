@@ -471,7 +471,7 @@ impl HasShardId for KvShardHandle {
 /// then block until that shard replies.
 ///
 /// ```
-/// use shardstar::ShardedKv;
+/// use sitas::ShardedKv;
 ///
 /// let kv = ShardedKv::start(2)?;
 ///
@@ -479,7 +479,7 @@ impl HasShardId for KvShardHandle {
 /// assert_eq!(kv.get("alpha")?, Some("one".to_string()));
 ///
 /// kv.stop()?;
-/// # Ok::<(), shardstar::ShardError>(())
+/// # Ok::<(), sitas::ShardError>(())
 /// ```
 pub struct ShardedKv<P = HashPlacement> {
     shards: ShardSet<KvShardHandle>,
@@ -503,7 +503,7 @@ impl ShardedKv<HashPlacement> {
     /// Returns [`ShardError::InvalidShardCount`] when `shard_count` is zero.
     ///
     /// ```
-    /// use shardstar::{ShardError, ShardedKv};
+    /// use sitas::{ShardError, ShardedKv};
     ///
     /// assert_eq!(
     ///     ShardedKv::start(0).unwrap_err(),
