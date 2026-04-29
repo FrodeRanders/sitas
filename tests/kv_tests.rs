@@ -1,7 +1,17 @@
+use shardstar::placement::Placement;
 use shardstar::{RuntimeSnapshot, ShardError, ShardId, ShardSnapshot, ShardedKv, ShardedKvConfig};
 use std::error::Error;
 use std::thread;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy)]
+struct FirstShardPlacement;
+
+impl Placement<str> for FirstShardPlacement {
+    fn shard_for(&self, _key: &str, _shard_count: usize) -> ShardId {
+        ShardId(0)
+    }
+}
 
 #[test]
 fn starting_with_zero_shards_fails() {
@@ -49,6 +59,30 @@ fn starting_with_config_succeeds() {
 }
 
 #[test]
+fn starting_with_custom_placement_routes_keys_through_strategy() {
+    let kv = ShardedKv::start_with_placement(
+        ShardedKvConfig::new(4).with_mailbox_capacity(4),
+        FirstShardPlacement,
+    )
+    .unwrap();
+
+    assert_eq!(kv.shard_for_key("alpha"), ShardId(0));
+    assert_eq!(kv.shard_for_key("beta"), ShardId(0));
+
+    kv.put("alpha", "one").unwrap();
+    kv.put("beta", "two").unwrap();
+
+    assert_eq!(kv.len_on_shard(ShardId(0)).unwrap(), 2);
+    assert_eq!(kv.total_len().unwrap(), 2);
+
+    for shard_idx in 1..kv.shard_count() {
+        assert_eq!(kv.len_on_shard(ShardId(shard_idx)).unwrap(), 0);
+    }
+
+    kv.stop().unwrap();
+}
+
+#[test]
 fn starting_with_zero_mailbox_capacity_fails() {
     let result = ShardedKv::start_with_config(ShardedKvConfig::new(1).with_mailbox_capacity(0));
 
@@ -74,6 +108,76 @@ fn try_put_and_try_get_work_when_mailbox_has_capacity() {
     kv.try_put("alpha", "one").unwrap();
 
     assert_eq!(kv.try_get("alpha").unwrap(), Some("one".to_string()));
+
+    kv.stop().unwrap();
+}
+
+#[test]
+fn get_many_returns_owned_values_in_input_order() {
+    let kv = ShardedKv::start(4).unwrap();
+
+    kv.put("alpha", "one").unwrap();
+    kv.put("beta", "two").unwrap();
+    kv.put("gamma", "three").unwrap();
+
+    assert_eq!(
+        kv.get_many(["gamma", "missing", "alpha", "beta"]).unwrap(),
+        vec![
+            ("gamma".to_string(), Some("three".to_string())),
+            ("missing".to_string(), None),
+            ("alpha".to_string(), Some("one".to_string())),
+            ("beta".to_string(), Some("two".to_string())),
+        ]
+    );
+
+    kv.stop().unwrap();
+}
+
+#[test]
+fn submit_get_many_can_wait_later() {
+    let kv = ShardedKv::start(4).unwrap();
+
+    kv.put("alpha", "one").unwrap();
+    kv.put("beta", "two").unwrap();
+
+    let reply = kv.submit_get_many(["beta", "alpha", "missing"]).unwrap();
+
+    assert_eq!(
+        reply.wait().unwrap(),
+        vec![
+            ("beta".to_string(), Some("two".to_string())),
+            ("alpha".to_string(), Some("one".to_string())),
+            ("missing".to_string(), None),
+        ]
+    );
+
+    kv.stop().unwrap();
+}
+
+#[test]
+fn try_get_many_and_try_submit_get_many_work() {
+    let kv =
+        ShardedKv::start_with_config(ShardedKvConfig::new(3).with_mailbox_capacity(4)).unwrap();
+
+    kv.put("alpha", "one").unwrap();
+    kv.put("beta", "two").unwrap();
+
+    assert_eq!(
+        kv.try_get_many(["alpha", "missing"]).unwrap(),
+        vec![
+            ("alpha".to_string(), Some("one".to_string())),
+            ("missing".to_string(), None),
+        ]
+    );
+
+    let reply = kv.try_submit_get_many(["beta", "alpha"]).unwrap();
+    assert_eq!(
+        reply.wait().unwrap(),
+        vec![
+            ("beta".to_string(), Some("two".to_string())),
+            ("alpha".to_string(), Some("one".to_string())),
+        ]
+    );
 
     kv.stop().unwrap();
 }
@@ -265,6 +369,81 @@ fn submit_delete_can_wait_later() {
 
     assert_eq!(delete.wait().unwrap(), Some("one".to_string()));
     assert_eq!(kv.get("alpha").unwrap(), None);
+
+    kv.stop().unwrap();
+}
+
+#[test]
+fn delete_many_returns_previous_values_in_input_order() {
+    let kv = ShardedKv::start(4).unwrap();
+
+    kv.put("alpha", "one").unwrap();
+    kv.put("beta", "two").unwrap();
+    kv.put("gamma", "three").unwrap();
+
+    assert_eq!(
+        kv.delete_many(["gamma", "missing", "alpha", "beta"])
+            .unwrap(),
+        vec![
+            ("gamma".to_string(), Some("three".to_string())),
+            ("missing".to_string(), None),
+            ("alpha".to_string(), Some("one".to_string())),
+            ("beta".to_string(), Some("two".to_string())),
+        ]
+    );
+    assert_eq!(kv.total_len().unwrap(), 0);
+
+    kv.stop().unwrap();
+}
+
+#[test]
+fn submit_delete_many_can_wait_later() {
+    let kv = ShardedKv::start(4).unwrap();
+
+    kv.put("alpha", "one").unwrap();
+    kv.put("beta", "two").unwrap();
+
+    let reply = kv.submit_delete_many(["beta", "alpha", "missing"]).unwrap();
+
+    assert_eq!(
+        reply.wait().unwrap(),
+        vec![
+            ("beta".to_string(), Some("two".to_string())),
+            ("alpha".to_string(), Some("one".to_string())),
+            ("missing".to_string(), None),
+        ]
+    );
+    assert_eq!(kv.total_len().unwrap(), 0);
+
+    kv.stop().unwrap();
+}
+
+#[test]
+fn try_delete_many_and_try_submit_delete_many_work() {
+    let kv =
+        ShardedKv::start_with_config(ShardedKvConfig::new(3).with_mailbox_capacity(4)).unwrap();
+
+    kv.put("alpha", "one").unwrap();
+    kv.put("beta", "two").unwrap();
+    kv.put("gamma", "three").unwrap();
+
+    assert_eq!(
+        kv.try_delete_many(["alpha", "missing"]).unwrap(),
+        vec![
+            ("alpha".to_string(), Some("one".to_string())),
+            ("missing".to_string(), None),
+        ]
+    );
+
+    let reply = kv.try_submit_delete_many(["gamma", "beta"]).unwrap();
+    assert_eq!(
+        reply.wait().unwrap(),
+        vec![
+            ("gamma".to_string(), Some("three".to_string())),
+            ("beta".to_string(), Some("two".to_string())),
+        ]
+    );
+    assert_eq!(kv.total_len().unwrap(), 0);
 
     kv.stop().unwrap();
 }

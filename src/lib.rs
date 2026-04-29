@@ -1,10 +1,10 @@
 //! `shardstar` is an experiment in Rust-native shard-local service ownership.
 //!
 //! The project is inspired by Seastar's shard-per-core, shared-nothing model,
-//! but this first milestone is not an async runtime. It deliberately uses only
-//! the Rust standard library to validate a small architectural kernel:
-//! shard-local ownership, bounded mailboxes, reply handles, and typed message
-//! passing.
+//! but this first milestone deliberately uses only the Rust standard library to
+//! validate small architectural kernels: shard-local ownership, bounded
+//! mailboxes, reply handles, typed message passing, and a minimal executor
+//! experiment.
 //!
 //! Application state is owned by a shard thread. Other threads interact with
 //! that state only by sending typed messages to the owning shard. No mutex
@@ -14,9 +14,7 @@
 //!
 //! This first milestone deliberately does not include:
 //!
-//! - async/await
 //! - non-blocking I/O
-//! - a custom executor
 //! - a network server
 //! - persistence
 //! - CPU pinning
@@ -33,6 +31,8 @@
 pub mod counter;
 /// Error types returned by shard operations.
 pub mod error;
+/// Minimal standard-library async executor experiment.
+pub mod executor;
 /// Sharded key-value store implementation.
 pub mod kv;
 /// Key-to-shard placement helpers.
@@ -48,7 +48,8 @@ pub use counter::{
 };
 pub use error::ShardError;
 pub use kv::{
-    KvAllKeysReply, KvReply, KvShardSnapshotsReply, KvTotalLenReply, ShardedKv, ShardedKvConfig,
+    KvAllKeysReply, KvDeleteManyReply, KvGetManyReply, KvReply, KvShardSnapshotsReply,
+    KvTotalLenReply, ShardedKv, ShardedKvConfig,
 };
 pub use runtime::{RuntimeSnapshot, DEFAULT_MAILBOX_CAPACITY};
 pub use shard::{ShardId, ShardSnapshot};

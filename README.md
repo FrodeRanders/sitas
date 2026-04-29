@@ -1,11 +1,11 @@
 # shardstar
 
-`shardstar` is a small Rust experiment in shard-local service ownership and
-typed message passing.
+`shardstar` is a small Rust experiment in shard-local service ownership, typed
+message passing, and executor internals.
 
 The project is inspired by Seastar's shard-per-core, shared-nothing model, but
-this first milestone is intentionally much smaller. It is not an async runtime
-and it does not attempt to clone Seastar.
+this first milestone is intentionally much smaller. It does not attempt to clone
+Seastar.
 
 ## First Milestone
 
@@ -13,6 +13,7 @@ The current version implements a sharded key-value store using only the Rust
 standard library:
 
 - a small reusable std-only runtime layer
+- a minimal std-only executor experiment with custom wakers and join handles
 - one OS thread per shard
 - one mailbox per shard
 - bounded shard mailboxes
@@ -20,7 +21,7 @@ standard library:
 - typed internal commands
 - blocking request/reply with `std::sync::mpsc`
 - local service state owned by the shard thread
-- key-based routing to shards
+- key-based routing through default hash placement or caller-provided placement
 - clean shutdown through `ShardedKv::stop`
 - non-consuming shutdown for post-shutdown runtime inspection
 - best-effort shutdown on drop if `stop` is not called
@@ -28,6 +29,7 @@ standard library:
 - `try_*` operations that report a full mailbox instead of waiting for capacity
 - `submit_*` operations that enqueue a command and return a reply handle for
   waiting later
+- multi-key reads and deletes that preserve caller-provided key order
 - owned per-shard snapshots for observing distribution without sharing state
 - owned key snapshots for debugging and inspection
 - shard-local compare-and-put for atomic conditional updates
@@ -52,11 +54,10 @@ and shutdown model.
 
 This milestone does not include:
 
-- async/await
 - Tokio, Glommio, Monoio, or other async runtimes
 - actor frameworks
 - non-blocking I/O
-- a custom executor
+- production-ready async I/O
 - networking
 - persistence
 - CPU pinning
@@ -64,8 +65,8 @@ This milestone does not include:
 - procedural macro service generation
 - `unsafe`
 
-Later milestones may add async I/O, custom executors, CPU affinity,
-backpressure, and OS-specific runtime backends.
+Later milestones may connect the executor experiment to shard replies, add
+async I/O, CPU affinity, backpressure, and OS-specific runtime backends.
 
 ## Platform Notes
 
@@ -116,6 +117,12 @@ Run the submit-and-wait-later example:
 cargo run --example submit_kv
 ```
 
+Run the custom placement example:
+
+```sh
+cargo run --example custom_placement
+```
+
 Run the counter example:
 
 ```sh
@@ -134,5 +141,6 @@ cargo doc --no-deps
 cargo run --example basic_kv
 cargo run --example concurrent_kv
 cargo run --example submit_kv
+cargo run --example custom_placement
 cargo run --example basic_counter
 ```

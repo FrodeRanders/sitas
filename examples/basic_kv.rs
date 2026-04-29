@@ -26,7 +26,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("snapshots: {:?}", kv.shard_snapshots()?);
+    println!(
+        "selected values: {:?}",
+        kv.get_many(["gamma", "alpha", "missing"])?
+    );
     println!("all keys: {:?}", kv.all_keys()?);
+    println!("deleted values: {:?}", kv.delete_many(["delta", "beta"])?);
+    println!("all keys after delete: {:?}", kv.all_keys()?);
     println!("total keys: {}", kv.total_len()?);
 
     kv.stop()?;

@@ -1,4 +1,4 @@
-use shardstar::placement::shard_for_hash;
+use shardstar::placement::{shard_for_hash, HashPlacement, Placement};
 use shardstar::{ShardId, ShardedKv};
 
 #[test]
@@ -18,6 +18,22 @@ fn shard_for_hash_is_repeatable_for_same_key_and_shard_count() {
     let second = shard_for_hash(&"alpha", 8);
 
     assert_eq!(first, second);
+}
+
+#[test]
+fn hash_placement_matches_shard_for_hash() {
+    let placement = HashPlacement;
+
+    for shard_count in 1..16 {
+        for idx in 0..100 {
+            let key = format!("key-{idx}");
+
+            assert_eq!(
+                placement.shard_for(&key, shard_count),
+                shard_for_hash(&key, shard_count)
+            );
+        }
+    }
 }
 
 #[test]

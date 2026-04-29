@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::placement::shard_for_hash;
+use crate::placement::{HashPlacement, Placement};
 use crate::runtime::{HasShardId, Reply, RuntimeSnapshot, ShardConfig, ShardMailbox, ShardSet};
 use crate::{ShardError, ShardId, ShardSnapshot};
 
@@ -172,6 +172,81 @@ impl KvAllKeysReply {
         )?;
         keys.sort();
         Ok(keys)
+    }
+}
+
+/// Reply handle for a multi-key get request.
+///
+/// Calling [`KvGetManyReply::wait`] waits for each accepted get command and
+/// returns owned key/value pairs in the same order the keys were submitted.
+#[must_use]
+#[derive(Debug)]
+pub struct KvGetManyReply {
+    replies: Vec<(String, KvReply<Option<String>>)>,
+}
+
+impl KvGetManyReply {
+    fn new(replies: Vec<(String, KvReply<Option<String>>)>) -> Self {
+        Self { replies }
+    }
+
+    /// Waits for all key replies and returns results in input order.
+    pub fn wait(self) -> Result<Vec<(String, Option<String>)>, ShardError> {
+        self.replies
+            .into_iter()
+            .map(|(key, reply)| Ok((key, reply.wait()?)))
+            .collect()
+    }
+
+    /// Waits for all key replies until `timeout` expires for one reply.
+    ///
+    /// The timeout is applied per pending key reply.
+    pub fn wait_timeout(
+        self,
+        timeout: Duration,
+    ) -> Result<Vec<(String, Option<String>)>, ShardError> {
+        self.replies
+            .into_iter()
+            .map(|(key, reply)| Ok((key, reply.wait_timeout(timeout)?)))
+            .collect()
+    }
+}
+
+/// Reply handle for a multi-key delete request.
+///
+/// Calling [`KvDeleteManyReply::wait`] waits for each accepted delete command
+/// and returns owned key/previous-value pairs in the same order the keys were
+/// submitted.
+#[must_use]
+#[derive(Debug)]
+pub struct KvDeleteManyReply {
+    replies: Vec<(String, KvReply<Option<String>>)>,
+}
+
+impl KvDeleteManyReply {
+    fn new(replies: Vec<(String, KvReply<Option<String>>)>) -> Self {
+        Self { replies }
+    }
+
+    /// Waits for all delete replies and returns results in input order.
+    pub fn wait(self) -> Result<Vec<(String, Option<String>)>, ShardError> {
+        self.replies
+            .into_iter()
+            .map(|(key, reply)| Ok((key, reply.wait()?)))
+            .collect()
+    }
+
+    /// Waits for all delete replies until `timeout` expires for one reply.
+    ///
+    /// The timeout is applied per pending delete reply.
+    pub fn wait_timeout(
+        self,
+        timeout: Duration,
+    ) -> Result<Vec<(String, Option<String>)>, ShardError> {
+        self.replies
+            .into_iter()
+            .map(|(key, reply)| Ok((key, reply.wait_timeout(timeout)?)))
+            .collect()
     }
 }
 
@@ -406,22 +481,23 @@ impl HasShardId for KvShardHandle {
 /// kv.stop()?;
 /// # Ok::<(), shardstar::ShardError>(())
 /// ```
-pub struct ShardedKv {
+pub struct ShardedKv<P = HashPlacement> {
     shards: ShardSet<KvShardHandle>,
+    placement: P,
     stopped: bool,
 }
 
-impl fmt::Debug for ShardedKv {
+impl<P> fmt::Debug for ShardedKv<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ShardedKv")
-            .field("shard_count", &self.shard_count())
-            .field("mailbox_capacity", &self.mailbox_capacity())
+            .field("shard_count", &self.shards.len())
+            .field("mailbox_capacity", &self.shards.mailbox_capacity())
             .field("stopped", &self.stopped)
             .finish_non_exhaustive()
     }
 }
 
-impl ShardedKv {
+impl ShardedKv<HashPlacement> {
     /// Starts a sharded key-value store with `shard_count` shard threads.
     ///
     /// Returns [`ShardError::InvalidShardCount`] when `shard_count` is zero.
@@ -443,6 +519,20 @@ impl ShardedKv {
     /// Command mailboxes are bounded. A full mailbox blocks callers at send
     /// time until the owning shard drains capacity.
     pub fn start_with_config(config: ShardedKvConfig) -> Result<Self, ShardError> {
+        Self::start_with_placement(config, HashPlacement)
+    }
+}
+
+impl<P> ShardedKv<P>
+where
+    P: Placement<str>,
+{
+    /// Starts a sharded key-value store from an explicit configuration and
+    /// placement strategy.
+    ///
+    /// Command mailboxes are bounded. A full mailbox blocks callers at send
+    /// time until the owning shard drains capacity.
+    pub fn start_with_placement(config: ShardedKvConfig, placement: P) -> Result<Self, ShardError> {
         let config = config.runtime_config()?;
 
         let shards = ShardSet::start(
@@ -454,6 +544,7 @@ impl ShardedKv {
 
         Ok(Self {
             shards,
+            placement,
             stopped: false,
         })
     }
@@ -477,7 +568,7 @@ impl ShardedKv {
     ///
     /// The exact shard ID is intentionally not a stable public contract.
     pub fn shard_for_key(&self, key: &str) -> ShardId {
-        shard_for_hash(&key, self.shard_count())
+        self.placement.shard_for(key, self.shard_count())
     }
 
     /// Inserts or replaces a key-value pair on the shard that owns `key`.
@@ -637,6 +728,15 @@ impl ShardedKv {
         self.submit_get(key)?.wait()
     }
 
+    /// Gets owned values for multiple keys, preserving input order.
+    pub fn get_many<I, K>(&self, keys: I) -> Result<Vec<(String, Option<String>)>, ShardError>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        self.submit_get_many(keys)?.wait()
+    }
+
     /// Attempts to get a value without waiting for mailbox capacity.
     ///
     /// If the owning shard mailbox is full, this returns
@@ -644,6 +744,19 @@ impl ShardedKv {
     /// still blocks waiting for the shard's reply.
     pub fn try_get(&self, key: impl Into<String>) -> Result<Option<String>, ShardError> {
         self.try_submit_get(key)?.wait()
+    }
+
+    /// Attempts to get multiple keys without waiting for mailbox capacity.
+    ///
+    /// If any owning shard mailbox is full, this returns
+    /// [`ShardError::MailboxFull`]. Earlier accepted get commands may already
+    /// have been enqueued. Those commands are read-only.
+    pub fn try_get_many<I, K>(&self, keys: I) -> Result<Vec<(String, Option<String>)>, ShardError>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        self.try_submit_get_many(keys)?.wait()
     }
 
     /// Enqueues a get command and returns a reply handle.
@@ -659,6 +772,28 @@ impl ShardedKv {
         shard.submit_get(key)
     }
 
+    /// Enqueues get commands for multiple keys and returns a reply handle.
+    ///
+    /// This method may block while waiting for bounded mailbox capacity, but it
+    /// does not wait for shards to execute the commands.
+    pub fn submit_get_many<I, K>(&self, keys: I) -> Result<KvGetManyReply, ShardError>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        let replies = keys
+            .into_iter()
+            .map(|key| {
+                let key = key.into();
+                let shard = self.shard_for_owned_key(&key)?;
+                let reply = shard.submit_get(key.clone())?;
+                Ok((key, reply))
+            })
+            .collect::<Result<Vec<_>, ShardError>>()?;
+
+        Ok(KvGetManyReply::new(replies))
+    }
+
     /// Attempts to enqueue a get command and return a reply handle without
     /// waiting for mailbox capacity.
     pub fn try_submit_get(
@@ -670,9 +805,41 @@ impl ShardedKv {
         shard.try_submit_get(key)
     }
 
+    /// Attempts to enqueue get commands for multiple keys without waiting for
+    /// mailbox capacity.
+    ///
+    /// If this returns [`ShardError::MailboxFull`], earlier get commands may
+    /// already have been accepted. Those commands are read-only.
+    pub fn try_submit_get_many<I, K>(&self, keys: I) -> Result<KvGetManyReply, ShardError>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        let replies = keys
+            .into_iter()
+            .map(|key| {
+                let key = key.into();
+                let shard = self.shard_for_owned_key(&key)?;
+                let reply = shard.try_submit_get(key.clone())?;
+                Ok((key, reply))
+            })
+            .collect::<Result<Vec<_>, ShardError>>()?;
+
+        Ok(KvGetManyReply::new(replies))
+    }
+
     /// Deletes a key from the shard that owns it and returns the previous value.
     pub fn delete(&self, key: impl Into<String>) -> Result<Option<String>, ShardError> {
         self.submit_delete(key)?.wait()
+    }
+
+    /// Deletes multiple keys and returns previous values in input order.
+    pub fn delete_many<I, K>(&self, keys: I) -> Result<Vec<(String, Option<String>)>, ShardError>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        self.submit_delete_many(keys)?.wait()
     }
 
     /// Attempts to delete a key without waiting for mailbox capacity.
@@ -682,6 +849,22 @@ impl ShardedKv {
     /// still blocks waiting for the shard's reply.
     pub fn try_delete(&self, key: impl Into<String>) -> Result<Option<String>, ShardError> {
         self.try_submit_delete(key)?.wait()
+    }
+
+    /// Attempts to delete multiple keys without waiting for mailbox capacity.
+    ///
+    /// If any owning shard mailbox is full, this returns
+    /// [`ShardError::MailboxFull`]. Earlier accepted delete commands may
+    /// already have been enqueued.
+    pub fn try_delete_many<I, K>(
+        &self,
+        keys: I,
+    ) -> Result<Vec<(String, Option<String>)>, ShardError>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        self.try_submit_delete_many(keys)?.wait()
     }
 
     /// Enqueues a delete command and returns a reply handle.
@@ -697,6 +880,28 @@ impl ShardedKv {
         shard.submit_delete(key)
     }
 
+    /// Enqueues delete commands for multiple keys and returns a reply handle.
+    ///
+    /// This method may block while waiting for bounded mailbox capacity, but it
+    /// does not wait for shards to execute the commands.
+    pub fn submit_delete_many<I, K>(&self, keys: I) -> Result<KvDeleteManyReply, ShardError>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        let replies = keys
+            .into_iter()
+            .map(|key| {
+                let key = key.into();
+                let shard = self.shard_for_owned_key(&key)?;
+                let reply = shard.submit_delete(key.clone())?;
+                Ok((key, reply))
+            })
+            .collect::<Result<Vec<_>, ShardError>>()?;
+
+        Ok(KvDeleteManyReply::new(replies))
+    }
+
     /// Attempts to enqueue a delete command and return a reply handle without
     /// waiting for mailbox capacity.
     pub fn try_submit_delete(
@@ -706,6 +911,29 @@ impl ShardedKv {
         let key = key.into();
         let shard = self.shard_for_owned_key(&key)?;
         shard.try_submit_delete(key)
+    }
+
+    /// Attempts to enqueue delete commands for multiple keys without waiting
+    /// for mailbox capacity.
+    ///
+    /// If this returns [`ShardError::MailboxFull`], earlier delete commands may
+    /// already have been accepted.
+    pub fn try_submit_delete_many<I, K>(&self, keys: I) -> Result<KvDeleteManyReply, ShardError>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        let replies = keys
+            .into_iter()
+            .map(|key| {
+                let key = key.into();
+                let shard = self.shard_for_owned_key(&key)?;
+                let reply = shard.try_submit_delete(key.clone())?;
+                Ok((key, reply))
+            })
+            .collect::<Result<Vec<_>, ShardError>>()?;
+
+        Ok(KvDeleteManyReply::new(replies))
     }
 
     /// Returns the number of keys stored on a specific shard.
@@ -922,9 +1150,12 @@ impl ShardedKv {
     }
 }
 
-impl Drop for ShardedKv {
+impl<P> Drop for ShardedKv<P> {
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        if !self.stopped {
+            self.stopped = true;
+            let _ = self.shards.stop_and_join(KvShardHandle::send_stop);
+        }
     }
 }
 

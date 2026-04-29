@@ -1,8 +1,8 @@
 # Architecture
 
 This first milestone is intentionally small. It validates the ownership model
-before introducing async I/O, custom scheduling, CPU affinity, networking, or
-OS-specific backends.
+and starts a minimal executor experiment before introducing async I/O, CPU
+affinity, networking, or OS-specific backends.
 
 ## Components
 
@@ -15,6 +15,18 @@ OS-specific backends.
 - shard thread join handling
 
 It deliberately does not know about key-value commands or service state.
+
+`executor` provides a minimal single-threaded async kernel:
+
+- tasks own pinned futures
+- a ready queue stores runnable tasks
+- custom wakers re-enqueue tasks
+- `block_on` drives one root future to completion
+- join handles let tasks await typed outputs from spawned tasks
+- `yield_now` proves cooperative wakeups without third-party runtimes
+
+It is not wired into the shard services yet. The executor may use synchronization
+for task bookkeeping, but application service state remains shard-local.
 
 `ShardedKv` owns:
 
@@ -35,7 +47,7 @@ Each shard thread owns:
 
 For `put`, `get`, and `delete`:
 
-1. `ShardedKv` hashes the key into a `ShardId`.
+1. `ShardedKv` routes the key through the default hash placement strategy.
 2. The matching `KvShardHandle` creates a one-shot reply channel.
 3. The handle sends a typed `KvCommand` to the shard mailbox.
 4. The caller blocks waiting for the reply.
@@ -43,6 +55,14 @@ For `put`, `get`, and `delete`:
 6. The shard replies with an owned value.
 
 No references into shard-local state cross the mailbox boundary.
+
+## Placement
+
+`placement` defines a small `Placement<K>` trait and a default `HashPlacement`
+implementation backed by `shard_for_hash`. `ShardedKv::start` and
+`ShardedKv::start_with_config` use the default hash strategy, while
+`ShardedKv::start_with_placement` lets callers provide a placement strategy for
+key-routed stores.
 
 ## Backpressure
 
@@ -84,6 +104,13 @@ state.
 
 `keys_on_shard` and `all_keys` return owned, sorted key vectors. They clone keys
 inside the owning shard and send those owned values back to the caller.
+
+`get_many` sends one owned get command per requested key and returns owned
+key/value pairs in the same order the keys were submitted. Missing keys are
+reported as `None`.
+
+`delete_many` follows the same ordered shape, returning each key with its
+previous value. Missing keys are reported as `None`.
 
 ## Shard-Local Atomic Operations
 
