@@ -142,6 +142,12 @@ Run the executor TCP echo example:
 cargo run --example async_tcp_echo
 ```
 
+Run the executor multi-client TCP echo example:
+
+```sh
+cargo run --example async_tcp_multi_echo
+```
+
 Run the executor async copy helper example:
 
 ```sh
@@ -205,6 +211,7 @@ cargo run --example submit_kv
 cargo run --example async_kv
 cargo run --example async_accept
 cargo run --example async_tcp_echo
+cargo run --example async_tcp_multi_echo
 cargo run --example async_copy
 cargo run --example async_readable
 cargo run --example async_write

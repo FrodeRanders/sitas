@@ -52,6 +52,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   when non-blocking descriptors report `WouldBlock`
 - `copy_async` composes the read and write helpers to copy until EOF while
   using both readiness paths
+- accepted TCP streams can be handed to spawned tasks, allowing one executor
+  thread to interleave multiple connection handlers
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than

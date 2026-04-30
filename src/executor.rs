@@ -1425,6 +1425,57 @@ mod tests {
         assert_eq!(client.join().unwrap(), b'z');
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn executor_can_spawn_tcp_handlers_for_multiple_accepted_streams() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let clients = (0..3u8)
+            .map(|value| {
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(5 + u64::from(value) * 5));
+                    let mut stream = TcpStream::connect(address).unwrap();
+                    stream.write_all(&[b'a' + value]).unwrap();
+
+                    let mut echo = [0u8; 1];
+                    stream.read_exact(&mut echo).unwrap();
+                    echo[0]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (executor, spawner) = executor_and_spawner();
+        let accept_spawner = spawner.clone();
+
+        spawner
+            .spawn(async move {
+                for _ in 0..3 {
+                    let (mut stream, _) = accept_async(&listener).await.unwrap();
+                    accept_spawner
+                        .spawn(async move {
+                            let mut byte = [0u8; 1];
+                            read_exact_async(&mut stream, &mut byte).await.unwrap();
+                            write_all_async(&mut stream, &byte).await.unwrap();
+                        })
+                        .unwrap();
+                }
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        let mut echoed = clients
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .collect::<Vec<_>>();
+        echoed.sort();
+
+        assert_eq!(&echoed, b"abc");
+    }
+
     #[test]
     fn block_on_can_await_spawned_task_output() {
         let (executor, spawner) = executor_and_spawner();
