@@ -1,7 +1,7 @@
 # Sitas
 
 `sitas` is a small Rust experiment in shard-local service ownership, typed
-message passing, and executor internals.
+message passing, executor internals, and Unix runtime backends.
 
 The project is inspired by Seastar's shard-per-core, shared-nothing model, but
 this first milestone is intentionally much smaller. It does not attempt to clone
@@ -15,6 +15,7 @@ standard library:
 - a small reusable std-only runtime layer
 - a minimal std-only executor experiment with custom wakers, join handles, and
   awaitable shard replies
+- an early Unix runtime backend experiment using direct OS FFI for reactor wakes
 - one OS thread per shard
 - one mailbox per shard
 - bounded shard mailboxes
@@ -58,7 +59,6 @@ This milestone does not include:
 
 - Tokio, Glommio, Monoio, or other async runtimes
 - actor frameworks
-- non-blocking I/O
 - production-ready async I/O
 - networking
 - persistence
@@ -137,6 +137,12 @@ Run the counter example:
 cargo run --example basic_counter
 ```
 
+Run the OS reactor wake example:
+
+```sh
+cargo run --example os_reactor
+```
+
 ## Development
 
 Run the standard checks:
@@ -152,4 +158,5 @@ cargo run --example submit_kv
 cargo run --example async_kv
 cargo run --example custom_placement
 cargo run --example basic_counter
+cargo run --example os_reactor
 ```

@@ -12,7 +12,7 @@
 //! Cross-shard values are owned values, so no references into shard-local state
 //! escape the shard.
 //!
-//! This first milestone deliberately does not include:
+//! The baseline std-only milestone deliberately does not include:
 //!
 //! - non-blocking I/O
 //! - a network server
@@ -21,11 +21,11 @@
 //! - scheduling classes
 //! - procedural macro service generation
 //!
-//! Later milestones may add async I/O, CPU pinning, backpressure, and runtime
-//! backends.
+//! The `non-std-runtime` branch starts introducing small Unix runtime backend
+//! pieces directly through OS syscalls.
 
-#![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(unsafe_op_in_unsafe_fn)]
 
 /// Sharded counter service implementation.
 pub mod counter;
@@ -35,6 +35,9 @@ pub mod error;
 pub mod executor;
 /// Sharded key-value store implementation.
 pub mod kv;
+/// Unix runtime backend experiments.
+#[cfg(unix)]
+pub mod os;
 /// Key-to-shard placement helpers.
 pub mod placement;
 /// Standard-library shard runtime primitives.

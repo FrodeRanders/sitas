@@ -1,8 +1,9 @@
 # Architecture
 
-This first milestone is intentionally small. It validates the ownership model
-and starts a minimal executor experiment before introducing async I/O, CPU
-affinity, networking, or OS-specific backends.
+The std-only baseline validates the ownership model and starts a minimal
+executor experiment. The `non-std-runtime` branch then begins adding small Unix
+runtime backend pieces before moving into async I/O, CPU affinity, and
+networking.
 
 ## Components
 
@@ -15,6 +16,19 @@ affinity, networking, or OS-specific backends.
 - shard thread join handling
 
 It deliberately does not know about key-value commands or service state.
+
+`os` provides the first non-std runtime backend primitive:
+
+- direct Unix FFI, currently `pipe`, `poll`, `read`, `write`, `fcntl`, and
+  `close`
+- a non-blocking pipe for cross-thread reactor wakeups
+- a cloneable `OsWaker`
+- a blocking `OsReactor::wait` that can be woken by the pipe
+
+This is intentionally smaller than a full reactor. It establishes the FFI
+boundary and a portable macOS/Linux wake mechanism before introducing file
+descriptor registration, timers, network sockets, or platform-specific backends
+such as `epoll`, `kqueue`, or `io_uring`.
 
 `executor` provides a minimal single-threaded async kernel:
 
@@ -159,7 +173,7 @@ return errors.
 This milestone does not implement:
 
 - non-blocking I/O
-- a reactor
+- file descriptor registration
 - actor framework behavior
 - networking
 - persistence
