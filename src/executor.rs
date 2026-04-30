@@ -14,6 +14,8 @@ use std::future::Future;
 #[cfg(unix)]
 use std::io::{self, Read, Write};
 #[cfg(unix)]
+use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -809,6 +811,25 @@ where
     }
 }
 
+/// Accepts one TCP connection, awaiting listener readiness when accepting
+/// would otherwise block.
+///
+/// The caller is responsible for putting the listener in non-blocking mode
+/// before using this helper.
+#[cfg(unix)]
+pub async fn accept_async(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
+    loop {
+        match listener.accept() {
+            Ok(connection) => return Ok(connection),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                readable(listener.as_raw_fd()).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Future returned by [`readable`].
 #[cfg(unix)]
 #[derive(Debug)]
@@ -959,11 +980,13 @@ impl Future for YieldNow {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{accept_async, copy_async, read_exact_async, readable, writable, write_all_async};
     use super::{block_on, executor_and_spawner, sleep, yield_now};
     #[cfg(unix)]
-    use super::{copy_async, read_exact_async, readable, writable, write_all_async};
-    #[cfg(unix)]
     use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::net::{TcpListener, TcpStream};
     #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
     #[cfg(unix)]
@@ -1334,6 +1357,31 @@ mod tests {
         });
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_async_waits_for_tcp_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(b"x").unwrap();
+        });
+
+        let mut stream = block_on(async move {
+            let (stream, peer) = accept_async(&listener).await.unwrap();
+            assert_eq!(peer.ip(), address.ip());
+            stream
+        });
+
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).unwrap();
+
+        assert_eq!(byte, [b'x']);
     }
 
     #[test]
