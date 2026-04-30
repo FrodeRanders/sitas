@@ -43,8 +43,9 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - timer futures register task wakers in the scheduler and drive reactor timeouts
 - read/write-readiness futures register file descriptors and resume when the
   reactor reports them ready
-- `accept_async` retries `TcpListener::accept` and awaits listener readability
-  when non-blocking listeners report `WouldBlock`
+- `accept_async` retries `TcpListener::accept`, awaits listener readability
+  when non-blocking listeners report `WouldBlock`, and returns non-blocking
+  accepted streams for the async read/write helpers
 - `read_exact_async` retries normal `Read` operations and awaits readability
   when non-blocking descriptors report `WouldBlock`
 - `write_all_async` retries normal `Write` operations and awaits writability

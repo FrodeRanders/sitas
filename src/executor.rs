@@ -815,12 +815,16 @@ where
 /// would otherwise block.
 ///
 /// The caller is responsible for putting the listener in non-blocking mode
-/// before using this helper.
+/// before using this helper. The returned stream is placed in non-blocking mode
+/// before it is returned.
 #[cfg(unix)]
 pub async fn accept_async(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
     loop {
         match listener.accept() {
-            Ok(connection) => return Ok(connection),
+            Ok((stream, peer)) => {
+                stream.set_nonblocking(true)?;
+                return Ok((stream, peer));
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 readable(listener.as_raw_fd()).await;
@@ -1369,19 +1373,56 @@ mod tests {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(10));
             let mut stream = TcpStream::connect(address).unwrap();
+            thread::sleep(Duration::from_millis(10));
             stream.write_all(b"x").unwrap();
         });
 
         let mut stream = block_on(async move {
-            let (stream, peer) = accept_async(&listener).await.unwrap();
+            let (mut stream, peer) = accept_async(&listener).await.unwrap();
             assert_eq!(peer.ip(), address.ip());
+            let mut empty = [0u8; 1];
+            assert_eq!(
+                stream.read(&mut empty).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
             stream
         });
 
-        let mut byte = [0u8; 1];
-        stream.read_exact(&mut byte).unwrap();
+        let byte = block_on(async move {
+            let mut byte = [0u8; 1];
+            read_exact_async(&mut stream, &mut byte).await.unwrap();
+            byte
+        });
 
         assert_eq!(byte, [b'x']);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_tcp_stream_works_with_async_read_and_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(b"z").unwrap();
+
+            let mut echo = [0u8; 1];
+            stream.read_exact(&mut echo).unwrap();
+            echo[0]
+        });
+
+        block_on(async move {
+            let (mut stream, peer) = accept_async(&listener).await.unwrap();
+            assert_eq!(peer.ip(), address.ip());
+
+            let mut byte = [0u8; 1];
+            read_exact_async(&mut stream, &mut byte).await.unwrap();
+            write_all_async(&mut stream, &byte).await.unwrap();
+        });
+
+        assert_eq!(client.join().unwrap(), b'z');
     }
 
     #[test]

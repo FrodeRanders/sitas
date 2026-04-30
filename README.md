@@ -136,6 +136,12 @@ Run the executor async accept helper example:
 cargo run --example async_accept
 ```
 
+Run the executor TCP echo example:
+
+```sh
+cargo run --example async_tcp_echo
+```
+
 Run the executor async copy helper example:
 
 ```sh
@@ -198,6 +204,7 @@ cargo run --example concurrent_kv
 cargo run --example submit_kv
 cargo run --example async_kv
 cargo run --example async_accept
+cargo run --example async_tcp_echo
 cargo run --example async_copy
 cargo run --example async_readable
 cargo run --example async_write
