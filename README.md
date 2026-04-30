@@ -14,11 +14,11 @@ standard library:
 
 - a small reusable std-only runtime layer
 - a minimal executor experiment with custom wakers, join handles, awaitable
-  shard replies, timers, OS-backed sleeping, and read-readiness futures on this
-  branch
-- a small async read helper layered on non-blocking Unix descriptors
+  shard replies, timers, OS-backed sleeping, and read/write-readiness futures on
+  this branch
+- small async read and write helpers layered on non-blocking Unix descriptors
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
-  and read readiness
+  and descriptor readiness
 - one OS thread per shard
 - one mailbox per shard
 - bounded shard mailboxes
@@ -68,7 +68,7 @@ This milestone does not include:
 - CPU pinning
 - scheduling classes
 - procedural macro service generation
-- `unsafe`
+- broad `unsafe` usage outside the small Unix FFI backend
 
 Later milestones may add async I/O, CPU affinity, backpressure, and fuller
 OS-specific runtime backends.
@@ -135,6 +135,12 @@ Run the executor read-readiness future example:
 cargo run --example async_readable
 ```
 
+Run the executor async write helper example:
+
+```sh
+cargo run --example async_write
+```
+
 Run the executor timer example:
 
 ```sh
@@ -179,6 +185,7 @@ cargo run --example concurrent_kv
 cargo run --example submit_kv
 cargo run --example async_kv
 cargo run --example async_readable
+cargo run --example async_write
 cargo run --example executor_sleep
 cargo run --example custom_placement
 cargo run --example basic_counter

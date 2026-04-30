@@ -22,7 +22,7 @@ It deliberately does not know about key-value commands or service state.
 - direct Unix FFI, currently `pipe`, `poll`, `read`, `write`, `fcntl`, and
   `close`
 - a non-blocking pipe for cross-thread reactor wakeups
-- read-readiness polling for caller-provided file descriptors
+- read/write-readiness polling for caller-provided file descriptors
 - a cloneable `OsWaker`
 - a blocking `OsReactor::wait` that can be woken by the pipe
 
@@ -41,9 +41,11 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - `yield_now` proves cooperative wakeups without third-party runtimes
 - on Unix, the executor sleeps on `OsReactor` when no tasks are ready
 - timer futures register task wakers in the scheduler and drive reactor timeouts
-- read-readiness futures register file descriptors and resume when the reactor
-  reports them readable
+- read/write-readiness futures register file descriptors and resume when the
+  reactor reports them ready
 - `read_exact_async` retries normal `Read` operations and awaits readability
+  when non-blocking descriptors report `WouldBlock`
+- `write_all_async` retries normal `Write` operations and awaits writability
   when non-blocking descriptors report `WouldBlock`
 
 Shard reply handles can be converted into awaitable futures through

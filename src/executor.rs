@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 #[cfg(unix)]
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
@@ -170,12 +170,14 @@ impl Executor {
             {
                 let event = self
                     .reactor
-                    .wait_readable(
+                    .wait_io(
                         &self.scheduler.read_interest_fds(),
+                        &self.scheduler.write_interest_fds(),
                         self.scheduler.time_until_next_timer(),
                     )
                     .expect("OS reactor wait failed while running executor");
                 self.scheduler.wake_readable_fds(&event.readable);
+                self.scheduler.wake_writable_fds(&event.writable);
             }
 
             self.scheduler.wake_expired_timers();
@@ -254,11 +256,14 @@ struct SchedulerState {
     timers: Vec<TimerEntry>,
     read_interests: Vec<ReadInterest>,
     ready_read_interests: Vec<usize>,
+    write_interests: Vec<WriteInterest>,
+    ready_write_interests: Vec<usize>,
     accepting: bool,
     spawner_count: usize,
     task_count: usize,
     next_timer_id: usize,
     next_read_interest_id: usize,
+    next_write_interest_id: usize,
 }
 
 #[derive(Debug)]
@@ -276,6 +281,14 @@ struct ReadInterest {
     waker: Waker,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct WriteInterest {
+    id: usize,
+    fd: RawFd,
+    waker: Waker,
+}
+
 impl Scheduler {
     fn new(#[cfg(unix)] waker: OsWaker) -> Self {
         Self {
@@ -284,11 +297,14 @@ impl Scheduler {
                 timers: Vec::new(),
                 read_interests: Vec::new(),
                 ready_read_interests: Vec::new(),
+                write_interests: Vec::new(),
+                ready_write_interests: Vec::new(),
                 accepting: true,
                 spawner_count: 1,
                 task_count: 0,
                 next_timer_id: 0,
                 next_read_interest_id: 0,
+                next_write_interest_id: 0,
             }),
             #[cfg(unix)]
             waker,
@@ -530,6 +546,96 @@ impl Scheduler {
         true
     }
 
+    #[cfg(unix)]
+    fn allocate_write_interest_id(&self) -> usize {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        let id = state.next_write_interest_id;
+        state.next_write_interest_id = state.next_write_interest_id.wrapping_add(1);
+        id
+    }
+
+    #[cfg(unix)]
+    fn register_write_interest(&self, id: usize, fd: RawFd, waker: Waker) {
+        {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+
+            match state
+                .write_interests
+                .iter_mut()
+                .find(|interest| interest.id == id)
+            {
+                Some(interest) => {
+                    interest.fd = fd;
+                    interest.waker = waker;
+                }
+                None => state.write_interests.push(WriteInterest { id, fd, waker }),
+            }
+        }
+
+        self.wake_reactor();
+    }
+
+    #[cfg(unix)]
+    fn remove_write_interest(&self, id: usize) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.write_interests.retain(|interest| interest.id != id);
+        state
+            .ready_write_interests
+            .retain(|ready_id| *ready_id != id);
+    }
+
+    #[cfg(unix)]
+    fn write_interest_fds(&self) -> Vec<RawFd> {
+        let state = self.state.lock().expect("scheduler state mutex poisoned");
+        state
+            .write_interests
+            .iter()
+            .map(|interest| interest.fd)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn wake_writable_fds(&self, writable: &[RawFd]) {
+        let wakers = {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+            let mut wakers = Vec::new();
+            let mut ready_ids = Vec::new();
+            let mut pending = Vec::with_capacity(state.write_interests.len());
+
+            for interest in state.write_interests.drain(..) {
+                if writable.contains(&interest.fd) {
+                    ready_ids.push(interest.id);
+                    wakers.push(interest.waker);
+                } else {
+                    pending.push(interest);
+                }
+            }
+
+            state.write_interests = pending;
+            state.ready_write_interests.extend(ready_ids);
+            wakers
+        };
+
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    #[cfg(unix)]
+    fn take_ready_write_interest(&self, id: usize) -> bool {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        let Some(position) = state
+            .ready_write_interests
+            .iter()
+            .position(|ready_id| *ready_id == id)
+        else {
+            return false;
+        };
+
+        state.ready_write_interests.swap_remove(position);
+        true
+    }
+
     fn wake_reactor(&self) {
         #[cfg(unix)]
         let _ = self.waker.wake();
@@ -617,6 +723,16 @@ pub fn readable(fd: RawFd) -> Readable {
     }
 }
 
+/// Returns a future that completes when `fd` is writable.
+#[cfg(unix)]
+pub fn writable(fd: RawFd) -> Writable {
+    Writable {
+        fd,
+        interest_id: None,
+        scheduler: None,
+    }
+}
+
 /// Reads exactly enough bytes to fill `buffer`, awaiting read readiness when
 /// the reader would otherwise block.
 ///
@@ -643,6 +759,40 @@ where
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 readable(reader.as_raw_fd()).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+/// Writes the entire buffer, awaiting write readiness when the writer would
+/// otherwise block.
+///
+/// The caller is responsible for putting the underlying descriptor in
+/// non-blocking mode before using this helper.
+#[cfg(unix)]
+pub async fn write_all_async<W>(writer: &mut W, buffer: &[u8]) -> io::Result<()>
+where
+    W: Write + AsRawFd,
+{
+    let mut written = 0usize;
+
+    while written < buffer.len() {
+        match writer.write(&buffer[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "writer accepted zero bytes before buffer was written",
+                ));
+            }
+            Ok(bytes_written) => {
+                written += bytes_written;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                writable(writer.as_raw_fd()).await;
             }
             Err(error) => return Err(error),
         }
@@ -691,6 +841,50 @@ impl Drop for Readable {
     fn drop(&mut self) {
         if let (Some(scheduler), Some(interest_id)) = (&self.scheduler, self.interest_id) {
             scheduler.remove_read_interest(interest_id);
+        }
+    }
+}
+
+/// Future returned by [`writable`].
+#[cfg(unix)]
+#[derive(Debug)]
+#[must_use = "futures do nothing unless polled or awaited"]
+pub struct Writable {
+    fd: RawFd,
+    interest_id: Option<usize>,
+    scheduler: Option<Arc<Scheduler>>,
+}
+
+#[cfg(unix)]
+impl Future for Writable {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let scheduler = current_scheduler();
+        self.scheduler = Some(Arc::clone(&scheduler));
+        let interest_id = match self.interest_id {
+            Some(interest_id) => interest_id,
+            None => {
+                let interest_id = scheduler.allocate_write_interest_id();
+                self.interest_id = Some(interest_id);
+                interest_id
+            }
+        };
+
+        if scheduler.take_ready_write_interest(interest_id) {
+            return Poll::Ready(());
+        }
+
+        scheduler.register_write_interest(interest_id, self.fd, context.waker().clone());
+        Poll::Pending
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Writable {
+    fn drop(&mut self) {
+        if let (Some(scheduler), Some(interest_id)) = (&self.scheduler, self.interest_id) {
+            scheduler.remove_write_interest(interest_id);
         }
     }
 }
@@ -759,7 +953,7 @@ impl Future for YieldNow {
 mod tests {
     use super::{block_on, executor_and_spawner, sleep, yield_now};
     #[cfg(unix)]
-    use super::{read_exact_async, readable};
+    use super::{read_exact_async, readable, writable, write_all_async};
     #[cfg(unix)]
     use std::io::{Read, Write};
     #[cfg(unix)]
@@ -1012,6 +1206,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn writable_future_completes_when_fd_is_writable() {
+        let (executor, spawner) = executor_and_spawner();
+        let (_reader, writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let writer_fd = writer.as_raw_fd();
+        let output = Arc::new(Mutex::new(false));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                writable(writer_fd).await;
+                *output_for_task.lock().unwrap() = true;
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert!(*output.lock().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn read_exact_async_waits_until_buffer_is_filled() {
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
         reader.set_nonblocking(true).unwrap();
@@ -1047,6 +1264,22 @@ mod tests {
         });
 
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_all_async_writes_entire_buffer() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+
+        block_on(async move {
+            write_all_async(&mut writer, b"hello").await.unwrap();
+        });
+
+        let mut buffer = [0u8; 5];
+        reader.read_exact(&mut buffer).unwrap();
+
+        assert_eq!(&buffer, b"hello");
     }
 
     #[test]

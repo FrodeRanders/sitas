@@ -18,6 +18,7 @@ type Nfds = std::os::raw::c_ulong;
 type Nfds = u32;
 
 const POLLIN: c_short = 0x0001;
+const POLLOUT: c_short = 0x0004;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 
@@ -43,6 +44,14 @@ impl PollFd {
         Self {
             fd,
             events: POLLIN,
+            revents: 0,
+        }
+    }
+
+    fn writable(fd: RawFd) -> Self {
+        Self {
+            fd,
+            events: POLLOUT,
             revents: 0,
         }
     }
@@ -96,7 +105,7 @@ impl OsReactor {
 
     /// Waits until the reactor is woken or the optional timeout expires.
     pub fn wait(&self, timeout: Option<Duration>) -> io::Result<OsEvent> {
-        self.wait_readable(&[], timeout)
+        self.wait_io(&[], &[], timeout)
     }
 
     /// Waits until the reactor is woken, one of `read_fds` becomes readable,
@@ -106,12 +115,34 @@ impl OsReactor {
         read_fds: &[RawFd],
         timeout: Option<Duration>,
     ) -> io::Result<OsEvent> {
+        self.wait_io(read_fds, &[], timeout)
+    }
+
+    /// Waits until the reactor is woken, one of `write_fds` becomes writable,
+    /// or the optional timeout expires.
+    pub fn wait_writable(
+        &self,
+        write_fds: &[RawFd],
+        timeout: Option<Duration>,
+    ) -> io::Result<OsEvent> {
+        self.wait_io(&[], write_fds, timeout)
+    }
+
+    /// Waits until the reactor is woken, a read descriptor becomes readable, a
+    /// write descriptor becomes writable, or the optional timeout expires.
+    pub fn wait_io(
+        &self,
+        read_fds: &[RawFd],
+        write_fds: &[RawFd],
+        timeout: Option<Duration>,
+    ) -> io::Result<OsEvent> {
         let timeout_ms = timeout_to_poll_ms(timeout);
 
         loop {
-            let mut fds = Vec::with_capacity(read_fds.len() + 1);
+            let mut fds = Vec::with_capacity(read_fds.len() + write_fds.len() + 1);
             fds.push(PollFd::readable(self.read_fd.raw()));
             fds.extend(read_fds.iter().copied().map(PollFd::readable));
+            fds.extend(write_fds.iter().copied().map(PollFd::writable));
 
             // SAFETY: `fds` points to initialized `PollFd` values for the
             // duration of the call, and all raw descriptors are borrowed only
@@ -122,16 +153,28 @@ impl OsReactor {
                 let readable = fds
                     .iter()
                     .skip(1)
+                    .take(read_fds.len())
                     .filter(|fd| fd.revents & POLLIN != 0)
                     .map(|fd| fd.fd)
                     .collect();
+                let writable = fds
+                    .iter()
+                    .skip(1 + read_fds.len())
+                    .filter(|fd| fd.revents & POLLOUT != 0)
+                    .map(|fd| fd.fd)
+                    .collect();
 
-                return Ok(OsEvent { woke, readable });
+                return Ok(OsEvent {
+                    woke,
+                    readable,
+                    writable,
+                });
             }
             if result == 0 {
                 return Ok(OsEvent {
                     woke: false,
                     readable: Vec::new(),
+                    writable: Vec::new(),
                 });
             }
 
@@ -239,6 +282,8 @@ pub struct OsEvent {
     pub woke: bool,
     /// File descriptors that were readable when the reactor returned.
     pub readable: Vec<RawFd>,
+    /// File descriptors that were writable when the reactor returned.
+    pub writable: Vec<RawFd>,
 }
 
 #[derive(Debug)]
@@ -402,6 +447,7 @@ mod tests {
 
         assert!(!event.woke);
         assert!(event.readable.is_empty());
+        assert!(event.writable.is_empty());
     }
 
     #[test]
@@ -417,6 +463,7 @@ mod tests {
 
         assert!(!event.woke);
         assert_eq!(event.readable, vec![read_fd.raw()]);
+        assert!(event.writable.is_empty());
     }
 
     #[test]
@@ -434,6 +481,42 @@ mod tests {
 
         assert!(event.woke);
         assert_eq!(event.readable, vec![read_fd.raw()]);
+        assert!(event.writable.is_empty());
+    }
+
+    #[test]
+    fn wait_writable_reports_external_fd_readiness() {
+        let reactor = OsReactor::new().unwrap();
+        let (_read_fd, write_fd) = create_pipe().unwrap();
+
+        let event = reactor
+            .wait_writable(&[write_fd.raw()], Some(Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(!event.woke);
+        assert!(event.readable.is_empty());
+        assert_eq!(event.writable, vec![write_fd.raw()]);
+    }
+
+    #[test]
+    fn wait_io_reports_readable_and_writable_fds_together() {
+        let reactor = OsReactor::new().unwrap();
+        let (read_fd, first_write_fd) = create_pipe().unwrap();
+        let (_unused_read_fd, second_write_fd) = create_pipe().unwrap();
+
+        write_one(first_write_fd.raw());
+
+        let event = reactor
+            .wait_io(
+                &[read_fd.raw()],
+                &[second_write_fd.raw()],
+                Some(Duration::from_secs(1)),
+            )
+            .unwrap();
+
+        assert!(!event.woke);
+        assert_eq!(event.readable, vec![read_fd.raw()]);
+        assert_eq!(event.writable, vec![second_write_fd.raw()]);
     }
 
     fn write_one(fd: RawFd) {
