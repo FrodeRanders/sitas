@@ -37,6 +37,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - a ready queue stores runnable tasks
 - repeated wakes coalesce to one ready-queue entry per task
 - custom wakers re-enqueue tasks
+- task panics are caught at the executor boundary so unrelated tasks can keep
+  running
 - `block_on` drives one root future to completion
 - join handles let tasks await typed outputs from spawned tasks
 - `yield_now` proves cooperative wakeups without third-party runtimes

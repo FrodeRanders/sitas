@@ -17,6 +17,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -26,6 +27,9 @@ use std::time::{Duration, Instant};
 use crate::os::{OsReactor, OsWaker};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
+type PanicHandler = Box<dyn FnOnce(PanicPayload) + Send + 'static>;
+type JoinResult<T> = Result<T, PanicPayload>;
 
 thread_local! {
     static CURRENT_SCHEDULER: RefCell<Option<Arc<Scheduler>>> = const { RefCell::new(None) };
@@ -71,9 +75,7 @@ impl Spawner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let task = Arc::new(Task::new(Box::pin(future), Arc::clone(&self.scheduler)));
-
-        self.scheduler.schedule(task)
+        self.spawn_with_panic_handler(future, None)
     }
 
     /// Spawns a future and returns a handle that can await its output.
@@ -83,27 +85,60 @@ impl Spawner {
         F::Output: Send + 'static,
     {
         let shared = Arc::new(Mutex::new(JoinState {
-            output: None,
+            result: None,
             waker: None,
         }));
         let shared_for_task = Arc::clone(&shared);
+        let shared_for_panic = Arc::clone(&shared);
 
-        self.spawn(async move {
-            let output = future.await;
-            let waker = {
-                let mut state = shared_for_task
-                    .lock()
-                    .expect("join handle state mutex poisoned");
-                state.output = Some(output);
-                state.waker.take()
-            };
+        self.spawn_with_panic_handler(
+            async move {
+                let output = future.await;
+                let waker = {
+                    let mut state = shared_for_task
+                        .lock()
+                        .expect("join handle state mutex poisoned");
+                    state.result = Some(Ok(output));
+                    state.waker.take()
+                };
 
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        })?;
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            },
+            Some(Box::new(move |payload| {
+                let waker = {
+                    let mut state = shared_for_panic
+                        .lock()
+                        .expect("join handle state mutex poisoned");
+                    state.result = Some(Err(payload));
+                    state.waker.take()
+                };
+
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            })),
+        )?;
 
         Ok(JoinHandle { shared })
+    }
+
+    fn spawn_with_panic_handler<F>(
+        &self,
+        future: F,
+        panic_handler: Option<PanicHandler>,
+    ) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let task = Arc::new(Task::new(
+            Box::pin(future),
+            Arc::clone(&self.scheduler),
+            panic_handler,
+        ));
+
+        self.scheduler.schedule(task)
     }
 }
 
@@ -114,7 +149,7 @@ pub struct JoinHandle<T> {
 }
 
 struct JoinState<T> {
-    output: Option<T>,
+    result: Option<JoinResult<T>>,
     waker: Option<Waker>,
 }
 
@@ -133,8 +168,9 @@ impl<T> Future for JoinHandle<T> {
             .lock()
             .expect("join handle state mutex poisoned");
 
-        match state.output.take() {
-            Some(output) => Poll::Ready(output),
+        match state.result.take() {
+            Some(Ok(output)) => Poll::Ready(output),
+            Some(Err(payload)) => panic::resume_unwind(payload),
             None => {
                 state.waker = Some(context.waker().clone());
                 Poll::Pending
@@ -197,6 +233,7 @@ struct Task {
 
 struct TaskState {
     future: Option<BoxFuture>,
+    panic_handler: Option<PanicHandler>,
     queued: bool,
     polling: bool,
 }
@@ -208,10 +245,15 @@ impl fmt::Debug for Task {
 }
 
 impl Task {
-    fn new(future: BoxFuture, scheduler: Arc<Scheduler>) -> Self {
+    fn new(
+        future: BoxFuture,
+        scheduler: Arc<Scheduler>,
+        panic_handler: Option<PanicHandler>,
+    ) -> Self {
         Self {
             state: Mutex::new(TaskState {
                 future: Some(future),
+                panic_handler,
                 queued: false,
                 polling: false,
             }),
@@ -238,24 +280,38 @@ impl Task {
             *current.borrow_mut() = Some(scheduler);
         });
 
-        let poll_result = future.as_mut().poll(&mut context);
+        let poll_result =
+            panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut context)));
 
         CURRENT_SCHEDULER.with(|current| {
             *current.borrow_mut() = None;
         });
 
         match poll_result {
-            Poll::Ready(()) => {
+            Ok(Poll::Ready(())) => {
                 self.state
                     .lock()
                     .expect("task state mutex poisoned")
                     .polling = false;
                 self.scheduler.finish_task();
             }
-            Poll::Pending => {
+            Ok(Poll::Pending) => {
                 let mut state = self.state.lock().expect("task state mutex poisoned");
                 state.polling = false;
                 state.future = Some(future);
+            }
+            Err(payload) => {
+                let panic_handler = {
+                    let mut state = self.state.lock().expect("task state mutex poisoned");
+                    state.polling = false;
+                    state.future = None;
+                    state.panic_handler.take()
+                };
+
+                if let Some(panic_handler) = panic_handler {
+                    panic_handler(payload);
+                }
+                self.scheduler.finish_task();
             }
         }
     }
@@ -1152,6 +1208,29 @@ mod tests {
     }
 
     #[test]
+    fn panicking_task_does_not_stop_executor() {
+        let (executor, spawner) = executor_and_spawner();
+        let completed = Arc::new(Mutex::new(false));
+        let completed_for_task = Arc::clone(&completed);
+
+        spawner
+            .spawn(async {
+                panic!("task panic");
+            })
+            .unwrap();
+        spawner
+            .spawn(async move {
+                *completed_for_task.lock().unwrap() = true;
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert!(*completed.lock().unwrap());
+    }
+
+    #[test]
     fn spawn_with_handle_returns_task_output() {
         let (executor, spawner) = executor_and_spawner();
         let result = Arc::new(Mutex::new(None));
@@ -1207,6 +1286,31 @@ mod tests {
         executor.run();
 
         assert_eq!(*result.lock().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn panicking_join_handle_wakes_waiter() {
+        let (executor, spawner) = executor_and_spawner();
+        let observed = Arc::new(Mutex::new(false));
+        let observed_for_task = Arc::clone(&observed);
+
+        let worker = spawner
+            .spawn_with_handle(async {
+                panic!("join panic");
+            })
+            .unwrap();
+
+        spawner
+            .spawn(CatchJoinPanic {
+                handle: worker,
+                observed: observed_for_task,
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert!(*observed.lock().unwrap());
     }
 
     #[test]
@@ -1593,6 +1697,33 @@ mod tests {
             context.waker().wake_by_ref();
             context.waker().wake_by_ref();
             std::task::Poll::Pending
+        }
+    }
+
+    struct CatchJoinPanic<T> {
+        handle: super::JoinHandle<T>,
+        observed: Arc<Mutex<bool>>,
+    }
+
+    impl<T> std::future::Future for CatchJoinPanic<T> {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::pin::Pin::new(&mut self.handle).poll(context)
+            }));
+
+            match result {
+                Ok(std::task::Poll::Ready(_)) => std::task::Poll::Ready(()),
+                Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                Err(_) => {
+                    *self.observed.lock().unwrap() = true;
+                    std::task::Poll::Ready(())
+                }
+            }
         }
     }
 }
