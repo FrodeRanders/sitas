@@ -730,7 +730,7 @@ fn next_timer_deadline(timers: &[TimerEntry]) -> Option<Instant> {
 fn current_scheduler() -> Arc<Scheduler> {
     CURRENT_SCHEDULER
         .with(|current| current.borrow().as_ref().cloned())
-        .expect("executor::sleep must be polled by sitas::executor::Executor")
+        .expect("executor futures must be polled by sitas::executor::Executor")
 }
 
 /// Creates a paired executor and spawner.
@@ -793,6 +793,19 @@ pub fn sleep(duration: Duration) -> Sleep {
     Sleep {
         deadline: Instant::now() + duration,
         timer_id: None,
+        scheduler: None,
+    }
+}
+
+/// Returns a future that resolves to an error if `future` does not complete
+/// before `duration` elapses.
+pub fn timeout<F>(duration: Duration, future: F) -> Timeout<F>
+where
+    F: Future,
+{
+    Timeout {
+        future: Box::pin(future),
+        sleep: sleep(duration),
     }
 }
 
@@ -1051,6 +1064,7 @@ impl Drop for Writable {
 pub struct Sleep {
     deadline: Instant,
     timer_id: Option<usize>,
+    scheduler: Option<Arc<Scheduler>>,
 }
 
 impl Future for Sleep {
@@ -1065,6 +1079,7 @@ impl Future for Sleep {
         }
 
         let scheduler = current_scheduler();
+        self.scheduler = Some(Arc::clone(&scheduler));
         let timer_id = match self.timer_id {
             Some(timer_id) => timer_id,
             None => {
@@ -1075,6 +1090,62 @@ impl Future for Sleep {
         };
 
         scheduler.register_timer(timer_id, self.deadline, context.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        if let (Some(scheduler), Some(timer_id)) = (&self.scheduler, self.timer_id) {
+            scheduler.remove_timer(timer_id);
+        }
+    }
+}
+
+/// Error returned by [`timeout`] when the deadline wins the race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutError;
+
+impl fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "future timed out")
+    }
+}
+
+impl Error for TimeoutError {}
+
+/// Future returned by [`timeout`].
+#[must_use = "futures do nothing unless polled or awaited"]
+pub struct Timeout<F> {
+    future: Pin<Box<F>>,
+    sleep: Sleep,
+}
+
+impl<F> fmt::Debug for Timeout<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Timeout").finish_non_exhaustive()
+    }
+}
+
+impl<F> Unpin for Timeout<F> {}
+
+impl<F> Future for Timeout<F>
+where
+    F: Future,
+{
+    type Output = Result<F::Output, TimeoutError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if let Poll::Ready(output) = this.future.as_mut().poll(context) {
+            return Poll::Ready(Ok(output));
+        }
+
+        if Pin::new(&mut this.sleep).poll(context).is_ready() {
+            return Poll::Ready(Err(TimeoutError));
+        }
+
         Poll::Pending
     }
 }
@@ -1112,7 +1183,7 @@ mod tests {
         accept_async, connect_async, copy_async, read_exact_async, readable, writable,
         write_all_async,
     };
-    use super::{block_on, executor_and_spawner, sleep, yield_now};
+    use super::{block_on, executor_and_spawner, sleep, timeout, yield_now, TimeoutError};
     #[cfg(unix)]
     use std::io::{Read, Write};
     #[cfg(unix)]
@@ -1166,6 +1237,59 @@ mod tests {
         });
 
         assert!(started.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn timeout_returns_future_output_before_deadline() {
+        let output = block_on(async { timeout(Duration::from_secs(1), async { 7 }).await });
+
+        assert_eq!(output, Ok(7));
+    }
+
+    #[test]
+    fn timeout_expires_before_slow_future() {
+        let started = Instant::now();
+
+        let output = block_on(async {
+            timeout(Duration::from_millis(5), async {
+                sleep(Duration::from_secs(60)).await;
+                7
+            })
+            .await
+        });
+
+        assert_eq!(output, Err(TimeoutError));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn timeout_drops_inner_sleep_timer() {
+        let (executor, spawner) = executor_and_spawner();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                let result = timeout(Duration::from_millis(5), async {
+                    sleep(Duration::from_secs(60)).await;
+                    7
+                })
+                .await;
+                *output_for_task.lock().unwrap() = Some(result);
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(*output.lock().unwrap(), Some(Err(TimeoutError)));
+        assert!(executor
+            .scheduler
+            .state
+            .lock()
+            .expect("scheduler state mutex poisoned")
+            .timers
+            .is_empty());
     }
 
     #[test]

@@ -45,6 +45,10 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - `yield_now` proves cooperative wakeups without third-party runtimes
 - on Unix, the executor sleeps on `OsReactor` when no tasks are ready
 - timer futures register task wakers in the scheduler and drive reactor timeouts
+- sleeping futures unregister their timers when dropped, which keeps cancelled
+  composed futures from leaving stale timer entries behind
+- `timeout` composes a future with a timer and returns `TimeoutError` if the
+  deadline completes first
 - read/write-readiness futures register file descriptors and resume when the
   reactor reports them ready
 - `accept_async` retries `TcpListener::accept`, awaits listener readability
