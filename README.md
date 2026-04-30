@@ -161,3 +161,15 @@ cargo run --example custom_placement
 cargo run --example basic_counter
 cargo run --example os_reactor
 ```
+
+Run the Linux Docker check from macOS:
+
+```sh
+tools/linux-docker.sh
+```
+
+Pass a custom command after the script name to run a narrower Linux check:
+
+```sh
+tools/linux-docker.sh cargo test os::tests
+```
