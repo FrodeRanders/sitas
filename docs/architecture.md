@@ -35,6 +35,7 @@ such as `epoll`, `kqueue`, or `io_uring`.
 
 - tasks own pinned futures
 - a ready queue stores runnable tasks
+- repeated wakes coalesce to one ready-queue entry per task
 - custom wakers re-enqueue tasks
 - `block_on` drives one root future to completion
 - join handles let tasks await typed outputs from spawned tasks

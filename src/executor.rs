@@ -71,10 +71,7 @@ impl Spawner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let task = Arc::new(Task {
-            future: Mutex::new(Some(Box::pin(future))),
-            scheduler: Arc::clone(&self.scheduler),
-        });
+        let task = Arc::new(Task::new(Box::pin(future), Arc::clone(&self.scheduler)));
 
         self.scheduler.schedule(task)
     }
@@ -194,8 +191,14 @@ impl Drop for Executor {
 }
 
 struct Task {
-    future: Mutex<Option<BoxFuture>>,
+    state: Mutex<TaskState>,
     scheduler: Arc<Scheduler>,
+}
+
+struct TaskState {
+    future: Option<BoxFuture>,
+    queued: bool,
+    polling: bool,
 }
 
 impl fmt::Debug for Task {
@@ -205,32 +208,70 @@ impl fmt::Debug for Task {
 }
 
 impl Task {
+    fn new(future: BoxFuture, scheduler: Arc<Scheduler>) -> Self {
+        Self {
+            state: Mutex::new(TaskState {
+                future: Some(future),
+                queued: false,
+                polling: false,
+            }),
+            scheduler,
+        }
+    }
+
     fn poll(self: Arc<Self>) {
         let waker = Waker::from(self.clone());
         let mut context = Context::from_waker(&waker);
-        let mut future_slot = self.future.lock().expect("task future mutex poisoned");
+        let mut future = {
+            let mut state = self.state.lock().expect("task state mutex poisoned");
+            state.queued = false;
 
-        if let Some(mut future) = future_slot.take() {
-            let scheduler = Arc::clone(&self.scheduler);
-            CURRENT_SCHEDULER.with(|current| {
-                *current.borrow_mut() = Some(scheduler);
-            });
+            let Some(future) = state.future.take() else {
+                return;
+            };
+            state.polling = true;
+            future
+        };
 
-            let poll_result = future.as_mut().poll(&mut context);
+        let scheduler = Arc::clone(&self.scheduler);
+        CURRENT_SCHEDULER.with(|current| {
+            *current.borrow_mut() = Some(scheduler);
+        });
 
-            CURRENT_SCHEDULER.with(|current| {
-                *current.borrow_mut() = None;
-            });
+        let poll_result = future.as_mut().poll(&mut context);
 
-            match poll_result {
-                Poll::Ready(()) => {
-                    self.scheduler.finish_task();
-                }
-                Poll::Pending => {
-                    *future_slot = Some(future);
-                }
+        CURRENT_SCHEDULER.with(|current| {
+            *current.borrow_mut() = None;
+        });
+
+        match poll_result {
+            Poll::Ready(()) => {
+                self.state
+                    .lock()
+                    .expect("task state mutex poisoned")
+                    .polling = false;
+                self.scheduler.finish_task();
+            }
+            Poll::Pending => {
+                let mut state = self.state.lock().expect("task state mutex poisoned");
+                state.polling = false;
+                state.future = Some(future);
             }
         }
+    }
+
+    fn mark_queued(&self) -> bool {
+        let mut state = self.state.lock().expect("task state mutex poisoned");
+        if state.queued || (state.future.is_none() && !state.polling) {
+            return false;
+        }
+
+        state.queued = true;
+        true
+    }
+
+    fn clear_queued(&self) {
+        self.state.lock().expect("task state mutex poisoned").queued = false;
     }
 }
 
@@ -391,9 +432,14 @@ impl Scheduler {
     }
 
     fn schedule(&self, task: Arc<Task>) -> Result<(), SpawnError> {
+        if !task.mark_queued() {
+            return Ok(());
+        }
+
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
             if !state.accepting {
+                task.clear_queued();
                 return Err(SpawnError);
             }
             state.task_count += 1;
@@ -405,9 +451,14 @@ impl Scheduler {
     }
 
     fn schedule_existing(&self, task: Arc<Task>) -> Result<(), SpawnError> {
+        if !task.mark_queued() {
+            return Ok(());
+        }
+
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
             if !state.accepting {
+                task.clear_queued();
                 return Err(SpawnError);
             }
             state.queue.push_back(task);
@@ -1081,6 +1132,26 @@ mod tests {
     }
 
     #[test]
+    fn repeated_wakes_share_one_ready_queue_entry() {
+        let (executor, spawner) = executor_and_spawner();
+        spawner.spawn(WakeTwiceThenPending).unwrap();
+
+        let task = executor.scheduler.next_task().unwrap();
+        task.poll();
+
+        assert_eq!(
+            executor
+                .scheduler
+                .state
+                .lock()
+                .expect("scheduler state mutex poisoned")
+                .queue
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn spawn_with_handle_returns_task_output() {
         let (executor, spawner) = executor_and_spawner();
         let result = Arc::new(Mutex::new(None));
@@ -1508,5 +1579,20 @@ mod tests {
         drop(executor);
 
         assert!(spawner.spawn(async {}).is_err());
+    }
+
+    struct WakeTwiceThenPending;
+
+    impl std::future::Future for WakeTwiceThenPending {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            context.waker().wake_by_ref();
+            context.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
     }
 }
