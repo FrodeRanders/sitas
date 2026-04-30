@@ -8,6 +8,8 @@ TARGET_DIR="${SITAS_LINUX_TARGET_DIR:-/tmp/sitas-target}"
 if [ "$#" -eq 0 ]; then
     set -- sh -lc '
         set -eu
+        export PATH="/usr/local/cargo/bin:$PATH"
+        rustup component add rustfmt
         cargo fmt --check
         cargo test
         cargo doc --no-deps
@@ -15,6 +17,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example concurrent_kv
         cargo run --example submit_kv
         cargo run --example async_kv
+        cargo run --example executor_sleep
         cargo run --example custom_placement
         cargo run --example basic_counter
         cargo run --example os_reactor

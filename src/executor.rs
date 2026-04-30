@@ -6,6 +6,7 @@
 //! Unix, the `non-std-runtime` branch parks the executor on an OS reactor wake
 //! source when no tasks are ready.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
@@ -13,11 +14,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use crate::os::{OsReactor, OsWaker};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+thread_local! {
+    static CURRENT_SCHEDULER: RefCell<Option<Arc<Scheduler>>> = const { RefCell::new(None) };
+}
 
 /// Error returned when a task cannot be submitted to an executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +156,8 @@ impl Executor {
                 task.poll();
             }
 
+            self.scheduler.wake_expired_timers();
+
             if self.scheduler.is_drained() {
                 break;
             }
@@ -157,8 +165,10 @@ impl Executor {
             #[cfg(unix)]
             let _ = self
                 .reactor
-                .wait(None)
+                .wait(self.scheduler.time_until_next_timer())
                 .expect("OS reactor wait failed while running executor");
+
+            self.scheduler.wake_expired_timers();
         }
     }
 }
@@ -187,7 +197,18 @@ impl Task {
         let mut future_slot = self.future.lock().expect("task future mutex poisoned");
 
         if let Some(mut future) = future_slot.take() {
-            match future.as_mut().poll(&mut context) {
+            let scheduler = Arc::clone(&self.scheduler);
+            CURRENT_SCHEDULER.with(|current| {
+                *current.borrow_mut() = Some(scheduler);
+            });
+
+            let poll_result = future.as_mut().poll(&mut context);
+
+            CURRENT_SCHEDULER.with(|current| {
+                *current.borrow_mut() = None;
+            });
+
+            match poll_result {
                 Poll::Ready(()) => {
                     self.scheduler.finish_task();
                 }
@@ -220,9 +241,18 @@ struct Scheduler {
 #[derive(Debug)]
 struct SchedulerState {
     queue: VecDeque<Arc<Task>>,
+    timers: Vec<TimerEntry>,
     accepting: bool,
     spawner_count: usize,
     task_count: usize,
+    next_timer_id: usize,
+}
+
+#[derive(Debug)]
+struct TimerEntry {
+    id: usize,
+    deadline: Instant,
+    waker: Waker,
 }
 
 impl Scheduler {
@@ -230,9 +260,11 @@ impl Scheduler {
         Self {
             state: Mutex::new(SchedulerState {
                 queue: VecDeque::new(),
+                timers: Vec::new(),
                 accepting: true,
                 spawner_count: 1,
                 task_count: 0,
+                next_timer_id: 0,
             }),
             #[cfg(unix)]
             waker,
@@ -317,10 +349,87 @@ impl Scheduler {
         }
     }
 
+    fn allocate_timer_id(&self) -> usize {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        let id = state.next_timer_id;
+        state.next_timer_id = state.next_timer_id.wrapping_add(1);
+        id
+    }
+
+    fn register_timer(&self, id: usize, deadline: Instant, waker: Waker) {
+        let should_wake = {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+            let previous_next = next_timer_deadline(&state.timers);
+
+            match state.timers.iter_mut().find(|timer| timer.id == id) {
+                Some(timer) => {
+                    timer.deadline = deadline;
+                    timer.waker = waker;
+                }
+                None => state.timers.push(TimerEntry {
+                    id,
+                    deadline,
+                    waker,
+                }),
+            }
+
+            previous_next.map_or(true, |previous| deadline < previous)
+        };
+
+        if should_wake {
+            self.wake_reactor();
+        }
+    }
+
+    fn remove_timer(&self, id: usize) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.timers.retain(|timer| timer.id != id);
+    }
+
+    fn wake_expired_timers(&self) {
+        let expired = {
+            let now = Instant::now();
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+            let mut expired = Vec::new();
+            let mut pending = Vec::with_capacity(state.timers.len());
+
+            for timer in state.timers.drain(..) {
+                if timer.deadline <= now {
+                    expired.push(timer.waker);
+                } else {
+                    pending.push(timer);
+                }
+            }
+
+            state.timers = pending;
+            expired
+        };
+
+        for waker in expired {
+            waker.wake();
+        }
+    }
+
+    fn time_until_next_timer(&self) -> Option<Duration> {
+        let state = self.state.lock().expect("scheduler state mutex poisoned");
+        let deadline = next_timer_deadline(&state.timers)?;
+        Some(deadline.saturating_duration_since(Instant::now()))
+    }
+
     fn wake_reactor(&self) {
         #[cfg(unix)]
         let _ = self.waker.wake();
     }
+}
+
+fn next_timer_deadline(timers: &[TimerEntry]) -> Option<Instant> {
+    timers.iter().map(|timer| timer.deadline).min()
+}
+
+fn current_scheduler() -> Arc<Scheduler> {
+    CURRENT_SCHEDULER
+        .with(|current| current.borrow().as_ref().cloned())
+        .expect("executor::sleep must be polled by sitas::executor::Executor")
 }
 
 /// Creates a paired executor and spawner.
@@ -373,6 +482,51 @@ where
     output
 }
 
+/// Returns a future that completes after `duration`.
+///
+/// This future is driven by the executor's internal timer list. It must be
+/// polled by this module's [`Executor`].
+pub fn sleep(duration: Duration) -> Sleep {
+    Sleep {
+        deadline: Instant::now() + duration,
+        timer_id: None,
+    }
+}
+
+/// Future returned by [`sleep`].
+#[derive(Debug)]
+#[must_use = "futures do nothing unless polled or awaited"]
+pub struct Sleep {
+    deadline: Instant,
+    timer_id: Option<usize>,
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if Instant::now() >= self.deadline {
+            if let Some(timer_id) = self.timer_id.take() {
+                current_scheduler().remove_timer(timer_id);
+            }
+            return Poll::Ready(());
+        }
+
+        let scheduler = current_scheduler();
+        let timer_id = match self.timer_id {
+            Some(timer_id) => timer_id,
+            None => {
+                let timer_id = scheduler.allocate_timer_id();
+                self.timer_id = Some(timer_id);
+                timer_id
+            }
+        };
+
+        scheduler.register_timer(timer_id, self.deadline, context.waker().clone());
+        Poll::Pending
+    }
+}
+
 /// Returns a future that yields once before completing.
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
@@ -401,8 +555,9 @@ impl Future for YieldNow {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_on, executor_and_spawner, yield_now};
+    use super::{block_on, executor_and_spawner, sleep, yield_now};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn block_on_returns_future_output() {
@@ -421,6 +576,44 @@ mod tests {
         });
 
         assert_eq!(&*events.lock().unwrap(), &["before", "after"]);
+    }
+
+    #[test]
+    fn sleep_delays_future_completion() {
+        let started = Instant::now();
+
+        block_on(async {
+            sleep(Duration::from_millis(10)).await;
+        });
+
+        assert!(started.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn timers_wake_in_deadline_order() {
+        let (executor, spawner) = executor_and_spawner();
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let slow_events = Arc::clone(&events);
+        spawner
+            .spawn(async move {
+                sleep(Duration::from_millis(20)).await;
+                slow_events.lock().unwrap().push("slow");
+            })
+            .unwrap();
+
+        let fast_events = Arc::clone(&events);
+        spawner
+            .spawn(async move {
+                sleep(Duration::from_millis(5)).await;
+                fast_events.lock().unwrap().push("fast");
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(&*events.lock().unwrap(), &["fast", "slow"]);
     }
 
     #[test]
@@ -502,6 +695,31 @@ mod tests {
         executor.run();
 
         assert_eq!(*result.lock().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn spawned_tasks_can_sleep_before_joining() {
+        let (executor, spawner) = executor_and_spawner();
+        let result = Arc::new(Mutex::new(None));
+        let result_for_task = Arc::clone(&result);
+
+        let worker = spawner
+            .spawn_with_handle(async {
+                sleep(Duration::from_millis(5)).await;
+                11
+            })
+            .unwrap();
+
+        spawner
+            .spawn(async move {
+                *result_for_task.lock().unwrap() = Some(worker.await);
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(*result.lock().unwrap(), Some(11));
     }
 
     #[test]
