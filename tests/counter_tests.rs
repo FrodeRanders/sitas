@@ -1,5 +1,5 @@
 use sitas::{
-    CounterShardSnapshot, RuntimeSnapshot, ShardError, ShardId, ShardedCounter,
+    executor::block_on, CounterShardSnapshot, RuntimeSnapshot, ShardError, ShardId, ShardedCounter,
     ShardedCounterConfig, DEFAULT_MAILBOX_CAPACITY,
 };
 
@@ -184,6 +184,60 @@ fn counter_submit_and_try_submit_work() {
     assert_eq!(counter.try_get_on_shard(ShardId(0)).unwrap(), 10);
 
     counter.stop().unwrap();
+}
+
+#[test]
+fn counter_replies_can_be_awaited_on_custom_executor() {
+    block_on(async {
+        let counter = ShardedCounter::start(3).unwrap();
+
+        assert_eq!(
+            counter
+                .submit_add_on_shard(ShardId(0), 4)
+                .unwrap()
+                .wait_async()
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            counter
+                .submit_add_on_shard(ShardId(1), 6)
+                .unwrap()
+                .wait_async()
+                .await
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            counter.submit_total().unwrap().wait_async().await.unwrap(),
+            10
+        );
+        assert_eq!(
+            counter
+                .submit_shard_snapshots()
+                .unwrap()
+                .wait_async()
+                .await
+                .unwrap(),
+            vec![
+                CounterShardSnapshot {
+                    shard_id: ShardId(0),
+                    value: 4
+                },
+                CounterShardSnapshot {
+                    shard_id: ShardId(1),
+                    value: 6
+                },
+                CounterShardSnapshot {
+                    shard_id: ShardId(2),
+                    value: 0
+                },
+            ]
+        );
+
+        counter.stop().unwrap();
+    });
 }
 
 #[test]

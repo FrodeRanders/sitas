@@ -2,7 +2,9 @@ use std::fmt;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::runtime::{HasShardId, Reply, RuntimeSnapshot, ShardConfig, ShardMailbox, ShardSet};
+use crate::runtime::{
+    HasShardId, Reply, ReplySender, RuntimeSnapshot, ShardConfig, ShardMailbox, ShardSet,
+};
 use crate::{ShardError, ShardId};
 
 /// Configuration for starting a [`ShardedCounter`] instance.
@@ -88,6 +90,15 @@ impl CounterTotalReply {
             Ok(total + reply.wait_timeout(timeout)?)
         })
     }
+
+    /// Awaits all shard counter replies and returns their sum.
+    pub async fn wait_async(self) -> Result<i64, ShardError> {
+        let mut total = 0i64;
+        for reply in self.replies {
+            total += reply.wait_async().await?;
+        }
+        Ok(total)
+    }
 }
 
 /// Reply handle for a per-shard counter snapshot request.
@@ -133,6 +144,18 @@ impl CounterShardSnapshotsReply {
             })
             .collect()
     }
+
+    /// Awaits all shard snapshot replies.
+    pub async fn wait_async(self) -> Result<Vec<CounterShardSnapshot>, ShardError> {
+        let mut snapshots = Vec::with_capacity(self.replies.len());
+        for (shard_id, reply) in self.replies {
+            snapshots.push(CounterShardSnapshot {
+                shard_id,
+                value: reply.wait_async().await?,
+            });
+        }
+        Ok(snapshots)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -154,13 +177,13 @@ impl CounterService {
 enum CounterCommand {
     Add {
         delta: i64,
-        reply: mpsc::Sender<i64>,
+        reply: ReplySender<i64>,
     },
     Get {
-        reply: mpsc::Sender<i64>,
+        reply: ReplySender<i64>,
     },
     Stop {
-        reply: mpsc::Sender<()>,
+        reply: ReplySender<()>,
     },
     #[cfg(test)]
     Hold {
@@ -479,6 +502,7 @@ fn run_counter_shard(receiver: mpsc::Receiver<CounterCommand>) {
 #[cfg(test)]
 mod tests {
     use super::{CounterCommand, CounterService, ShardedCounter, ShardedCounterConfig};
+    use crate::runtime::reply_channel;
     use crate::{ShardError, ShardId, DEFAULT_MAILBOX_CAPACITY};
     use std::time::Duration;
 
@@ -514,7 +538,7 @@ mod tests {
         shard
             .mailbox
             .try_send(CounterCommand::Get {
-                reply: std::sync::mpsc::channel().0,
+                reply: reply_channel().0,
             })
             .unwrap();
 

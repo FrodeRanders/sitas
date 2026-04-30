@@ -4,7 +4,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::placement::{HashPlacement, Placement};
-use crate::runtime::{HasShardId, Reply, RuntimeSnapshot, ShardConfig, ShardMailbox, ShardSet};
+use crate::runtime::{
+    HasShardId, Reply, ReplySender, RuntimeSnapshot, ShardConfig, ShardMailbox, ShardSet,
+};
 use crate::{ShardError, ShardId, ShardSnapshot};
 
 /// Reply handle for an accepted key-value command.
@@ -84,6 +86,15 @@ impl KvTotalLenReply {
             Ok(total + reply.wait_timeout(timeout)?)
         })
     }
+
+    /// Awaits all shard length replies and returns their sum.
+    pub async fn wait_async(self) -> Result<usize, ShardError> {
+        let mut total = 0usize;
+        for reply in self.replies {
+            total += reply.wait_async().await?;
+        }
+        Ok(total)
+    }
 }
 
 /// Reply handle for a per-shard snapshot request.
@@ -129,6 +140,18 @@ impl KvShardSnapshotsReply {
             })
             .collect()
     }
+
+    /// Awaits all shard snapshot replies.
+    pub async fn wait_async(self) -> Result<Vec<ShardSnapshot>, ShardError> {
+        let mut snapshots = Vec::with_capacity(self.replies.len());
+        for (shard_id, reply) in self.replies {
+            snapshots.push(ShardSnapshot {
+                shard_id,
+                len: reply.wait_async().await?,
+            });
+        }
+        Ok(snapshots)
+    }
 }
 
 /// Reply handle for an all-keys request across all shards.
@@ -173,6 +196,16 @@ impl KvAllKeysReply {
         keys.sort();
         Ok(keys)
     }
+
+    /// Awaits all shard key replies and returns sorted owned keys.
+    pub async fn wait_async(self) -> Result<Vec<String>, ShardError> {
+        let mut keys = Vec::new();
+        for reply in self.replies {
+            keys.extend(reply.wait_async().await?);
+        }
+        keys.sort();
+        Ok(keys)
+    }
 }
 
 /// Reply handle for a multi-key get request.
@@ -209,6 +242,15 @@ impl KvGetManyReply {
             .into_iter()
             .map(|(key, reply)| Ok((key, reply.wait_timeout(timeout)?)))
             .collect()
+    }
+
+    /// Awaits all key replies and returns results in input order.
+    pub async fn wait_async(self) -> Result<Vec<(String, Option<String>)>, ShardError> {
+        let mut values = Vec::with_capacity(self.replies.len());
+        for (key, reply) in self.replies {
+            values.push((key, reply.wait_async().await?));
+        }
+        Ok(values)
     }
 }
 
@@ -247,6 +289,15 @@ impl KvDeleteManyReply {
             .into_iter()
             .map(|(key, reply)| Ok((key, reply.wait_timeout(timeout)?)))
             .collect()
+    }
+
+    /// Awaits all delete replies and returns results in input order.
+    pub async fn wait_async(self) -> Result<Vec<(String, Option<String>)>, ShardError> {
+        let mut values = Vec::with_capacity(self.replies.len());
+        for (key, reply) in self.replies {
+            values.push((key, reply.wait_async().await?));
+        }
+        Ok(values)
     }
 }
 
@@ -300,36 +351,36 @@ impl KvService {
 enum KvCommand {
     Get {
         key: String,
-        reply: mpsc::Sender<Option<String>>,
+        reply: ReplySender<Option<String>>,
     },
     Put {
         key: String,
         value: String,
-        reply: mpsc::Sender<()>,
+        reply: ReplySender<()>,
     },
     CompareAndPut {
         key: String,
         expected: Option<String>,
         value: String,
-        reply: mpsc::Sender<bool>,
+        reply: ReplySender<bool>,
     },
     GetOrPut {
         key: String,
         value: String,
-        reply: mpsc::Sender<String>,
+        reply: ReplySender<String>,
     },
     Delete {
         key: String,
-        reply: mpsc::Sender<Option<String>>,
+        reply: ReplySender<Option<String>>,
     },
     Len {
-        reply: mpsc::Sender<usize>,
+        reply: ReplySender<usize>,
     },
     Keys {
-        reply: mpsc::Sender<Vec<String>>,
+        reply: ReplySender<Vec<String>>,
     },
     Stop {
-        reply: mpsc::Sender<()>,
+        reply: ReplySender<()>,
     },
     #[cfg(test)]
     Hold {
@@ -1212,6 +1263,7 @@ fn run_kv_shard(receiver: mpsc::Receiver<KvCommand>) {
 #[cfg(test)]
 mod tests {
     use super::{KvCommand, KvService, ShardedKv, ShardedKvConfig};
+    use crate::runtime::reply_channel;
     use crate::{ShardError, ShardId, DEFAULT_MAILBOX_CAPACITY};
     use std::time::Duration;
 
@@ -1327,7 +1379,7 @@ mod tests {
         shard
             .mailbox
             .try_send(KvCommand::Len {
-                reply: std::sync::mpsc::channel().0,
+                reply: reply_channel().0,
             })
             .unwrap();
 

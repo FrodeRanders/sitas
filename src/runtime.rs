@@ -1,7 +1,11 @@
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{ShardError, ShardId};
 
@@ -64,25 +68,71 @@ pub struct RuntimeSnapshot {
 /// reply channel once without blocking.
 #[must_use]
 pub struct Reply<T> {
-    receiver: mpsc::Receiver<T>,
+    shared: Arc<ReplyShared<T>>,
 }
 
 impl<T> Reply<T> {
-    pub(crate) fn new(receiver: mpsc::Receiver<T>) -> Self {
-        Self { receiver }
+    fn new(shared: Arc<ReplyShared<T>>) -> Self {
+        Self { shared }
     }
 
     /// Waits for the shard reply and returns the owned response value.
     pub fn wait(self) -> Result<T, ShardError> {
-        self.receiver.recv().map_err(|_| ShardError::ReplyFailed)
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("reply state mutex poisoned");
+
+        loop {
+            if let Some(value) = state.value.take() {
+                return Ok(value);
+            }
+            if !state.sender_alive {
+                return Err(ShardError::ReplyFailed);
+            }
+
+            state = self
+                .shared
+                .ready
+                .wait(state)
+                .expect("reply state mutex poisoned");
+        }
     }
 
     /// Waits for the shard reply until `timeout` expires.
     pub fn wait_timeout(self, timeout: Duration) -> Result<T, ShardError> {
-        match self.receiver.recv_timeout(timeout) {
-            Ok(value) => Ok(value),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ShardError::ReplyTimeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ShardError::ReplyFailed),
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("reply state mutex poisoned");
+
+        loop {
+            if let Some(value) = state.value.take() {
+                return Ok(value);
+            }
+            if !state.sender_alive {
+                return Err(ShardError::ReplyFailed);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ShardError::ReplyTimeout);
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_state, timeout_result) = self
+                .shared
+                .ready
+                .wait_timeout(state, remaining)
+                .expect("reply state mutex poisoned");
+            state = next_state;
+
+            if timeout_result.timed_out() && state.value.is_none() {
+                return Err(ShardError::ReplyTimeout);
+            }
         }
     }
 
@@ -91,10 +141,30 @@ impl<T> Reply<T> {
     /// Returns `Ok(None)` when the shard has not replied yet. Returns
     /// `Ok(Some(value))` when the reply is ready.
     pub fn try_wait(&self) -> Result<Option<T>, ShardError> {
-        match self.receiver.try_recv() {
-            Ok(value) => Ok(Some(value)),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Err(ShardError::ReplyFailed),
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("reply state mutex poisoned");
+
+        if let Some(value) = state.value.take() {
+            Ok(Some(value))
+        } else if state.sender_alive {
+            Ok(None)
+        } else {
+            Err(ShardError::ReplyFailed)
+        }
+    }
+}
+
+impl<T: Send + 'static> Reply<T> {
+    /// Converts this reply handle into a future.
+    ///
+    /// The future registers its task waker directly in this reply's one-shot
+    /// state and is woken when the shard sends the response.
+    pub fn wait_async(self) -> ReplyFuture<T> {
+        ReplyFuture {
+            shared: self.shared,
         }
     }
 }
@@ -105,9 +175,119 @@ impl<T> fmt::Debug for Reply<T> {
     }
 }
 
-pub(crate) fn reply_channel<T>() -> (mpsc::Sender<T>, Reply<T>) {
-    let (sender, receiver) = mpsc::channel();
-    (sender, Reply::new(receiver))
+pub(crate) struct ReplySender<T> {
+    shared: Arc<ReplyShared<T>>,
+}
+
+impl<T> ReplySender<T> {
+    pub(crate) fn send(self, value: T) -> Result<(), T> {
+        let waker = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("reply state mutex poisoned");
+            if state.value.is_some() {
+                return Err(value);
+            }
+
+            state.value = Some(value);
+            state.sender_alive = false;
+            state.waker.take()
+        };
+
+        self.shared.ready.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+
+        Ok(())
+    }
+}
+
+impl<T> Drop for ReplySender<T> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("reply state mutex poisoned");
+            if !state.sender_alive {
+                return;
+            }
+
+            state.sender_alive = false;
+            state.waker.take()
+        };
+
+        self.shared.ready.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+pub(crate) fn reply_channel<T>() -> (ReplySender<T>, Reply<T>) {
+    let shared = Arc::new(ReplyShared {
+        state: Mutex::new(ReplyState {
+            value: None,
+            sender_alive: true,
+            waker: None,
+        }),
+        ready: Condvar::new(),
+    });
+
+    (
+        ReplySender {
+            shared: Arc::clone(&shared),
+        },
+        Reply::new(shared),
+    )
+}
+
+struct ReplyShared<T> {
+    state: Mutex<ReplyState<T>>,
+    ready: Condvar,
+}
+
+struct ReplyState<T> {
+    value: Option<T>,
+    sender_alive: bool,
+    waker: Option<Waker>,
+}
+
+/// Future returned by [`Reply::wait_async`].
+#[must_use = "futures do nothing unless polled or awaited"]
+pub struct ReplyFuture<T> {
+    shared: Arc<ReplyShared<T>>,
+}
+
+impl<T> fmt::Debug for ReplyFuture<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplyFuture").finish_non_exhaustive()
+    }
+}
+
+impl<T> Future for ReplyFuture<T> {
+    type Output = Result<T, ShardError>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("reply state mutex poisoned");
+
+        if let Some(value) = state.value.take() {
+            Poll::Ready(Ok(value))
+        } else if state.sender_alive {
+            state.waker = Some(context.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(ShardError::ReplyFailed))
+        }
+    }
 }
 
 pub(crate) struct ShardMailbox<C> {
@@ -137,7 +317,7 @@ impl<C> ShardMailbox<C> {
 
     pub(crate) fn request<T, F>(&self, build: F) -> Result<Reply<T>, ShardError>
     where
-        F: FnOnce(mpsc::Sender<T>) -> C,
+        F: FnOnce(ReplySender<T>) -> C,
     {
         let (reply, receiver) = reply_channel();
         self.send(build(reply))?;
@@ -146,7 +326,7 @@ impl<C> ShardMailbox<C> {
 
     pub(crate) fn try_request<T, F>(&self, build: F) -> Result<Reply<T>, ShardError>
     where
-        F: FnOnce(mpsc::Sender<T>) -> C,
+        F: FnOnce(ReplySender<T>) -> C,
     {
         let (reply, receiver) = reply_channel();
         self.try_send(build(reply))?;
@@ -155,11 +335,11 @@ impl<C> ShardMailbox<C> {
 
     pub(crate) fn request_stopped<T, F>(&self, build: F) -> Result<T, ShardError>
     where
-        F: FnOnce(mpsc::Sender<T>) -> C,
+        F: FnOnce(ReplySender<T>) -> C,
     {
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = reply_channel();
         self.send_stopped(build(reply))?;
-        receiver.recv().map_err(|_| ShardError::ReplyFailed)
+        receiver.wait()
     }
 }
 
@@ -301,8 +481,11 @@ fn map_try_send_error<C>(error: mpsc::TrySendError<C>) -> ShardError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShardConfig, DEFAULT_MAILBOX_CAPACITY};
+    use super::{reply_channel, ShardConfig, DEFAULT_MAILBOX_CAPACITY};
+    use crate::executor::block_on;
     use crate::ShardError;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn shard_config_uses_default_mailbox_capacity() {
@@ -329,5 +512,17 @@ mod tests {
                 .unwrap_err(),
             ShardError::InvalidMailboxCapacity
         );
+    }
+
+    #[test]
+    fn reply_future_wakes_after_sender_replies() {
+        let (sender, reply) = reply_channel();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            sender.send(17).unwrap();
+        });
+
+        assert_eq!(block_on(async move { reply.wait_async().await }), Ok(17));
     }
 }

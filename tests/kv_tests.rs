@@ -1,3 +1,4 @@
+use sitas::executor::block_on;
 use sitas::placement::Placement;
 use sitas::{RuntimeSnapshot, ShardError, ShardId, ShardSnapshot, ShardedKv, ShardedKvConfig};
 use std::error::Error;
@@ -193,6 +194,51 @@ fn submit_put_and_submit_get_can_wait_later() {
     assert_eq!(get.wait().unwrap(), Some("one".to_string()));
 
     kv.stop().unwrap();
+}
+
+#[test]
+fn replies_can_be_awaited_on_custom_executor() {
+    block_on(async {
+        let kv = ShardedKv::start(4).unwrap();
+
+        kv.submit_put("alpha", "one")
+            .unwrap()
+            .wait_async()
+            .await
+            .unwrap();
+        kv.submit_put("beta", "two")
+            .unwrap()
+            .wait_async()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            kv.submit_get("alpha").unwrap().wait_async().await.unwrap(),
+            Some("one".to_string())
+        );
+        assert_eq!(
+            kv.submit_get_many(["beta", "alpha", "missing"])
+                .unwrap()
+                .wait_async()
+                .await
+                .unwrap(),
+            vec![
+                ("beta".to_string(), Some("two".to_string())),
+                ("alpha".to_string(), Some("one".to_string())),
+                ("missing".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            kv.submit_total_len().unwrap().wait_async().await.unwrap(),
+            2
+        );
+        assert_eq!(
+            kv.submit_all_keys().unwrap().wait_async().await.unwrap(),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+
+        kv.stop().unwrap();
+    });
 }
 
 #[test]

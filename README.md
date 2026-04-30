@@ -13,7 +13,8 @@ The current version implements a sharded key-value store using only the Rust
 standard library:
 
 - a small reusable std-only runtime layer
-- a minimal std-only executor experiment with custom wakers and join handles
+- a minimal std-only executor experiment with custom wakers, join handles, and
+  awaitable shard replies
 - one OS thread per shard
 - one mailbox per shard
 - bounded shard mailboxes
@@ -28,7 +29,8 @@ standard library:
 - basic backpressure by blocking callers when a shard mailbox is full
 - `try_*` operations that report a full mailbox instead of waiting for capacity
 - `submit_*` operations that enqueue a command and return a reply handle for
-  waiting later
+  blocking or async waiting later
+- std-only one-shot replies that can store wakers for the custom executor
 - multi-key reads and deletes that preserve caller-provided key order
 - owned per-shard snapshots for observing distribution without sharing state
 - owned key snapshots for debugging and inspection
@@ -65,8 +67,8 @@ This milestone does not include:
 - procedural macro service generation
 - `unsafe`
 
-Later milestones may connect the executor experiment to shard replies, add
-async I/O, CPU affinity, backpressure, and OS-specific runtime backends.
+Later milestones may add async I/O, CPU affinity, backpressure, and OS-specific
+runtime backends.
 
 ## Platform Notes
 
@@ -117,6 +119,12 @@ Run the submit-and-wait-later example:
 cargo run --example submit_kv
 ```
 
+Run the custom-executor async reply example:
+
+```sh
+cargo run --example async_kv
+```
+
 Run the custom placement example:
 
 ```sh
@@ -141,6 +149,7 @@ cargo doc --no-deps
 cargo run --example basic_kv
 cargo run --example concurrent_kv
 cargo run --example submit_kv
+cargo run --example async_kv
 cargo run --example custom_placement
 cargo run --example basic_counter
 ```

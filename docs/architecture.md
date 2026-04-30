@@ -25,8 +25,14 @@ It deliberately does not know about key-value commands or service state.
 - join handles let tasks await typed outputs from spawned tasks
 - `yield_now` proves cooperative wakeups without third-party runtimes
 
-It is not wired into the shard services yet. The executor may use synchronization
-for task bookkeeping, but application service state remains shard-local.
+Shard reply handles can be converted into awaitable futures through
+`wait_async`. Replies use a small custom std-only one-shot primitive rather than
+`std::sync::mpsc`, so a waiting future can store its task waker directly in the
+reply state. When the shard sends the response, the reply wakes the task on the
+custom executor.
+
+The executor and reply futures may use synchronization for task bookkeeping, but
+application service state remains shard-local.
 
 `ShardedKv` owns:
 
@@ -45,7 +51,7 @@ Each shard thread owns:
 
 ## Request Flow
 
-For `put`, `get`, and `delete`:
+For blocking `put`, `get`, and `delete`:
 
 1. `ShardedKv` routes the key through the default hash placement strategy.
 2. The matching `KvShardHandle` creates a one-shot reply channel.
@@ -55,6 +61,9 @@ For `put`, `get`, and `delete`:
 6. The shard replies with an owned value.
 
 No references into shard-local state cross the mailbox boundary.
+
+For submitted commands, steps 1-3 are the same. The returned reply handle can
+then be consumed by `wait`, `wait_timeout`, or `wait_async`.
 
 ## Placement
 
@@ -78,14 +87,15 @@ attempt to enqueue without waiting for mailbox capacity and return
 `ShardError::MailboxFull` if the queue is saturated.
 
 Once a command is accepted into a mailbox, both the blocking and `try_*` methods
-wait for the shard's reply. This is deliberately simple backpressure: no async
-runtime, no polling API, and no scheduler integration yet.
+wait for the shard's reply. Submitted reply handles can be awaited through the
+custom executor, but mailbox enqueue itself is still synchronous.
 
 ## Reply Handles
 
 The `submit_*` methods enqueue commands and return `KvReply<T>` handles. This
 lets a caller issue multiple commands first and then call `wait` on each reply
-later. These handles are blocking one-shot receivers, not futures.
+later. Callers can also consume a reply with `wait_async` to await it on the
+custom executor.
 
 The `try_submit_*` methods combine non-blocking mailbox enqueue with delayed
 waiting. If the mailbox has capacity, the caller receives a reply handle. If the
@@ -94,6 +104,10 @@ mailbox is full, the call returns `ShardError::MailboxFull`.
 Reply handles also support `try_wait` for a single non-blocking poll and
 `wait_timeout` for bounded blocking waits. A timeout is reported as
 `ShardError::ReplyTimeout`.
+
+Aggregate reply handles, such as total length, all keys, multi-key reads,
+multi-key deletes, counter totals, and per-shard snapshots, also expose
+`wait_async`.
 
 ## Snapshots
 
@@ -144,10 +158,8 @@ return errors.
 
 This milestone does not implement:
 
-- async/await
 - non-blocking I/O
 - a reactor
-- a custom executor
 - actor framework behavior
 - networking
 - persistence

@@ -3,8 +3,8 @@
 //! The project is inspired by Seastar's shard-per-core, shared-nothing model,
 //! but this first milestone deliberately uses only the Rust standard library to
 //! validate small architectural kernels: shard-local ownership, bounded
-//! mailboxes, reply handles, typed message passing, and a minimal executor
-//! experiment.
+//! mailboxes, blocking and awaitable reply handles, typed message passing, and a
+//! minimal executor experiment.
 //!
 //! Application state is owned by a shard thread. Other threads interact with
 //! that state only by sending typed messages to the owning shard. No mutex
@@ -21,8 +21,8 @@
 //! - scheduling classes
 //! - procedural macro service generation
 //!
-//! Later milestones may add async I/O, custom executors, CPU pinning,
-//! backpressure, and runtime backends.
+//! Later milestones may add async I/O, CPU pinning, backpressure, and runtime
+//! backends.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -51,5 +51,5 @@ pub use kv::{
     KvAllKeysReply, KvDeleteManyReply, KvGetManyReply, KvReply, KvShardSnapshotsReply,
     KvTotalLenReply, ShardedKv, ShardedKvConfig,
 };
-pub use runtime::{RuntimeSnapshot, DEFAULT_MAILBOX_CAPACITY};
+pub use runtime::{ReplyFuture, RuntimeSnapshot, DEFAULT_MAILBOX_CAPACITY};
 pub use shard::{ShardId, ShardSnapshot};
