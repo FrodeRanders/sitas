@@ -11,6 +11,8 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -163,10 +165,16 @@ impl Executor {
             }
 
             #[cfg(unix)]
-            let _ = self
-                .reactor
-                .wait(self.scheduler.time_until_next_timer())
-                .expect("OS reactor wait failed while running executor");
+            {
+                let event = self
+                    .reactor
+                    .wait_readable(
+                        &self.scheduler.read_interest_fds(),
+                        self.scheduler.time_until_next_timer(),
+                    )
+                    .expect("OS reactor wait failed while running executor");
+                self.scheduler.wake_readable_fds(&event.readable);
+            }
 
             self.scheduler.wake_expired_timers();
         }
@@ -242,10 +250,13 @@ struct Scheduler {
 struct SchedulerState {
     queue: VecDeque<Arc<Task>>,
     timers: Vec<TimerEntry>,
+    read_interests: Vec<ReadInterest>,
+    ready_read_interests: Vec<usize>,
     accepting: bool,
     spawner_count: usize,
     task_count: usize,
     next_timer_id: usize,
+    next_read_interest_id: usize,
 }
 
 #[derive(Debug)]
@@ -255,16 +266,27 @@ struct TimerEntry {
     waker: Waker,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct ReadInterest {
+    id: usize,
+    fd: RawFd,
+    waker: Waker,
+}
+
 impl Scheduler {
     fn new(#[cfg(unix)] waker: OsWaker) -> Self {
         Self {
             state: Mutex::new(SchedulerState {
                 queue: VecDeque::new(),
                 timers: Vec::new(),
+                read_interests: Vec::new(),
+                ready_read_interests: Vec::new(),
                 accepting: true,
                 spawner_count: 1,
                 task_count: 0,
                 next_timer_id: 0,
+                next_read_interest_id: 0,
             }),
             #[cfg(unix)]
             waker,
@@ -416,6 +438,96 @@ impl Scheduler {
         Some(deadline.saturating_duration_since(Instant::now()))
     }
 
+    #[cfg(unix)]
+    fn allocate_read_interest_id(&self) -> usize {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        let id = state.next_read_interest_id;
+        state.next_read_interest_id = state.next_read_interest_id.wrapping_add(1);
+        id
+    }
+
+    #[cfg(unix)]
+    fn register_read_interest(&self, id: usize, fd: RawFd, waker: Waker) {
+        {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+
+            match state
+                .read_interests
+                .iter_mut()
+                .find(|interest| interest.id == id)
+            {
+                Some(interest) => {
+                    interest.fd = fd;
+                    interest.waker = waker;
+                }
+                None => state.read_interests.push(ReadInterest { id, fd, waker }),
+            }
+        }
+
+        self.wake_reactor();
+    }
+
+    #[cfg(unix)]
+    fn remove_read_interest(&self, id: usize) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.read_interests.retain(|interest| interest.id != id);
+        state
+            .ready_read_interests
+            .retain(|ready_id| *ready_id != id);
+    }
+
+    #[cfg(unix)]
+    fn read_interest_fds(&self) -> Vec<RawFd> {
+        let state = self.state.lock().expect("scheduler state mutex poisoned");
+        state
+            .read_interests
+            .iter()
+            .map(|interest| interest.fd)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn wake_readable_fds(&self, readable: &[RawFd]) {
+        let wakers = {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+            let mut wakers = Vec::new();
+            let mut ready_ids = Vec::new();
+            let mut pending = Vec::with_capacity(state.read_interests.len());
+
+            for interest in state.read_interests.drain(..) {
+                if readable.contains(&interest.fd) {
+                    ready_ids.push(interest.id);
+                    wakers.push(interest.waker);
+                } else {
+                    pending.push(interest);
+                }
+            }
+
+            state.read_interests = pending;
+            state.ready_read_interests.extend(ready_ids);
+            wakers
+        };
+
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    #[cfg(unix)]
+    fn take_ready_read_interest(&self, id: usize) -> bool {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        let Some(position) = state
+            .ready_read_interests
+            .iter()
+            .position(|ready_id| *ready_id == id)
+        else {
+            return false;
+        };
+
+        state.ready_read_interests.swap_remove(position);
+        true
+    }
+
     fn wake_reactor(&self) {
         #[cfg(unix)]
         let _ = self.waker.wake();
@@ -493,6 +605,60 @@ pub fn sleep(duration: Duration) -> Sleep {
     }
 }
 
+/// Returns a future that completes when `fd` is readable.
+#[cfg(unix)]
+pub fn readable(fd: RawFd) -> Readable {
+    Readable {
+        fd,
+        interest_id: None,
+        scheduler: None,
+    }
+}
+
+/// Future returned by [`readable`].
+#[cfg(unix)]
+#[derive(Debug)]
+#[must_use = "futures do nothing unless polled or awaited"]
+pub struct Readable {
+    fd: RawFd,
+    interest_id: Option<usize>,
+    scheduler: Option<Arc<Scheduler>>,
+}
+
+#[cfg(unix)]
+impl Future for Readable {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let scheduler = current_scheduler();
+        self.scheduler = Some(Arc::clone(&scheduler));
+        let interest_id = match self.interest_id {
+            Some(interest_id) => interest_id,
+            None => {
+                let interest_id = scheduler.allocate_read_interest_id();
+                self.interest_id = Some(interest_id);
+                interest_id
+            }
+        };
+
+        if scheduler.take_ready_read_interest(interest_id) {
+            return Poll::Ready(());
+        }
+
+        scheduler.register_read_interest(interest_id, self.fd, context.waker().clone());
+        Poll::Pending
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Readable {
+    fn drop(&mut self) {
+        if let (Some(scheduler), Some(interest_id)) = (&self.scheduler, self.interest_id) {
+            scheduler.remove_read_interest(interest_id);
+        }
+    }
+}
+
 /// Future returned by [`sleep`].
 #[derive(Debug)]
 #[must_use = "futures do nothing unless polled or awaited"]
@@ -555,8 +721,18 @@ impl Future for YieldNow {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::readable;
     use super::{block_on, executor_and_spawner, sleep, yield_now};
+    #[cfg(unix)]
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::os::unix::io::AsRawFd;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -720,6 +896,82 @@ mod tests {
         executor.run();
 
         assert_eq!(*result.lock().unwrap(), Some(11));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_future_completes_when_fd_becomes_readable() {
+        let (executor, spawner) = executor_and_spawner();
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let reader_fd = reader.as_raw_fd();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                readable(reader_fd).await;
+
+                let mut byte = [0u8; 1];
+                reader.read_exact(&mut byte).unwrap();
+                *output_for_task.lock().unwrap() = Some(byte[0]);
+            })
+            .unwrap();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            writer.write_all(b"x").unwrap();
+        });
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(*output.lock().unwrap(), Some(b'x'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiple_tasks_can_wait_for_different_readable_fds() {
+        let (executor, spawner) = executor_and_spawner();
+        let (mut first_reader, mut first_writer) = UnixStream::pair().unwrap();
+        let (mut second_reader, mut second_writer) = UnixStream::pair().unwrap();
+        first_reader.set_nonblocking(true).unwrap();
+        second_reader.set_nonblocking(true).unwrap();
+        let first_fd = first_reader.as_raw_fd();
+        let second_fd = second_reader.as_raw_fd();
+        let output = Arc::new(Mutex::new(Vec::new()));
+
+        let first_output = Arc::clone(&output);
+        spawner
+            .spawn(async move {
+                readable(first_fd).await;
+                let mut byte = [0u8; 1];
+                first_reader.read_exact(&mut byte).unwrap();
+                first_output.lock().unwrap().push(byte[0]);
+            })
+            .unwrap();
+
+        let second_output = Arc::clone(&output);
+        spawner
+            .spawn(async move {
+                readable(second_fd).await;
+                let mut byte = [0u8; 1];
+                second_reader.read_exact(&mut byte).unwrap();
+                second_output.lock().unwrap().push(byte[0]);
+            })
+            .unwrap();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            second_writer.write_all(b"b").unwrap();
+            thread::sleep(Duration::from_millis(5));
+            first_writer.write_all(b"a").unwrap();
+        });
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(&*output.lock().unwrap(), b"ba");
     }
 
     #[test]

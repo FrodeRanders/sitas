@@ -14,7 +14,8 @@ standard library:
 
 - a small reusable std-only runtime layer
 - a minimal executor experiment with custom wakers, join handles, awaitable
-  shard replies, timers, and OS-backed sleeping on this branch
+  shard replies, timers, OS-backed sleeping, and read-readiness futures on this
+  branch
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
   and read readiness
 - one OS thread per shard
@@ -127,6 +128,12 @@ Run the custom-executor async reply example:
 cargo run --example async_kv
 ```
 
+Run the executor read-readiness future example:
+
+```sh
+cargo run --example async_readable
+```
+
 Run the executor timer example:
 
 ```sh
@@ -170,6 +177,7 @@ cargo run --example basic_kv
 cargo run --example concurrent_kv
 cargo run --example submit_kv
 cargo run --example async_kv
+cargo run --example async_readable
 cargo run --example executor_sleep
 cargo run --example custom_placement
 cargo run --example basic_counter

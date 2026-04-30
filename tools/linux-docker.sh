@@ -17,6 +17,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example concurrent_kv
         cargo run --example submit_kv
         cargo run --example async_kv
+        cargo run --example async_readable
         cargo run --example executor_sleep
         cargo run --example custom_placement
         cargo run --example basic_counter
