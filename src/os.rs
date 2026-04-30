@@ -7,8 +7,9 @@
 
 use std::fmt;
 use std::io;
+use std::net::{SocketAddrV4, TcpStream};
 use std::os::raw::{c_int, c_short, c_void};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,11 +17,14 @@ use std::time::Duration;
 type Nfds = std::os::raw::c_ulong;
 #[cfg(not(target_os = "linux"))]
 type Nfds = u32;
+type SockLen = u32;
 
 const POLLIN: c_short = 0x0001;
 const POLLOUT: c_short = 0x0004;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
+const AF_INET: c_int = 2;
+const SOCK_STREAM: c_int = 1;
 
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: c_int = 0o4000;
@@ -29,6 +33,10 @@ const O_NONBLOCK: c_int = 0x0004;
 
 const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
+#[cfg(target_os = "linux")]
+const EINPROGRESS: c_int = 115;
+#[cfg(not(target_os = "linux"))]
+const EINPROGRESS: c_int = 36;
 #[cfg(not(target_os = "linux"))]
 const EWOULDBLOCK: c_int = 35;
 
@@ -37,6 +45,30 @@ struct PollFd {
     fd: c_int,
     events: c_short,
     revents: c_short,
+}
+
+#[repr(C)]
+struct InAddr {
+    s_addr: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct SockAddrIn {
+    sin_family: u16,
+    sin_port: u16,
+    sin_addr: InAddr,
+    sin_zero: [u8; 8],
+}
+
+#[cfg(not(target_os = "linux"))]
+#[repr(C)]
+struct SockAddrIn {
+    sin_len: u8,
+    sin_family: u8,
+    sin_port: u16,
+    sin_addr: InAddr,
+    sin_zero: [u8; 8],
 }
 
 impl PollFd {
@@ -59,10 +91,12 @@ impl PollFd {
 
 extern "C" {
     fn close(fd: c_int) -> c_int;
+    fn connect(fd: c_int, address: *const c_void, length: SockLen) -> c_int;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
     fn pipe(fds: *mut c_int) -> c_int;
     fn poll(fds: *mut PollFd, nfds: Nfds, timeout: c_int) -> c_int;
     fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
+    fn socket(domain: c_int, socket_type: c_int, protocol: c_int) -> c_int;
     fn write(fd: c_int, buffer: *const c_void, count: usize) -> isize;
 }
 
@@ -286,6 +320,44 @@ pub struct OsEvent {
     pub writable: Vec<RawFd>,
 }
 
+/// Starts a non-blocking IPv4 TCP connection.
+///
+/// If the connection is still in progress, the returned stream should be
+/// awaited for writability and then checked with `TcpStream::take_error`.
+pub fn tcp_connect_start_v4(address: SocketAddrV4) -> io::Result<TcpStream> {
+    // SAFETY: `socket` is called with constant address family/type values and
+    // no borrowed memory.
+    let fd = unsafe { socket(AF_INET, SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(last_os_error());
+    }
+
+    let fd = OwnedFd::new(fd);
+    set_nonblocking(fd.raw())?;
+
+    let socket_address = socket_addr_v4(address);
+    // SAFETY: `socket_address` is a properly initialized IPv4 socket address
+    // whose pointer is valid for the duration of the call.
+    let result = unsafe {
+        connect(
+            fd.raw(),
+            (&socket_address as *const SockAddrIn).cast::<c_void>(),
+            std::mem::size_of::<SockAddrIn>() as SockLen,
+        )
+    };
+
+    if result == 0 {
+        return Ok(fd.into_tcp_stream());
+    }
+
+    let error = last_os_error();
+    if error.raw_os_error() == Some(EINPROGRESS) || is_would_block(&error) {
+        return Ok(fd.into_tcp_stream());
+    }
+
+    Err(error)
+}
+
 #[derive(Debug)]
 struct OwnedFd {
     fd: RawFd,
@@ -298,6 +370,14 @@ impl OwnedFd {
 
     fn raw(&self) -> RawFd {
         self.fd
+    }
+
+    fn into_tcp_stream(self) -> TcpStream {
+        let fd = self.fd;
+        std::mem::forget(self);
+        // SAFETY: `fd` is an owned TCP socket descriptor and ownership is
+        // transferred to `TcpStream`.
+        unsafe { TcpStream::from_raw_fd(fd) }
     }
 }
 
@@ -324,6 +404,31 @@ fn create_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     set_nonblocking(write_fd.raw())?;
 
     Ok((read_fd, write_fd))
+}
+
+#[cfg(target_os = "linux")]
+fn socket_addr_v4(address: SocketAddrV4) -> SockAddrIn {
+    SockAddrIn {
+        sin_family: AF_INET as u16,
+        sin_port: address.port().to_be(),
+        sin_addr: InAddr {
+            s_addr: u32::from_be_bytes(address.ip().octets()).to_be(),
+        },
+        sin_zero: [0; 8],
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_addr_v4(address: SocketAddrV4) -> SockAddrIn {
+    SockAddrIn {
+        sin_len: std::mem::size_of::<SockAddrIn>() as u8,
+        sin_family: AF_INET as u8,
+        sin_port: address.port().to_be(),
+        sin_addr: InAddr {
+            s_addr: u32::from_be_bytes(address.ip().octets()).to_be(),
+        },
+        sin_zero: [0; 8],
+    }
 }
 
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {

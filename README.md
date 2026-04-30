@@ -16,8 +16,8 @@ standard library:
 - a minimal executor experiment with custom wakers, join handles, awaitable
   shard replies, timers, OS-backed sleeping, and read/write-readiness futures on
   this branch
-- small async accept, read, write, and copy helpers layered on non-blocking Unix
-  descriptors
+- small async connect, accept, read, write, and copy helpers layered on
+  non-blocking Unix descriptors
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
   and descriptor readiness
 - one OS thread per shard
@@ -136,6 +136,12 @@ Run the executor async accept helper example:
 cargo run --example async_accept
 ```
 
+Run the executor async connect helper example:
+
+```sh
+cargo run --example async_connect
+```
+
 Run the executor TCP echo example:
 
 ```sh
@@ -210,6 +216,7 @@ cargo run --example concurrent_kv
 cargo run --example submit_kv
 cargo run --example async_kv
 cargo run --example async_accept
+cargo run --example async_connect
 cargo run --example async_tcp_echo
 cargo run --example async_tcp_multi_echo
 cargo run --example async_copy

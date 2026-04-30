@@ -24,7 +24,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use crate::os::{OsReactor, OsWaker};
+use crate::os::{tcp_connect_start_v4, OsReactor, OsWaker};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
@@ -943,6 +943,28 @@ pub async fn accept_async(listener: &TcpListener) -> io::Result<(TcpStream, Sock
     }
 }
 
+/// Connects to a TCP address without blocking the executor.
+///
+/// This first low-level client helper supports IPv4 addresses. The returned
+/// stream is non-blocking.
+#[cfg(unix)]
+pub async fn connect_async(address: SocketAddr) -> io::Result<TcpStream> {
+    let SocketAddr::V4(address) = address else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "async TCP connect currently supports IPv4 addresses only",
+        ));
+    };
+
+    let stream = tcp_connect_start_v4(address)?;
+    writable(stream.as_raw_fd()).await;
+
+    match stream.take_error()? {
+        Some(error) => Err(error),
+        None => Ok(stream),
+    }
+}
+
 /// Future returned by [`readable`].
 #[cfg(unix)]
 #[derive(Debug)]
@@ -1094,7 +1116,10 @@ impl Future for YieldNow {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::{accept_async, copy_async, read_exact_async, readable, writable, write_all_async};
+    use super::{
+        accept_async, connect_async, copy_async, read_exact_async, readable, writable,
+        write_all_async,
+    };
     use super::{block_on, executor_and_spawner, sleep, yield_now};
     #[cfg(unix)]
     use std::io::{Read, Write};
@@ -1612,6 +1637,33 @@ mod tests {
         });
 
         assert_eq!(client.join().unwrap(), b'z');
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_async_establishes_nonblocking_tcp_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            stream.write_all(&byte).unwrap();
+        });
+
+        let echoed = block_on(async move {
+            let mut stream = connect_async(address).await.unwrap();
+            write_all_async(&mut stream, b"q").await.unwrap();
+
+            let mut byte = [0u8; 1];
+            read_exact_async(&mut stream, &mut byte).await.unwrap();
+            byte[0]
+        });
+
+        server.join().unwrap();
+        assert_eq!(echoed, b'q');
     }
 
     #[cfg(unix)]
