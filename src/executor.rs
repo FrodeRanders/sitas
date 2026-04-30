@@ -12,7 +12,9 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 #[cfg(unix)]
-use std::os::unix::io::RawFd;
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -615,6 +617,40 @@ pub fn readable(fd: RawFd) -> Readable {
     }
 }
 
+/// Reads exactly enough bytes to fill `buffer`, awaiting read readiness when
+/// the reader would otherwise block.
+///
+/// The caller is responsible for putting the underlying descriptor in
+/// non-blocking mode before using this helper.
+#[cfg(unix)]
+pub async fn read_exact_async<R>(reader: &mut R, buffer: &mut [u8]) -> io::Result<()>
+where
+    R: Read + AsRawFd,
+{
+    let mut filled = 0usize;
+
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "reader reached EOF before buffer was filled",
+                ));
+            }
+            Ok(bytes_read) => {
+                filled += bytes_read;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                readable(reader.as_raw_fd()).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
 /// Future returned by [`readable`].
 #[cfg(unix)]
 #[derive(Debug)]
@@ -721,9 +757,9 @@ impl Future for YieldNow {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::readable;
     use super::{block_on, executor_and_spawner, sleep, yield_now};
+    #[cfg(unix)]
+    use super::{read_exact_async, readable};
     #[cfg(unix)]
     use std::io::{Read, Write};
     #[cfg(unix)]
@@ -972,6 +1008,45 @@ mod tests {
         executor.run();
 
         assert_eq!(&*output.lock().unwrap(), b"ba");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_exact_async_waits_until_buffer_is_filled() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            writer.write_all(b"he").unwrap();
+            thread::sleep(Duration::from_millis(5));
+            writer.write_all(b"llo").unwrap();
+        });
+
+        let mut buffer = [0u8; 5];
+        let buffer = block_on(async move {
+            read_exact_async(&mut reader, &mut buffer).await.unwrap();
+            buffer
+        });
+
+        assert_eq!(&buffer, b"hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_exact_async_returns_unexpected_eof() {
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        drop(writer);
+
+        let mut buffer = [0u8; 1];
+        let error = block_on(async move {
+            read_exact_async(&mut reader, &mut buffer)
+                .await
+                .unwrap_err()
+        });
+
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

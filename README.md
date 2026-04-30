@@ -16,6 +16,7 @@ standard library:
 - a minimal executor experiment with custom wakers, join handles, awaitable
   shard replies, timers, OS-backed sleeping, and read-readiness futures on this
   branch
+- a small async read helper layered on non-blocking Unix descriptors
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
   and read readiness
 - one OS thread per shard

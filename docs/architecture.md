@@ -43,6 +43,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - timer futures register task wakers in the scheduler and drive reactor timeouts
 - read-readiness futures register file descriptors and resume when the reactor
   reports them readable
+- `read_exact_async` retries normal `Read` operations and awaits readability
+  when non-blocking descriptors report `WouldBlock`
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than
