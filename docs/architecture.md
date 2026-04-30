@@ -47,6 +47,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   when non-blocking descriptors report `WouldBlock`
 - `write_all_async` retries normal `Write` operations and awaits writability
   when non-blocking descriptors report `WouldBlock`
+- `copy_async` composes the read and write helpers to copy until EOF while
+  using both readiness paths
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than

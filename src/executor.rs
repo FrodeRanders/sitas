@@ -801,6 +801,42 @@ where
     Ok(())
 }
 
+/// Copies bytes from `reader` to `writer` until `reader` reaches EOF, awaiting
+/// descriptor readiness whenever either side would otherwise block.
+///
+/// The caller is responsible for putting both underlying descriptors in
+/// non-blocking mode before using this helper.
+#[cfg(unix)]
+pub async fn copy_async<R, W>(reader: &mut R, writer: &mut W, buffer: &mut [u8]) -> io::Result<u64>
+where
+    R: Read + AsRawFd,
+    W: Write + AsRawFd,
+{
+    if buffer.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy buffer must not be empty",
+        ));
+    }
+
+    let mut copied = 0u64;
+
+    loop {
+        match reader.read(buffer) {
+            Ok(0) => return Ok(copied),
+            Ok(bytes_read) => {
+                write_all_async(writer, &buffer[..bytes_read]).await?;
+                copied += bytes_read as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                readable(reader.as_raw_fd()).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Future returned by [`readable`].
 #[cfg(unix)]
 #[derive(Debug)]
@@ -953,7 +989,7 @@ impl Future for YieldNow {
 mod tests {
     use super::{block_on, executor_and_spawner, sleep, yield_now};
     #[cfg(unix)]
-    use super::{read_exact_async, readable, writable, write_all_async};
+    use super::{copy_async, read_exact_async, readable, writable, write_all_async};
     #[cfg(unix)]
     use std::io::{Read, Write};
     #[cfg(unix)]
@@ -1280,6 +1316,52 @@ mod tests {
         reader.read_exact(&mut buffer).unwrap();
 
         assert_eq!(&buffer, b"hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_async_copies_until_reader_eof() {
+        let (mut source_reader, mut source_writer) = UnixStream::pair().unwrap();
+        let (mut sink_reader, mut sink_writer) = UnixStream::pair().unwrap();
+        source_reader.set_nonblocking(true).unwrap();
+        sink_writer.set_nonblocking(true).unwrap();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            source_writer.write_all(b"hello").unwrap();
+            thread::sleep(Duration::from_millis(5));
+            source_writer.write_all(b" world").unwrap();
+        });
+
+        let copied = block_on(async move {
+            let mut buffer = [0u8; 4];
+            copy_async(&mut source_reader, &mut sink_writer, &mut buffer)
+                .await
+                .unwrap()
+        });
+
+        let mut output = Vec::new();
+        sink_reader.read_to_end(&mut output).unwrap();
+
+        assert_eq!(copied, 11);
+        assert_eq!(&output, b"hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_async_rejects_empty_buffer() {
+        let (mut source_reader, _source_writer) = UnixStream::pair().unwrap();
+        let (_sink_reader, mut sink_writer) = UnixStream::pair().unwrap();
+        source_reader.set_nonblocking(true).unwrap();
+        sink_writer.set_nonblocking(true).unwrap();
+
+        let error = block_on(async move {
+            copy_async(&mut source_reader, &mut sink_writer, &mut [])
+                .await
+                .unwrap_err()
+        });
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
