@@ -254,16 +254,14 @@ struct Scheduler {
 struct SchedulerState {
     queue: VecDeque<Arc<Task>>,
     timers: Vec<TimerEntry>,
-    read_interests: Vec<ReadInterest>,
-    ready_read_interests: Vec<usize>,
-    write_interests: Vec<WriteInterest>,
-    ready_write_interests: Vec<usize>,
+    #[cfg(unix)]
+    read_interests: InterestSet,
+    #[cfg(unix)]
+    write_interests: InterestSet,
     accepting: bool,
     spawner_count: usize,
     task_count: usize,
     next_timer_id: usize,
-    next_read_interest_id: usize,
-    next_write_interest_id: usize,
 }
 
 #[derive(Debug)]
@@ -275,18 +273,82 @@ struct TimerEntry {
 
 #[cfg(unix)]
 #[derive(Debug)]
-struct ReadInterest {
+struct InterestSet {
+    interests: Vec<IoInterest>,
+    ready: Vec<usize>,
+    next_id: usize,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct IoInterest {
     id: usize,
     fd: RawFd,
     waker: Waker,
 }
 
 #[cfg(unix)]
-#[derive(Debug)]
-struct WriteInterest {
-    id: usize,
-    fd: RawFd,
-    waker: Waker,
+impl InterestSet {
+    fn new() -> Self {
+        Self {
+            interests: Vec::new(),
+            ready: Vec::new(),
+            next_id: 0,
+        }
+    }
+
+    fn allocate_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
+    }
+
+    fn register(&mut self, id: usize, fd: RawFd, waker: Waker) {
+        match self.interests.iter_mut().find(|interest| interest.id == id) {
+            Some(interest) => {
+                interest.fd = fd;
+                interest.waker = waker;
+            }
+            None => self.interests.push(IoInterest { id, fd, waker }),
+        }
+    }
+
+    fn remove(&mut self, id: usize) {
+        self.interests.retain(|interest| interest.id != id);
+        self.ready.retain(|ready_id| *ready_id != id);
+    }
+
+    fn fds(&self) -> Vec<RawFd> {
+        self.interests.iter().map(|interest| interest.fd).collect()
+    }
+
+    fn wake_ready(&mut self, ready_fds: &[RawFd]) -> Vec<Waker> {
+        let mut wakers = Vec::new();
+        let mut ready_ids = Vec::new();
+        let mut pending = Vec::with_capacity(self.interests.len());
+
+        for interest in self.interests.drain(..) {
+            if ready_fds.contains(&interest.fd) {
+                ready_ids.push(interest.id);
+                wakers.push(interest.waker);
+            } else {
+                pending.push(interest);
+            }
+        }
+
+        self.interests = pending;
+        self.ready.extend(ready_ids);
+        wakers
+    }
+
+    fn take_ready(&mut self, id: usize) -> bool {
+        let Some(position) = self.ready.iter().position(|ready_id| *ready_id == id) else {
+            return false;
+        };
+
+        self.ready.swap_remove(position);
+        true
+    }
 }
 
 impl Scheduler {
@@ -295,16 +357,14 @@ impl Scheduler {
             state: Mutex::new(SchedulerState {
                 queue: VecDeque::new(),
                 timers: Vec::new(),
-                read_interests: Vec::new(),
-                ready_read_interests: Vec::new(),
-                write_interests: Vec::new(),
-                ready_write_interests: Vec::new(),
+                #[cfg(unix)]
+                read_interests: InterestSet::new(),
+                #[cfg(unix)]
+                write_interests: InterestSet::new(),
                 accepting: true,
                 spawner_count: 1,
                 task_count: 0,
                 next_timer_id: 0,
-                next_read_interest_id: 0,
-                next_write_interest_id: 0,
             }),
             #[cfg(unix)]
             waker,
@@ -459,27 +519,14 @@ impl Scheduler {
     #[cfg(unix)]
     fn allocate_read_interest_id(&self) -> usize {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        let id = state.next_read_interest_id;
-        state.next_read_interest_id = state.next_read_interest_id.wrapping_add(1);
-        id
+        state.read_interests.allocate_id()
     }
 
     #[cfg(unix)]
     fn register_read_interest(&self, id: usize, fd: RawFd, waker: Waker) {
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-
-            match state
-                .read_interests
-                .iter_mut()
-                .find(|interest| interest.id == id)
-            {
-                Some(interest) => {
-                    interest.fd = fd;
-                    interest.waker = waker;
-                }
-                None => state.read_interests.push(ReadInterest { id, fd, waker }),
-            }
+            state.read_interests.register(id, fd, waker);
         }
 
         self.wake_reactor();
@@ -488,42 +535,20 @@ impl Scheduler {
     #[cfg(unix)]
     fn remove_read_interest(&self, id: usize) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.read_interests.retain(|interest| interest.id != id);
-        state
-            .ready_read_interests
-            .retain(|ready_id| *ready_id != id);
+        state.read_interests.remove(id);
     }
 
     #[cfg(unix)]
     fn read_interest_fds(&self) -> Vec<RawFd> {
         let state = self.state.lock().expect("scheduler state mutex poisoned");
-        state
-            .read_interests
-            .iter()
-            .map(|interest| interest.fd)
-            .collect()
+        state.read_interests.fds()
     }
 
     #[cfg(unix)]
     fn wake_readable_fds(&self, readable: &[RawFd]) {
         let wakers = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            let mut wakers = Vec::new();
-            let mut ready_ids = Vec::new();
-            let mut pending = Vec::with_capacity(state.read_interests.len());
-
-            for interest in state.read_interests.drain(..) {
-                if readable.contains(&interest.fd) {
-                    ready_ids.push(interest.id);
-                    wakers.push(interest.waker);
-                } else {
-                    pending.push(interest);
-                }
-            }
-
-            state.read_interests = pending;
-            state.ready_read_interests.extend(ready_ids);
-            wakers
+            state.read_interests.wake_ready(readable)
         };
 
         for waker in wakers {
@@ -534,42 +559,20 @@ impl Scheduler {
     #[cfg(unix)]
     fn take_ready_read_interest(&self, id: usize) -> bool {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        let Some(position) = state
-            .ready_read_interests
-            .iter()
-            .position(|ready_id| *ready_id == id)
-        else {
-            return false;
-        };
-
-        state.ready_read_interests.swap_remove(position);
-        true
+        state.read_interests.take_ready(id)
     }
 
     #[cfg(unix)]
     fn allocate_write_interest_id(&self) -> usize {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        let id = state.next_write_interest_id;
-        state.next_write_interest_id = state.next_write_interest_id.wrapping_add(1);
-        id
+        state.write_interests.allocate_id()
     }
 
     #[cfg(unix)]
     fn register_write_interest(&self, id: usize, fd: RawFd, waker: Waker) {
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-
-            match state
-                .write_interests
-                .iter_mut()
-                .find(|interest| interest.id == id)
-            {
-                Some(interest) => {
-                    interest.fd = fd;
-                    interest.waker = waker;
-                }
-                None => state.write_interests.push(WriteInterest { id, fd, waker }),
-            }
+            state.write_interests.register(id, fd, waker);
         }
 
         self.wake_reactor();
@@ -578,42 +581,20 @@ impl Scheduler {
     #[cfg(unix)]
     fn remove_write_interest(&self, id: usize) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.write_interests.retain(|interest| interest.id != id);
-        state
-            .ready_write_interests
-            .retain(|ready_id| *ready_id != id);
+        state.write_interests.remove(id);
     }
 
     #[cfg(unix)]
     fn write_interest_fds(&self) -> Vec<RawFd> {
         let state = self.state.lock().expect("scheduler state mutex poisoned");
-        state
-            .write_interests
-            .iter()
-            .map(|interest| interest.fd)
-            .collect()
+        state.write_interests.fds()
     }
 
     #[cfg(unix)]
     fn wake_writable_fds(&self, writable: &[RawFd]) {
         let wakers = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            let mut wakers = Vec::new();
-            let mut ready_ids = Vec::new();
-            let mut pending = Vec::with_capacity(state.write_interests.len());
-
-            for interest in state.write_interests.drain(..) {
-                if writable.contains(&interest.fd) {
-                    ready_ids.push(interest.id);
-                    wakers.push(interest.waker);
-                } else {
-                    pending.push(interest);
-                }
-            }
-
-            state.write_interests = pending;
-            state.ready_write_interests.extend(ready_ids);
-            wakers
+            state.write_interests.wake_ready(writable)
         };
 
         for waker in wakers {
@@ -624,16 +605,7 @@ impl Scheduler {
     #[cfg(unix)]
     fn take_ready_write_interest(&self, id: usize) -> bool {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        let Some(position) = state
-            .ready_write_interests
-            .iter()
-            .position(|ready_id| *ready_id == id)
-        else {
-            return false;
-        };
-
-        state.ready_write_interests.swap_remove(position);
-        true
+        state.write_interests.take_ready(id)
     }
 
     fn wake_reactor(&self) {
