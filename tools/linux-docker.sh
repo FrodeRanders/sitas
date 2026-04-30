@@ -21,6 +21,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example custom_placement
         cargo run --example basic_counter
         cargo run --example os_reactor
+        cargo run --example os_readable
     '
 fi
 

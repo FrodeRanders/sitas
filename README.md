@@ -16,6 +16,7 @@ standard library:
 - a minimal executor experiment with custom wakers, join handles, awaitable
   shard replies, timers, and OS-backed sleeping on this branch
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
+  and read readiness
 - one OS thread per shard
 - one mailbox per shard
 - bounded shard mailboxes
@@ -150,6 +151,12 @@ Run the OS reactor wake example:
 cargo run --example os_reactor
 ```
 
+Run the OS read-readiness example:
+
+```sh
+cargo run --example os_readable
+```
+
 ## Development
 
 Run the standard checks:
@@ -167,6 +174,7 @@ cargo run --example executor_sleep
 cargo run --example custom_placement
 cargo run --example basic_counter
 cargo run --example os_reactor
+cargo run --example os_readable
 ```
 
 Run the Linux Docker check from macOS:

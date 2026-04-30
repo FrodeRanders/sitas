@@ -22,6 +22,7 @@ It deliberately does not know about key-value commands or service state.
 - direct Unix FFI, currently `pipe`, `poll`, `read`, `write`, `fcntl`, and
   `close`
 - a non-blocking pipe for cross-thread reactor wakeups
+- read-readiness polling for caller-provided file descriptors
 - a cloneable `OsWaker`
 - a blocking `OsReactor::wait` that can be woken by the pipe
 

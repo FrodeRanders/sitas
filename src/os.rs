@@ -38,6 +38,16 @@ struct PollFd {
     revents: c_short,
 }
 
+impl PollFd {
+    fn readable(fd: RawFd) -> Self {
+        Self {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        }
+    }
+}
+
 extern "C" {
     fn close(fd: c_int) -> c_int;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
@@ -86,25 +96,43 @@ impl OsReactor {
 
     /// Waits until the reactor is woken or the optional timeout expires.
     pub fn wait(&self, timeout: Option<Duration>) -> io::Result<OsEvent> {
+        self.wait_readable(&[], timeout)
+    }
+
+    /// Waits until the reactor is woken, one of `read_fds` becomes readable,
+    /// or the optional timeout expires.
+    pub fn wait_readable(
+        &self,
+        read_fds: &[RawFd],
+        timeout: Option<Duration>,
+    ) -> io::Result<OsEvent> {
         let timeout_ms = timeout_to_poll_ms(timeout);
 
         loop {
-            let mut fd = PollFd {
-                fd: self.read_fd.raw(),
-                events: POLLIN,
-                revents: 0,
-            };
+            let mut fds = Vec::with_capacity(read_fds.len() + 1);
+            fds.push(PollFd::readable(self.read_fd.raw()));
+            fds.extend(read_fds.iter().copied().map(PollFd::readable));
 
-            // SAFETY: `fd` points to one initialized `PollFd` for the duration
-            // of the call, and the raw file descriptor is owned by `self`.
-            let result = unsafe { poll(&mut fd, 1, timeout_ms) };
+            // SAFETY: `fds` points to initialized `PollFd` values for the
+            // duration of the call, and all raw descriptors are borrowed only
+            // for this wait operation.
+            let result = unsafe { poll(fds.as_mut_ptr(), fds.len() as Nfds, timeout_ms) };
             if result > 0 {
-                return Ok(OsEvent {
-                    woke: fd.revents & POLLIN != 0 && self.drain_wakes()?,
-                });
+                let woke = fds[0].revents & POLLIN != 0 && self.drain_wakes()?;
+                let readable = fds
+                    .iter()
+                    .skip(1)
+                    .filter(|fd| fd.revents & POLLIN != 0)
+                    .map(|fd| fd.fd)
+                    .collect();
+
+                return Ok(OsEvent { woke, readable });
             }
             if result == 0 {
-                return Ok(OsEvent { woke: false });
+                return Ok(OsEvent {
+                    woke: false,
+                    readable: Vec::new(),
+                });
             }
 
             let error = last_os_error();
@@ -205,10 +233,12 @@ impl fmt::Debug for OsWaker {
 
 /// Result of waiting on an [`OsReactor`].
 #[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OsEvent {
     /// Whether the reactor observed and drained a wake.
     pub woke: bool,
+    /// File descriptors that were readable when the reactor returned.
+    pub readable: Vec<RawFd>,
 }
 
 #[derive(Debug)]
@@ -311,7 +341,9 @@ fn errno() -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::OsReactor;
+    use super::{create_pipe, OsReactor};
+    use std::os::raw::c_void;
+    use std::os::unix::io::RawFd;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -357,5 +389,58 @@ mod tests {
 
         assert!(reactor.wait(Some(Duration::from_secs(1))).unwrap().woke);
         assert!(!reactor.wait(Some(Duration::from_millis(1))).unwrap().woke);
+    }
+
+    #[test]
+    fn wait_readable_times_out_without_fd_readiness() {
+        let reactor = OsReactor::new().unwrap();
+        let (read_fd, _write_fd) = create_pipe().unwrap();
+
+        let event = reactor
+            .wait_readable(&[read_fd.raw()], Some(Duration::from_millis(1)))
+            .unwrap();
+
+        assert!(!event.woke);
+        assert!(event.readable.is_empty());
+    }
+
+    #[test]
+    fn wait_readable_reports_external_fd_readiness() {
+        let reactor = OsReactor::new().unwrap();
+        let (read_fd, write_fd) = create_pipe().unwrap();
+
+        write_one(write_fd.raw());
+
+        let event = reactor
+            .wait_readable(&[read_fd.raw()], Some(Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(!event.woke);
+        assert_eq!(event.readable, vec![read_fd.raw()]);
+    }
+
+    #[test]
+    fn wait_readable_reports_wake_and_fd_readiness_together() {
+        let reactor = OsReactor::new().unwrap();
+        let waker = reactor.waker();
+        let (read_fd, write_fd) = create_pipe().unwrap();
+
+        write_one(write_fd.raw());
+        waker.wake().unwrap();
+
+        let event = reactor
+            .wait_readable(&[read_fd.raw()], Some(Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(event.woke);
+        assert_eq!(event.readable, vec![read_fd.raw()]);
+    }
+
+    fn write_one(fd: RawFd) {
+        let byte = [1u8; 1];
+        // SAFETY: `byte` is valid readable memory for one byte, and tests pass
+        // an open non-blocking pipe write descriptor.
+        let result = unsafe { super::write(fd, byte.as_ptr().cast::<c_void>(), byte.len()) };
+        assert_eq!(result, 1);
     }
 }
