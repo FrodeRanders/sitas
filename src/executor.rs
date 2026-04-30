@@ -1691,6 +1691,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn connect_and_accept_can_run_on_same_executor() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let (executor, spawner) = executor_and_spawner();
+        let output = Arc::new(Mutex::new(None));
+
+        let server = spawner
+            .spawn_with_handle(async move {
+                let (mut stream, peer) = accept_async(&listener).await.unwrap();
+                let mut byte = [0u8; 1];
+                read_exact_async(&mut stream, &mut byte).await.unwrap();
+                write_all_async(&mut stream, &byte).await.unwrap();
+                peer
+            })
+            .unwrap();
+
+        let client = spawner
+            .spawn_with_handle(async move {
+                let mut stream = connect_async(address).await.unwrap();
+                write_all_async(&mut stream, b"x").await.unwrap();
+
+                let mut byte = [0u8; 1];
+                read_exact_async(&mut stream, &mut byte).await.unwrap();
+                byte[0]
+            })
+            .unwrap();
+
+        let output_for_task = Arc::clone(&output);
+        spawner
+            .spawn(async move {
+                let peer = server.await;
+                let echoed = client.await;
+                *output_for_task.lock().unwrap() = Some((peer, echoed));
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        let (peer, echoed) = output.lock().unwrap().take().unwrap();
+        assert_eq!(peer.ip(), address.ip());
+        assert_eq!(echoed, b'x');
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn executor_can_spawn_tcp_handlers_for_multiple_accepted_streams() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();

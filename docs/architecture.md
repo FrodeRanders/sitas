@@ -52,6 +52,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   accepted streams for the async read/write helpers
 - `connect_async` starts TCP connections with raw non-blocking IPv4 or IPv6
   sockets, awaits writability, and checks the stream for connection errors
+- client and server TCP futures can run on the same executor thread, using
+  readiness events to interleave connect, accept, read, and write operations
 - `read_exact_async` retries normal `Read` operations and awaits readability
   when non-blocking descriptors report `WouldBlock`
 - `write_all_async` retries normal `Write` operations and awaits writability
