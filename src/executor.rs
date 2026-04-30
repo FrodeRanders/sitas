@@ -448,6 +448,11 @@ impl InterestSet {
         self.ready.swap_remove(position);
         true
     }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.interests.is_empty() && self.ready.is_empty()
+    }
 }
 
 impl Scheduler {
@@ -863,6 +868,23 @@ where
     Ok(())
 }
 
+/// Reads exactly enough bytes to fill `buffer`, failing with
+/// `io::ErrorKind::TimedOut` if `duration` elapses first.
+///
+/// The caller is responsible for putting the underlying descriptor in
+/// non-blocking mode before using this helper.
+#[cfg(unix)]
+pub async fn read_exact_timeout_async<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    duration: Duration,
+) -> io::Result<()>
+where
+    R: Read + AsRawFd,
+{
+    timeout_io(duration, read_exact_async(reader, buffer)).await
+}
+
 /// Writes the entire buffer, awaiting write readiness when the writer would
 /// otherwise block.
 ///
@@ -895,6 +917,23 @@ where
     }
 
     Ok(())
+}
+
+/// Writes the entire buffer, failing with `io::ErrorKind::TimedOut` if
+/// `duration` elapses first.
+///
+/// The caller is responsible for putting the underlying descriptor in
+/// non-blocking mode before using this helper.
+#[cfg(unix)]
+pub async fn write_all_timeout_async<W>(
+    writer: &mut W,
+    buffer: &[u8],
+    duration: Duration,
+) -> io::Result<()>
+where
+    W: Write + AsRawFd,
+{
+    timeout_io(duration, write_all_async(writer, buffer)).await
 }
 
 /// Copies bytes from `reader` to `writer` until `reader` reaches EOF, awaiting
@@ -933,6 +972,25 @@ where
     }
 }
 
+/// Copies bytes from `reader` to `writer`, failing with
+/// `io::ErrorKind::TimedOut` if `duration` elapses first.
+///
+/// The caller is responsible for putting both underlying descriptors in
+/// non-blocking mode before using this helper.
+#[cfg(unix)]
+pub async fn copy_timeout_async<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    buffer: &mut [u8],
+    duration: Duration,
+) -> io::Result<u64>
+where
+    R: Read + AsRawFd,
+    W: Write + AsRawFd,
+{
+    timeout_io(duration, copy_async(reader, writer, buffer)).await
+}
+
 /// Accepts one TCP connection, awaiting listener readiness when accepting
 /// would otherwise block.
 ///
@@ -956,6 +1014,20 @@ pub async fn accept_async(listener: &TcpListener) -> io::Result<(TcpStream, Sock
     }
 }
 
+/// Accepts one TCP connection, failing with `io::ErrorKind::TimedOut` if
+/// `duration` elapses first.
+///
+/// The caller is responsible for putting the listener in non-blocking mode
+/// before using this helper. The returned stream is placed in non-blocking mode
+/// before it is returned.
+#[cfg(unix)]
+pub async fn accept_timeout_async(
+    listener: &TcpListener,
+    duration: Duration,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    timeout_io(duration, accept_async(listener)).await
+}
+
 /// Connects to a TCP address without blocking the executor.
 ///
 /// The returned stream is non-blocking.
@@ -967,6 +1039,32 @@ pub async fn connect_async(address: SocketAddr) -> io::Result<TcpStream> {
     match stream.take_error()? {
         Some(error) => Err(error),
         None => Ok(stream),
+    }
+}
+
+/// Connects to a TCP address without blocking the executor, failing with
+/// `io::ErrorKind::TimedOut` if `duration` elapses first.
+///
+/// The returned stream is non-blocking.
+#[cfg(unix)]
+pub async fn connect_timeout_async(
+    address: SocketAddr,
+    duration: Duration,
+) -> io::Result<TcpStream> {
+    timeout_io(duration, connect_async(address)).await
+}
+
+#[cfg(unix)]
+async fn timeout_io<F, T>(duration: Duration, future: F) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    match timeout(duration, future).await {
+        Ok(result) => result,
+        Err(TimeoutError) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "async operation timed out",
+        )),
     }
 }
 
@@ -1180,8 +1278,9 @@ impl Future for YieldNow {
 mod tests {
     #[cfg(unix)]
     use super::{
-        accept_async, connect_async, copy_async, read_exact_async, readable, writable,
-        write_all_async,
+        accept_async, accept_timeout_async, connect_async, connect_timeout_async, copy_async,
+        copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, writable,
+        write_all_async, write_all_timeout_async,
     };
     use super::{block_on, executor_and_spawner, sleep, timeout, yield_now, TimeoutError};
     #[cfg(unix)]
@@ -1633,12 +1732,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn read_exact_timeout_async_returns_timed_out() {
+        let (executor, spawner) = executor_and_spawner();
+        let (mut reader, _writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                let mut buffer = [0u8; 1];
+                let error =
+                    read_exact_timeout_async(&mut reader, &mut buffer, Duration::from_millis(5))
+                        .await
+                        .unwrap_err();
+                *output_for_task.lock().unwrap() = Some(error.kind());
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(*output.lock().unwrap(), Some(std::io::ErrorKind::TimedOut));
+        assert!(executor
+            .scheduler
+            .state
+            .lock()
+            .expect("scheduler state mutex poisoned")
+            .read_interests
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn write_all_async_writes_entire_buffer() {
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
         writer.set_nonblocking(true).unwrap();
 
         block_on(async move {
             write_all_async(&mut writer, b"hello").await.unwrap();
+        });
+
+        let mut buffer = [0u8; 5];
+        reader.read_exact(&mut buffer).unwrap();
+
+        assert_eq!(&buffer, b"hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_all_timeout_async_writes_entire_buffer() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+
+        block_on(async move {
+            write_all_timeout_async(&mut writer, b"hello", Duration::from_secs(1))
+                .await
+                .unwrap();
         });
 
         let mut buffer = [0u8; 5];
@@ -1695,6 +1845,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn copy_timeout_async_returns_timed_out() {
+        let (mut source_reader, _source_writer) = UnixStream::pair().unwrap();
+        let (_sink_reader, mut sink_writer) = UnixStream::pair().unwrap();
+        source_reader.set_nonblocking(true).unwrap();
+        sink_writer.set_nonblocking(true).unwrap();
+
+        let error = block_on(async move {
+            let mut buffer = [0u8; 8];
+            copy_timeout_async(
+                &mut source_reader,
+                &mut sink_writer,
+                &mut buffer,
+                Duration::from_millis(5),
+            )
+            .await
+            .unwrap_err()
+        });
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn accept_async_waits_for_tcp_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1725,6 +1898,37 @@ mod tests {
         });
 
         assert_eq!(byte, [b'x']);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_timeout_async_returns_timed_out() {
+        let (executor, spawner) = executor_and_spawner();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                let error = accept_timeout_async(&listener, Duration::from_millis(5))
+                    .await
+                    .unwrap_err();
+                *output_for_task.lock().unwrap() = Some(error.kind());
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(*output.lock().unwrap(), Some(std::io::ErrorKind::TimedOut));
+        assert!(executor
+            .scheduler
+            .state
+            .lock()
+            .expect("scheduler state mutex poisoned")
+            .read_interests
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -1780,6 +1984,35 @@ mod tests {
 
         server.join().unwrap();
         assert_eq!(echoed, b'q');
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_timeout_async_establishes_nonblocking_tcp_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            stream.write_all(&byte).unwrap();
+        });
+
+        let echoed = block_on(async move {
+            let mut stream = connect_timeout_async(address, Duration::from_secs(1))
+                .await
+                .unwrap();
+            write_all_async(&mut stream, b"t").await.unwrap();
+
+            let mut byte = [0u8; 1];
+            read_exact_async(&mut stream, &mut byte).await.unwrap();
+            byte[0]
+        });
+
+        server.join().unwrap();
+        assert_eq!(echoed, b't');
     }
 
     #[cfg(unix)]

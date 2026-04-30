@@ -64,6 +64,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   when non-blocking descriptors report `WouldBlock`
 - `copy_async` composes the read and write helpers to copy until EOF while
   using both readiness paths
+- timeout variants for accept, connect, read, write, and copy compose the same
+  I/O futures with executor timers and report `io::ErrorKind::TimedOut`
 - accepted TCP streams can be handed to spawned tasks, allowing one executor
   thread to interleave multiple connection handlers
 

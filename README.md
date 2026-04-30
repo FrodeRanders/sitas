@@ -18,6 +18,7 @@ standard library:
   futures on this branch
 - small async connect, accept, read, write, and copy helpers layered on
   non-blocking Unix descriptors
+- timeout variants for the async Unix I/O helpers
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
   and descriptor readiness
 - one OS thread per shard
@@ -154,6 +155,12 @@ Run the same-executor TCP echo pair example:
 cargo run --example async_tcp_pair
 ```
 
+Run the async TCP timeout example:
+
+```sh
+cargo run --example async_tcp_timeout
+```
+
 Run the executor multi-client TCP echo example:
 
 ```sh
@@ -231,6 +238,7 @@ cargo run --example async_accept
 cargo run --example async_connect
 cargo run --example async_tcp_echo
 cargo run --example async_tcp_pair
+cargo run --example async_tcp_timeout
 cargo run --example async_tcp_multi_echo
 cargo run --example async_copy
 cargo run --example async_readable
