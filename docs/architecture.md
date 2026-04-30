@@ -50,8 +50,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - `accept_async` retries `TcpListener::accept`, awaits listener readability
   when non-blocking listeners report `WouldBlock`, and returns non-blocking
   accepted streams for the async read/write helpers
-- `connect_async` starts an IPv4 TCP connection with a raw non-blocking socket,
-  awaits writability, and checks the stream for connection errors
+- `connect_async` starts TCP connections with raw non-blocking IPv4 or IPv6
+  sockets, awaits writability, and checks the stream for connection errors
 - `read_exact_async` retries normal `Read` operations and awaits readability
   when non-blocking descriptors report `WouldBlock`
 - `write_all_async` retries normal `Write` operations and awaits writability

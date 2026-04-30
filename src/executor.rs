@@ -24,7 +24,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use crate::os::{tcp_connect_start_v4, OsReactor, OsWaker};
+use crate::os::{tcp_connect_start, OsReactor, OsWaker};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
@@ -945,18 +945,10 @@ pub async fn accept_async(listener: &TcpListener) -> io::Result<(TcpStream, Sock
 
 /// Connects to a TCP address without blocking the executor.
 ///
-/// This first low-level client helper supports IPv4 addresses. The returned
-/// stream is non-blocking.
+/// The returned stream is non-blocking.
 #[cfg(unix)]
 pub async fn connect_async(address: SocketAddr) -> io::Result<TcpStream> {
-    let SocketAddr::V4(address) = address else {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "async TCP connect currently supports IPv4 addresses only",
-        ));
-    };
-
-    let stream = tcp_connect_start_v4(address)?;
+    let stream = tcp_connect_start(address)?;
     writable(stream.as_raw_fd()).await;
 
     match stream.take_error()? {
@@ -1664,6 +1656,37 @@ mod tests {
 
         server.join().unwrap();
         assert_eq!(echoed, b'q');
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_async_supports_ipv6_loopback() {
+        let listener = match TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => return,
+            Err(error) => panic!("failed to bind IPv6 loopback listener: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            stream.write_all(&byte).unwrap();
+        });
+
+        let echoed = block_on(async move {
+            let mut stream = connect_async(address).await.unwrap();
+            write_all_async(&mut stream, b"v").await.unwrap();
+
+            let mut byte = [0u8; 1];
+            read_exact_async(&mut stream, &mut byte).await.unwrap();
+            byte[0]
+        });
+
+        server.join().unwrap();
+        assert_eq!(echoed, b'v');
     }
 
     #[cfg(unix)]

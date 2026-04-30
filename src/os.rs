@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::io;
-use std::net::{SocketAddrV4, TcpStream};
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
 use std::os::raw::{c_int, c_short, c_void};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
@@ -24,6 +24,10 @@ const POLLOUT: c_short = 0x0004;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const AF_INET: c_int = 2;
+#[cfg(target_os = "linux")]
+const AF_INET6: c_int = 10;
+#[cfg(not(target_os = "linux"))]
+const AF_INET6: c_int = 30;
 const SOCK_STREAM: c_int = 1;
 
 #[cfg(target_os = "linux")]
@@ -52,6 +56,11 @@ struct InAddr {
     s_addr: u32,
 }
 
+#[repr(C)]
+struct In6Addr {
+    s6_addr: [u8; 16],
+}
+
 #[cfg(target_os = "linux")]
 #[repr(C)]
 struct SockAddrIn {
@@ -59,6 +68,27 @@ struct SockAddrIn {
     sin_port: u16,
     sin_addr: InAddr,
     sin_zero: [u8; 8],
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct SockAddrIn6 {
+    sin6_family: u16,
+    sin6_port: u16,
+    sin6_flowinfo: u32,
+    sin6_addr: In6Addr,
+    sin6_scope_id: u32,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[repr(C)]
+struct SockAddrIn6 {
+    sin6_len: u8,
+    sin6_family: u8,
+    sin6_port: u16,
+    sin6_flowinfo: u32,
+    sin6_addr: In6Addr,
+    sin6_scope_id: u32,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -320,14 +350,43 @@ pub struct OsEvent {
     pub writable: Vec<RawFd>,
 }
 
-/// Starts a non-blocking IPv4 TCP connection.
+/// Starts a non-blocking TCP connection.
 ///
 /// If the connection is still in progress, the returned stream should be
 /// awaited for writability and then checked with `TcpStream::take_error`.
-pub fn tcp_connect_start_v4(address: SocketAddrV4) -> io::Result<TcpStream> {
+pub fn tcp_connect_start(address: SocketAddr) -> io::Result<TcpStream> {
+    match address {
+        SocketAddr::V4(address) => tcp_connect_start_v4(address),
+        SocketAddr::V6(address) => tcp_connect_start_v6(address),
+    }
+}
+
+fn tcp_connect_start_v4(address: SocketAddrV4) -> io::Result<TcpStream> {
+    let socket_address = socket_addr_v4(address);
+    tcp_connect_start_with_address(
+        AF_INET,
+        (&socket_address as *const SockAddrIn).cast::<c_void>(),
+        std::mem::size_of::<SockAddrIn>() as SockLen,
+    )
+}
+
+fn tcp_connect_start_v6(address: SocketAddrV6) -> io::Result<TcpStream> {
+    let socket_address = socket_addr_v6(address);
+    tcp_connect_start_with_address(
+        AF_INET6,
+        (&socket_address as *const SockAddrIn6).cast::<c_void>(),
+        std::mem::size_of::<SockAddrIn6>() as SockLen,
+    )
+}
+
+fn tcp_connect_start_with_address(
+    address_family: c_int,
+    socket_address: *const c_void,
+    socket_address_len: SockLen,
+) -> io::Result<TcpStream> {
     // SAFETY: `socket` is called with constant address family/type values and
     // no borrowed memory.
-    let fd = unsafe { socket(AF_INET, SOCK_STREAM, 0) };
+    let fd = unsafe { socket(address_family, SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(last_os_error());
     }
@@ -335,16 +394,9 @@ pub fn tcp_connect_start_v4(address: SocketAddrV4) -> io::Result<TcpStream> {
     let fd = OwnedFd::new(fd);
     set_nonblocking(fd.raw())?;
 
-    let socket_address = socket_addr_v4(address);
-    // SAFETY: `socket_address` is a properly initialized IPv4 socket address
+    // SAFETY: `socket_address` points to a properly initialized socket address
     // whose pointer is valid for the duration of the call.
-    let result = unsafe {
-        connect(
-            fd.raw(),
-            (&socket_address as *const SockAddrIn).cast::<c_void>(),
-            std::mem::size_of::<SockAddrIn>() as SockLen,
-        )
-    };
+    let result = unsafe { connect(fd.raw(), socket_address, socket_address_len) };
 
     if result == 0 {
         return Ok(fd.into_tcp_stream());
@@ -428,6 +480,33 @@ fn socket_addr_v4(address: SocketAddrV4) -> SockAddrIn {
             s_addr: u32::from_be_bytes(address.ip().octets()).to_be(),
         },
         sin_zero: [0; 8],
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn socket_addr_v6(address: SocketAddrV6) -> SockAddrIn6 {
+    SockAddrIn6 {
+        sin6_family: AF_INET6 as u16,
+        sin6_port: address.port().to_be(),
+        sin6_flowinfo: address.flowinfo(),
+        sin6_addr: In6Addr {
+            s6_addr: address.ip().octets(),
+        },
+        sin6_scope_id: address.scope_id(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_addr_v6(address: SocketAddrV6) -> SockAddrIn6 {
+    SockAddrIn6 {
+        sin6_len: std::mem::size_of::<SockAddrIn6>() as u8,
+        sin6_family: AF_INET6 as u8,
+        sin6_port: address.port().to_be(),
+        sin6_flowinfo: address.flowinfo(),
+        sin6_addr: In6Addr {
+            s6_addr: address.ip().octets(),
+        },
+        sin6_scope_id: address.scope_id(),
     }
 }
 
