@@ -28,8 +28,6 @@ const O_NONBLOCK: c_int = 0x0004;
 
 const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
-#[cfg(target_os = "linux")]
-const EWOULDBLOCK: c_int = EAGAIN;
 #[cfg(not(target_os = "linux"))]
 const EWOULDBLOCK: c_int = 35;
 
@@ -289,6 +287,12 @@ fn last_os_error() -> io::Error {
     io::Error::from_raw_os_error(errno())
 }
 
+#[cfg(target_os = "linux")]
+fn is_would_block(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(EAGAIN)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn is_would_block(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(EAGAIN) | Some(EWOULDBLOCK))
 }

@@ -1,15 +1,21 @@
-//! A minimal standard-library executor experiment.
+//! A minimal async executor experiment.
 //!
 //! This module is intentionally small. It exists to expose the core mechanics
 //! behind async task execution: tasks own pinned futures, wakers re-enqueue
-//! ready tasks, and an executor repeatedly polls tasks from a ready queue.
+//! ready tasks, and an executor repeatedly polls tasks from a ready queue. On
+//! Unix, the `non-std-runtime` branch parks the executor on an OS reactor wake
+//! source when no tasks are ready.
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+
+#[cfg(unix)]
+use crate::os::{OsReactor, OsWaker};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -26,9 +32,25 @@ impl fmt::Display for SpawnError {
 impl Error for SpawnError {}
 
 /// Handle used to submit futures to an [`Executor`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Spawner {
-    sender: mpsc::Sender<Arc<Task>>,
+    scheduler: Arc<Scheduler>,
+}
+
+impl Clone for Spawner {
+    fn clone(&self) -> Self {
+        self.scheduler.add_spawner();
+
+        Self {
+            scheduler: Arc::clone(&self.scheduler),
+        }
+    }
+}
+
+impl Drop for Spawner {
+    fn drop(&mut self) {
+        self.scheduler.remove_spawner();
+    }
 }
 
 impl Spawner {
@@ -39,10 +61,10 @@ impl Spawner {
     {
         let task = Arc::new(Task {
             future: Mutex::new(Some(Box::pin(future))),
-            sender: self.sender.clone(),
+            scheduler: Arc::clone(&self.scheduler),
         });
 
-        self.sender.send(task).map_err(|_| SpawnError)
+        self.scheduler.schedule(task)
     }
 
     /// Spawns a future and returns a handle that can await its output.
@@ -115,21 +137,41 @@ impl<T> Future for JoinHandle<T> {
 /// Single-threaded executor that polls tasks from a ready queue.
 #[derive(Debug)]
 pub struct Executor {
-    receiver: mpsc::Receiver<Arc<Task>>,
+    scheduler: Arc<Scheduler>,
+    #[cfg(unix)]
+    reactor: OsReactor,
 }
 
 impl Executor {
     /// Runs tasks until all spawners and runnable tasks are gone.
     pub fn run(&self) {
-        while let Ok(task) = self.receiver.recv() {
-            task.poll();
+        loop {
+            while let Some(task) = self.scheduler.next_task() {
+                task.poll();
+            }
+
+            if self.scheduler.is_drained() {
+                break;
+            }
+
+            #[cfg(unix)]
+            let _ = self
+                .reactor
+                .wait(None)
+                .expect("OS reactor wait failed while running executor");
         }
+    }
+}
+
+impl Drop for Executor {
+    fn drop(&mut self) {
+        self.scheduler.close();
     }
 }
 
 struct Task {
     future: Mutex<Option<BoxFuture>>,
-    sender: mpsc::Sender<Arc<Task>>,
+    scheduler: Arc<Scheduler>,
 }
 
 impl fmt::Debug for Task {
@@ -146,7 +188,9 @@ impl Task {
 
         if let Some(mut future) = future_slot.take() {
             match future.as_mut().poll(&mut context) {
-                Poll::Ready(()) => {}
+                Poll::Ready(()) => {
+                    self.scheduler.finish_task();
+                }
                 Poll::Pending => {
                     *future_slot = Some(future);
                 }
@@ -157,19 +201,143 @@ impl Task {
 
 impl Wake for Task {
     fn wake(self: Arc<Self>) {
-        let sender = self.sender.clone();
-        let _ = sender.send(self);
+        let scheduler = Arc::clone(&self.scheduler);
+        let _ = scheduler.schedule_existing(self);
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        let _ = self.sender.send(self.clone());
+        let _ = self.scheduler.schedule_existing(self.clone());
+    }
+}
+
+#[derive(Debug)]
+struct Scheduler {
+    state: Mutex<SchedulerState>,
+    #[cfg(unix)]
+    waker: OsWaker,
+}
+
+#[derive(Debug)]
+struct SchedulerState {
+    queue: VecDeque<Arc<Task>>,
+    accepting: bool,
+    spawner_count: usize,
+    task_count: usize,
+}
+
+impl Scheduler {
+    fn new(#[cfg(unix)] waker: OsWaker) -> Self {
+        Self {
+            state: Mutex::new(SchedulerState {
+                queue: VecDeque::new(),
+                accepting: true,
+                spawner_count: 1,
+                task_count: 0,
+            }),
+            #[cfg(unix)]
+            waker,
+        }
+    }
+
+    fn add_spawner(&self) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.spawner_count += 1;
+    }
+
+    fn remove_spawner(&self) {
+        let should_wake = {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+            state.spawner_count = state.spawner_count.saturating_sub(1);
+            state.spawner_count == 0
+        };
+
+        if should_wake {
+            self.wake_reactor();
+        }
+    }
+
+    fn schedule(&self, task: Arc<Task>) -> Result<(), SpawnError> {
+        {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+            if !state.accepting {
+                return Err(SpawnError);
+            }
+            state.task_count += 1;
+            state.queue.push_back(task);
+        }
+
+        self.wake_reactor();
+        Ok(())
+    }
+
+    fn schedule_existing(&self, task: Arc<Task>) -> Result<(), SpawnError> {
+        {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+            if !state.accepting {
+                return Err(SpawnError);
+            }
+            state.queue.push_back(task);
+        }
+
+        self.wake_reactor();
+        Ok(())
+    }
+
+    fn next_task(&self) -> Option<Arc<Task>> {
+        self.state
+            .lock()
+            .expect("scheduler state mutex poisoned")
+            .queue
+            .pop_front()
+    }
+
+    fn is_drained(&self) -> bool {
+        let state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.queue.is_empty() && state.spawner_count == 0 && state.task_count == 0
+    }
+
+    fn close(&self) {
+        {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+            state.accepting = false;
+        }
+
+        self.wake_reactor();
+    }
+
+    fn finish_task(&self) {
+        let should_wake = {
+            let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+            state.task_count = state.task_count.saturating_sub(1);
+            state.queue.is_empty() && state.spawner_count == 0 && state.task_count == 0
+        };
+
+        if should_wake {
+            self.wake_reactor();
+        }
+    }
+
+    fn wake_reactor(&self) {
+        #[cfg(unix)]
+        let _ = self.waker.wake();
     }
 }
 
 /// Creates a paired executor and spawner.
 pub fn executor_and_spawner() -> (Executor, Spawner) {
-    let (sender, receiver) = mpsc::channel();
-    (Executor { receiver }, Spawner { sender })
+    #[cfg(unix)]
+    {
+        let reactor = OsReactor::new().expect("failed to create OS reactor for executor");
+        let scheduler = Arc::new(Scheduler::new(reactor.waker()));
+
+        (
+            Executor {
+                scheduler: Arc::clone(&scheduler),
+                reactor,
+            },
+            Spawner { scheduler },
+        )
+    }
 }
 
 /// Runs one future to completion on a fresh single-threaded executor.

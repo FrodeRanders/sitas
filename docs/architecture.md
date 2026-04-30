@@ -38,6 +38,7 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - `block_on` drives one root future to completion
 - join handles let tasks await typed outputs from spawned tasks
 - `yield_now` proves cooperative wakeups without third-party runtimes
+- on Unix, the executor sleeps on `OsReactor` when no tasks are ready
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than

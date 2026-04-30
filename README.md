@@ -13,8 +13,8 @@ The current version implements a sharded key-value store using only the Rust
 standard library:
 
 - a small reusable std-only runtime layer
-- a minimal std-only executor experiment with custom wakers, join handles, and
-  awaitable shard replies
+- a minimal executor experiment with custom wakers, join handles, awaitable
+  shard replies, and OS-backed sleeping on this branch
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
 - one OS thread per shard
 - one mailbox per shard
@@ -67,13 +67,14 @@ This milestone does not include:
 - procedural macro service generation
 - `unsafe`
 
-Later milestones may add async I/O, CPU affinity, backpressure, and OS-specific
-runtime backends.
+Later milestones may add async I/O, CPU affinity, backpressure, and fuller
+OS-specific runtime backends.
 
 ## Platform Notes
 
-The first milestone should work on both macOS and Linux because it only uses
-portable Rust standard-library concurrency primitives.
+The std-only baseline should work on both macOS and Linux because it only uses
+portable Rust standard-library concurrency primitives. The `non-std-runtime`
+branch keeps macOS and Linux as active targets for direct Unix runtime work.
 
 Linux is expected to become the primary performance and production target for
 later low-level runtime work, especially for CPU affinity and `io_uring`.

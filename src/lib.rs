@@ -31,7 +31,7 @@
 pub mod counter;
 /// Error types returned by shard operations.
 pub mod error;
-/// Minimal standard-library async executor experiment.
+/// Minimal async executor experiment.
 pub mod executor;
 /// Sharded key-value store implementation.
 pub mod kv;
