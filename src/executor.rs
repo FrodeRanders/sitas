@@ -760,27 +760,29 @@ where
     F::Output: Send + 'static,
 {
     let (executor, spawner) = executor_and_spawner();
-    let result = Arc::new(Mutex::new(None));
-    let result_for_task = Arc::clone(&result);
-
-    spawner
-        .spawn(async move {
-            let output = future.await;
-            *result_for_task
-                .lock()
-                .expect("block_on result mutex poisoned") = Some(output);
-        })
+    let handle = spawner
+        .spawn_with_handle(future)
         .expect("fresh executor should accept root future");
     drop(spawner);
 
     executor.run();
+    take_join_handle_result(handle)
+}
 
-    let output = result
+fn take_join_handle_result<T>(handle: JoinHandle<T>) -> T {
+    let mut state = handle
+        .shared
         .lock()
-        .expect("block_on result mutex poisoned")
+        .expect("join handle state mutex poisoned");
+
+    match state
+        .result
         .take()
-        .expect("root future completed without producing a result");
-    output
+        .expect("root future completed without producing a result")
+    {
+        Ok(output) => output,
+        Err(payload) => panic::resume_unwind(payload),
+    }
 }
 
 /// Returns a future that completes after `duration`.
@@ -1110,6 +1112,18 @@ mod tests {
     #[test]
     fn block_on_returns_future_output() {
         assert_eq!(block_on(async { 42 }), 42);
+    }
+
+    #[test]
+    fn block_on_preserves_root_future_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            block_on(async {
+                panic!("root panic");
+            });
+        })
+        .unwrap_err();
+
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"root panic"));
     }
 
     #[test]
