@@ -22,6 +22,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example async_tcp_echo
         cargo run --example async_tcp_pair
         cargo run --example async_tcp_server
+        cargo run --example async_tcp_idle_server
         cargo run --example async_tcp_timeout
         cargo run --example async_tcp_multi_echo
         cargo run --example async_copy

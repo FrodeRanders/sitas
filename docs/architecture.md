@@ -82,6 +82,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   thread to interleave multiple connection handlers
 - `serve_tcp_n` owns a listener, accepts a bounded number of connections,
   spawns one handler per stream, and awaits the handler join results
+- `serve_tcp_until_idle` runs the same handler-spawning accept loop until the
+  listener stays idle past a caller-provided timeout
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than

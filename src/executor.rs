@@ -1307,10 +1307,56 @@ where
         );
     }
 
+    join_tcp_handlers(handlers).await?;
+
+    Ok(())
+}
+
+/// Accepts TCP connections until `idle_timeout` elapses without a new
+/// connection, spawning one handler task for each accepted stream.
+///
+/// The listener is placed in non-blocking mode before serving starts. Handler
+/// futures run concurrently on `spawner`; this future waits for all spawned
+/// handlers before returning the number of accepted connections.
+#[cfg(unix)]
+pub async fn serve_tcp_until_idle<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    idle_timeout: Duration,
+    mut handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    let mut handlers = Vec::new();
+
+    loop {
+        match accept_timeout_async(&listener, idle_timeout).await {
+            Ok((stream, peer)) => {
+                handlers.push(
+                    spawner
+                        .spawn_with_handle(handler(stream, peer))
+                        .map_err(spawn_error_to_io)?,
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
+            Err(error) => return Err(error),
+        }
+    }
+
+    let accepted = handlers.len();
+    join_tcp_handlers(handlers).await?;
+
+    Ok(accepted)
+}
+
+#[cfg(unix)]
+async fn join_tcp_handlers(handlers: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
     for handler in handlers {
         handler.await.map_err(join_error_to_io)??;
     }
-
     Ok(())
 }
 
@@ -1643,7 +1689,7 @@ mod tests {
     use super::{
         accept_async, accept_timeout_async, connect_async, connect_timeout_async, copy_async,
         copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, serve_tcp_n,
-        writable, write_all_async, write_all_timeout_async,
+        serve_tcp_until_idle, writable, write_all_async, write_all_timeout_async,
     };
     use super::{
         block_on, executor_and_spawner, race, sleep, timeout, yield_now, RaceOutput, TimeoutError,
@@ -2764,6 +2810,100 @@ mod tests {
                 let error = serve_tcp_n(listener, server_spawner, 1, |_stream, _peer| async {
                     Err(io::Error::new(io::ErrorKind::Other, "handler failed"))
                 })
+                .await
+                .unwrap_err();
+                *output_for_task.lock().unwrap() = Some(error.kind());
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+        client.join().unwrap();
+
+        assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::Other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_until_idle_stops_after_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let clients = (0..3u8)
+            .map(|value| {
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(5 + u64::from(value) * 5));
+                    let mut stream = TcpStream::connect(address).unwrap();
+                    stream.write_all(&[b'a' + value]).unwrap();
+
+                    let mut echo = [0u8; 1];
+                    stream.read_exact(&mut echo).unwrap();
+                    echo[0]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                let accepted = serve_tcp_until_idle(
+                    listener,
+                    server_spawner,
+                    Duration::from_millis(25),
+                    |mut stream, _peer| async move {
+                        let mut byte = [0u8; 1];
+                        read_exact_async(&mut stream, &mut byte).await?;
+                        write_all_async(&mut stream, &byte).await
+                    },
+                )
+                .await
+                .unwrap();
+                *output_for_task.lock().unwrap() = Some(accepted);
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        let mut echoed = clients
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .collect::<Vec<_>>();
+        echoed.sort();
+
+        assert_eq!(*output.lock().unwrap(), Some(3));
+        assert_eq!(&echoed, b"abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_until_idle_returns_handler_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = thread::spawn(move || {
+            TcpStream::connect(address).unwrap();
+        });
+
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                let error = serve_tcp_until_idle(
+                    listener,
+                    server_spawner,
+                    Duration::from_millis(5),
+                    |_stream, _peer| async {
+                        Err(io::Error::new(io::ErrorKind::Other, "handler failed"))
+                    },
+                )
                 .await
                 .unwrap_err();
                 *output_for_task.lock().unwrap() = Some(error.kind());

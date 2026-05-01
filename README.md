@@ -26,6 +26,7 @@ standard library:
   non-blocking Unix descriptors
 - a bounded async TCP server helper that spawns and joins one handler per
   accepted connection
+- an idle-timeout async TCP server helper for cancellable accept loops
 - timeout variants for the async Unix I/O helpers
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
   and descriptor readiness
@@ -169,6 +170,12 @@ Run the bounded async TCP server helper example:
 cargo run --example async_tcp_server
 ```
 
+Run the idle-timeout async TCP server helper example:
+
+```sh
+cargo run --example async_tcp_idle_server
+```
+
 Run the async TCP timeout example:
 
 ```sh
@@ -265,6 +272,7 @@ cargo run --example async_connect
 cargo run --example async_tcp_echo
 cargo run --example async_tcp_pair
 cargo run --example async_tcp_server
+cargo run --example async_tcp_idle_server
 cargo run --example async_tcp_timeout
 cargo run --example async_tcp_multi_echo
 cargo run --example async_copy
