@@ -31,6 +31,8 @@ type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
 type PanicHandler = Box<dyn FnOnce(PanicPayload) + Send + 'static>;
 type JoinResult<T> = Result<T, JoinError>;
 
+const READY_POLL_BUDGET: usize = 64;
+
 thread_local! {
     static CURRENT_SCHEDULER: RefCell<Option<Arc<Scheduler>>> = const { RefCell::new(None) };
 }
@@ -252,14 +254,16 @@ impl Executor {
     /// Runs tasks until all spawners and runnable tasks are gone.
     pub fn run(&self) {
         loop {
-            while let Some(task) = self.scheduler.next_task() {
-                task.poll();
-            }
+            self.poll_ready_tasks();
 
             self.scheduler.wake_expired_timers();
 
             if self.scheduler.is_drained() {
                 break;
+            }
+
+            if self.scheduler.has_ready_tasks() {
+                continue;
             }
 
             #[cfg(unix)]
@@ -310,13 +314,11 @@ impl Executor {
                 }
             }
 
-            while let Some(task) = self.scheduler.next_task() {
-                task.poll();
-            }
+            self.poll_ready_tasks();
 
             self.scheduler.wake_expired_timers();
 
-            if root.is_ready() {
+            if root.is_ready() || self.scheduler.has_ready_tasks() {
                 continue;
             }
 
@@ -335,6 +337,15 @@ impl Executor {
             }
 
             self.scheduler.wake_expired_timers();
+        }
+    }
+
+    fn poll_ready_tasks(&self) {
+        for _ in 0..READY_POLL_BUDGET {
+            let Some(task) = self.scheduler.next_task() else {
+                break;
+            };
+            task.poll();
         }
     }
 }
@@ -744,6 +755,15 @@ impl Scheduler {
     fn is_drained(&self) -> bool {
         let state = self.state.lock().expect("scheduler state mutex poisoned");
         state.queue.is_empty() && state.spawner_count == 0 && state.task_count == 0
+    }
+
+    fn has_ready_tasks(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .expect("scheduler state mutex poisoned")
+            .queue
+            .is_empty()
     }
 
     fn close(&self) {
@@ -1603,6 +1623,21 @@ mod tests {
         drop(spawner);
 
         assert_eq!(output, 7);
+    }
+
+    #[test]
+    fn run_until_timer_completes_while_task_keeps_waking() {
+        let (executor, spawner) = executor_and_spawner();
+
+        spawner.spawn(AlwaysWake).unwrap();
+        drop(spawner);
+
+        let started = Instant::now();
+        executor.run_until(async {
+            sleep(Duration::from_millis(5)).await;
+        });
+
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -2620,6 +2655,20 @@ mod tests {
             context: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Self::Output> {
             context.waker().wake_by_ref();
+            context.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    struct AlwaysWake;
+
+    impl std::future::Future for AlwaysWake {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
             context.waker().wake_by_ref();
             std::task::Poll::Pending
         }

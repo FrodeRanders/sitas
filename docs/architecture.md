@@ -35,6 +35,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
 
 - tasks own pinned futures
 - a ready queue stores runnable tasks
+- ready-queue polling is budgeted so one self-waking task cannot indefinitely
+  starve timers and reactor readiness
 - repeated wakes coalesce to one ready-queue entry per task
 - custom wakers re-enqueue tasks
 - task panics are caught at the executor boundary so unrelated tasks can keep
