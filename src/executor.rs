@@ -29,7 +29,7 @@ use crate::os::{tcp_connect_start, OsReactor, OsWaker};
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
 type PanicHandler = Box<dyn FnOnce(PanicPayload) + Send + 'static>;
-type JoinResult<T> = Result<T, PanicPayload>;
+type JoinResult<T> = Result<T, JoinError>;
 
 thread_local! {
     static CURRENT_SCHEDULER: RefCell<Option<Arc<Scheduler>>> = const { RefCell::new(None) };
@@ -75,7 +75,7 @@ impl Spawner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_with_panic_handler(future, None)
+        self.spawn_with_panic_handler(future, None).map(|_| ())
     }
 
     /// Spawns a future and returns a handle that can await its output.
@@ -91,44 +91,24 @@ impl Spawner {
         let shared_for_task = Arc::clone(&shared);
         let shared_for_panic = Arc::clone(&shared);
 
-        self.spawn_with_panic_handler(
+        let task = self.spawn_with_panic_handler(
             async move {
                 let output = future.await;
-                let waker = {
-                    let mut state = shared_for_task
-                        .lock()
-                        .expect("join handle state mutex poisoned");
-                    state.result = Some(Ok(output));
-                    state.waker.take()
-                };
-
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
+                complete_join(&shared_for_task, Ok(output));
             },
             Some(Box::new(move |payload| {
-                let waker = {
-                    let mut state = shared_for_panic
-                        .lock()
-                        .expect("join handle state mutex poisoned");
-                    state.result = Some(Err(payload));
-                    state.waker.take()
-                };
-
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
+                complete_join(&shared_for_panic, Err(JoinError::Panic(payload)));
             })),
         )?;
 
-        Ok(JoinHandle { shared })
+        Ok(JoinHandle { shared, task })
     }
 
     fn spawn_with_panic_handler<F>(
         &self,
         future: F,
         panic_handler: Option<PanicHandler>,
-    ) -> Result<(), SpawnError>
+    ) -> Result<Arc<Task>, SpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -138,7 +118,8 @@ impl Spawner {
             panic_handler,
         ));
 
-        self.scheduler.schedule(task)
+        self.scheduler.schedule(Arc::clone(&task))?;
+        Ok(task)
     }
 }
 
@@ -146,6 +127,7 @@ impl Spawner {
 #[must_use = "join handles do nothing unless polled or awaited"]
 pub struct JoinHandle<T> {
     shared: Arc<Mutex<JoinState<T>>>,
+    task: Arc<Task>,
 }
 
 struct JoinState<T> {
@@ -153,14 +135,78 @@ struct JoinState<T> {
     waker: Option<Waker>,
 }
 
+/// Error returned by a [`JoinHandle`] when a spawned task did not produce a
+/// value.
+pub enum JoinError {
+    /// The task was aborted before it completed.
+    Cancelled,
+    /// The task panicked while it was being polled.
+    Panic(PanicPayload),
+}
+
+impl JoinError {
+    /// Returns true if the task was aborted before completion.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, JoinError::Cancelled)
+    }
+
+    /// Returns true if the task panicked while it was being polled.
+    pub fn is_panic(&self) -> bool {
+        matches!(self, JoinError::Panic(_))
+    }
+
+    /// Consumes the error and returns the panic payload if the task panicked.
+    pub fn into_panic(self) -> Option<PanicPayload> {
+        match self {
+            JoinError::Cancelled => None,
+            JoinError::Panic(payload) => Some(payload),
+        }
+    }
+}
+
+impl fmt::Debug for JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JoinError::Cancelled => f.write_str("Cancelled"),
+            JoinError::Panic(_) => f.write_str("Panic(..)"),
+        }
+    }
+}
+
+impl fmt::Display for JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JoinError::Cancelled => write!(f, "task was cancelled"),
+            JoinError::Panic(_) => write!(f, "task panicked"),
+        }
+    }
+}
+
+impl Error for JoinError {}
+
 impl<T> fmt::Debug for JoinHandle<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JoinHandle").finish_non_exhaustive()
     }
 }
 
+impl<T> JoinHandle<T> {
+    /// Aborts the task if it has not completed yet.
+    ///
+    /// Awaiting this handle after a successful abort returns
+    /// [`JoinError::Cancelled`].
+    pub fn abort(&self) -> bool {
+        if !self.task.cancel() {
+            return false;
+        }
+
+        complete_join(&self.shared, Err(JoinError::Cancelled));
+        true
+    }
+}
+
 impl<T> Future for JoinHandle<T> {
-    type Output = T;
+    type Output = JoinResult<T>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = self
@@ -169,13 +215,28 @@ impl<T> Future for JoinHandle<T> {
             .expect("join handle state mutex poisoned");
 
         match state.result.take() {
-            Some(Ok(output)) => Poll::Ready(output),
-            Some(Err(payload)) => panic::resume_unwind(payload),
+            Some(result) => Poll::Ready(result),
             None => {
                 state.waker = Some(context.waker().clone());
                 Poll::Pending
             }
         }
+    }
+}
+
+fn complete_join<T>(shared: &Arc<Mutex<JoinState<T>>>, result: JoinResult<T>) {
+    let waker = {
+        let mut state = shared.lock().expect("join handle state mutex poisoned");
+        if state.result.is_some() {
+            None
+        } else {
+            state.result = Some(result);
+            state.waker.take()
+        }
+    };
+
+    if let Some(waker) = waker {
+        waker.wake();
     }
 }
 
@@ -236,6 +297,7 @@ struct TaskState {
     panic_handler: Option<PanicHandler>,
     queued: bool,
     polling: bool,
+    cancel_requested: bool,
 }
 
 impl fmt::Debug for Task {
@@ -256,6 +318,7 @@ impl Task {
                 panic_handler,
                 queued: false,
                 polling: false,
+                cancel_requested: false,
             }),
             scheduler,
         }
@@ -296,9 +359,21 @@ impl Task {
                 self.scheduler.finish_task();
             }
             Ok(Poll::Pending) => {
-                let mut state = self.state.lock().expect("task state mutex poisoned");
-                state.polling = false;
-                state.future = Some(future);
+                let cancelled = {
+                    let mut state = self.state.lock().expect("task state mutex poisoned");
+                    state.polling = false;
+                    if state.cancel_requested {
+                        true
+                    } else {
+                        state.future = Some(future);
+                        false
+                    }
+                };
+
+                if cancelled {
+                    self.scheduler.finish_task();
+                    self.scheduler.wake_reactor();
+                }
             }
             Err(payload) => {
                 let panic_handler = {
@@ -323,6 +398,31 @@ impl Task {
         }
 
         state.queued = true;
+        true
+    }
+
+    fn cancel(&self) -> bool {
+        let should_finish = {
+            let mut state = self.state.lock().expect("task state mutex poisoned");
+            if state.future.is_none() && !state.polling {
+                return false;
+            }
+
+            state.cancel_requested = true;
+
+            if state.polling {
+                false
+            } else {
+                state.future = None;
+                state.queued = false;
+                true
+            }
+        };
+
+        if should_finish {
+            self.scheduler.finish_task();
+        }
+        self.scheduler.wake_reactor();
         true
     }
 
@@ -786,7 +886,8 @@ fn take_join_handle_result<T>(handle: JoinHandle<T>) -> T {
         .expect("root future completed without producing a result")
     {
         Ok(output) => output,
-        Err(payload) => panic::resume_unwind(payload),
+        Err(JoinError::Panic(payload)) => panic::resume_unwind(payload),
+        Err(JoinError::Cancelled) => panic!("root future was cancelled"),
     }
 }
 
@@ -1499,7 +1600,7 @@ mod tests {
 
         spawner
             .spawn(async move {
-                let output = worker.await;
+                let output = worker.await.unwrap();
                 *result_for_task.lock().unwrap() = Some(output);
             })
             .unwrap();
@@ -1532,7 +1633,8 @@ mod tests {
 
         spawner
             .spawn(async move {
-                *result_for_task.lock().unwrap() = Some(first.await + second.await);
+                *result_for_task.lock().unwrap() =
+                    Some(first.await.unwrap() + second.await.unwrap());
             })
             .unwrap();
 
@@ -1568,6 +1670,70 @@ mod tests {
     }
 
     #[test]
+    fn aborted_join_handle_returns_cancelled() {
+        let (executor, spawner) = executor_and_spawner();
+        let result = Arc::new(Mutex::new(None));
+        let result_for_task = Arc::clone(&result);
+
+        let worker = spawner
+            .spawn_with_handle(async {
+                sleep(Duration::from_secs(60)).await;
+                7
+            })
+            .unwrap();
+
+        spawner
+            .spawn(async move {
+                yield_now().await;
+                let aborted = worker.abort();
+                let cancelled = worker.await.unwrap_err().is_cancelled();
+                *result_for_task.lock().unwrap() = Some((aborted, cancelled));
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(*result.lock().unwrap(), Some((true, true)));
+        assert!(executor
+            .scheduler
+            .state
+            .lock()
+            .expect("scheduler state mutex poisoned")
+            .timers
+            .is_empty());
+    }
+
+    #[test]
+    fn aborting_completed_join_handle_returns_false() {
+        let (executor, spawner) = executor_and_spawner();
+        let result = Arc::new(Mutex::new(None));
+        let result_for_task = Arc::clone(&result);
+
+        let worker = spawner
+            .spawn_with_handle(async {
+                yield_now().await;
+                7
+            })
+            .unwrap();
+
+        spawner
+            .spawn(async move {
+                yield_now().await;
+                yield_now().await;
+                let aborted = worker.abort();
+                let output = worker.await.unwrap();
+                *result_for_task.lock().unwrap() = Some((aborted, output));
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(*result.lock().unwrap(), Some((false, 7)));
+    }
+
+    #[test]
     fn spawned_tasks_can_sleep_before_joining() {
         let (executor, spawner) = executor_and_spawner();
         let result = Arc::new(Mutex::new(None));
@@ -1582,7 +1748,7 @@ mod tests {
 
         spawner
             .spawn(async move {
-                *result_for_task.lock().unwrap() = Some(worker.await);
+                *result_for_task.lock().unwrap() = Some(worker.await.unwrap());
             })
             .unwrap();
 
@@ -2080,8 +2246,8 @@ mod tests {
         let output_for_task = Arc::clone(&output);
         spawner
             .spawn(async move {
-                let peer = server.await;
-                let echoed = client.await;
+                let peer = server.await.unwrap();
+                let echoed = client.await.unwrap();
                 *output_for_task.lock().unwrap() = Some((peer, echoed));
             })
             .unwrap();
@@ -2161,7 +2327,7 @@ mod tests {
                     })
                     .unwrap();
 
-                *output_for_task.lock().unwrap() = Some(worker.await);
+                *output_for_task.lock().unwrap() = Some(worker.await.unwrap());
             })
             .unwrap();
 
@@ -2211,6 +2377,10 @@ mod tests {
             }));
 
             match result {
+                Ok(std::task::Poll::Ready(Err(error))) if error.is_panic() => {
+                    *self.observed.lock().unwrap() = true;
+                    std::task::Poll::Ready(())
+                }
                 Ok(std::task::Poll::Ready(_)) => std::task::Poll::Ready(()),
                 Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
                 Err(_) => {

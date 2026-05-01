@@ -41,7 +41,10 @@ such as `epoll`, `kqueue`, or `io_uring`.
   running
 - `block_on` and join handles preserve task panic payloads when observed
 - `block_on` drives one root future to completion
-- join handles let tasks await typed outputs from spawned tasks
+- join handles let tasks await typed outputs from spawned tasks and observe
+  task panics as `JoinError`
+- pending tasks can be aborted through their join handles, which drops their
+  futures and lets timer/readiness cleanup run through normal future `Drop`
 - `yield_now` proves cooperative wakeups without third-party runtimes
 - on Unix, the executor sleeps on `OsReactor` when no tasks are ready
 - timer futures register task wakers in the scheduler and drive reactor timeouts

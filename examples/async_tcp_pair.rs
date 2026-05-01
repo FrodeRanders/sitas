@@ -36,8 +36,8 @@ fn main() -> std::io::Result<()> {
     let output_for_task = Arc::clone(&output);
     spawner
         .spawn(async move {
-            let peer = server.await.unwrap();
-            let echoed = client.await.unwrap();
+            let peer = server.await.unwrap().unwrap();
+            let echoed = client.await.unwrap().unwrap();
             *output_for_task.lock().unwrap() = Some((peer, echoed));
         })
         .unwrap();

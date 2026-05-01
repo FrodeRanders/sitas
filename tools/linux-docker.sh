@@ -27,6 +27,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example async_readable
         cargo run --example async_write
         cargo run --example executor_sleep
+        cargo run --example executor_abort
         cargo run --example executor_timeout
         cargo run --example custom_placement
         cargo run --example basic_counter
