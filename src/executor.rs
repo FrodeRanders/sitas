@@ -13,6 +13,7 @@ use std::fmt;
 use std::future::Future;
 #[cfg(unix)]
 use std::io::{self, Read, Write};
+use std::mem;
 #[cfg(unix)]
 use std::net::{SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
@@ -48,6 +49,115 @@ impl fmt::Display for SpawnError {
 }
 
 impl Error for SpawnError {}
+
+/// Creates a source/token pair used to stop async operations cooperatively.
+pub fn stop_pair() -> (StopSource, StopToken) {
+    let shared = Arc::new(Mutex::new(StopState {
+        stopped: false,
+        wakers: Vec::new(),
+    }));
+
+    (
+        StopSource {
+            shared: Arc::clone(&shared),
+        },
+        StopToken { shared },
+    )
+}
+
+/// Handle used to request cooperative stop.
+#[derive(Clone)]
+pub struct StopSource {
+    shared: Arc<Mutex<StopState>>,
+}
+
+/// Future that completes when its matching [`StopSource`] is stopped.
+#[derive(Clone)]
+#[must_use = "stop tokens do nothing unless polled or awaited"]
+pub struct StopToken {
+    shared: Arc<Mutex<StopState>>,
+}
+
+#[derive(Debug)]
+struct StopState {
+    stopped: bool,
+    wakers: Vec<Waker>,
+}
+
+impl StopSource {
+    /// Requests stop and wakes tasks waiting on the matching token.
+    pub fn stop(&self) -> bool {
+        let wakers = {
+            let mut state = self.shared.lock().expect("stop token mutex poisoned");
+            if state.stopped {
+                return false;
+            }
+
+            state.stopped = true;
+            mem::take(&mut state.wakers)
+        };
+
+        for waker in wakers {
+            waker.wake();
+        }
+
+        true
+    }
+
+    /// Returns true if stop has already been requested.
+    pub fn is_stopped(&self) -> bool {
+        self.shared
+            .lock()
+            .expect("stop token mutex poisoned")
+            .stopped
+    }
+}
+
+impl StopToken {
+    /// Returns true if stop has already been requested.
+    pub fn is_stopped(&self) -> bool {
+        self.shared
+            .lock()
+            .expect("stop token mutex poisoned")
+            .stopped
+    }
+}
+
+impl fmt::Debug for StopSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StopSource")
+            .field("stopped", &self.is_stopped())
+            .finish()
+    }
+}
+
+impl fmt::Debug for StopToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StopToken")
+            .field("stopped", &self.is_stopped())
+            .finish()
+    }
+}
+
+impl Future for StopToken {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.shared.lock().expect("stop token mutex poisoned");
+        if state.stopped {
+            Poll::Ready(())
+        } else {
+            if !state
+                .wakers
+                .iter()
+                .any(|waker| waker.will_wake(context.waker()))
+            {
+                state.wakers.push(context.waker().clone());
+            }
+            Poll::Pending
+        }
+    }
+}
 
 /// Handle used to submit futures to an [`Executor`].
 #[derive(Debug)]
@@ -1352,6 +1462,46 @@ where
     Ok(accepted)
 }
 
+/// Accepts TCP connections until `stop` completes, spawning one handler task
+/// for each accepted stream.
+///
+/// The listener is placed in non-blocking mode before serving starts. Handler
+/// futures run concurrently on `spawner`; this future waits for all spawned
+/// handlers before returning the number of accepted connections.
+#[cfg(unix)]
+pub async fn serve_tcp_until_stopped<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    stop: StopToken,
+    mut handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    let mut handlers = Vec::new();
+
+    loop {
+        match race(accept_async(&listener), stop.clone()).await {
+            RaceOutput::First(Ok((stream, peer))) => {
+                handlers.push(
+                    spawner
+                        .spawn_with_handle(handler(stream, peer))
+                        .map_err(spawn_error_to_io)?,
+                );
+            }
+            RaceOutput::First(Err(error)) => return Err(error),
+            RaceOutput::Second(()) => break,
+        }
+    }
+
+    let accepted = handlers.len();
+    join_tcp_handlers(handlers).await?;
+
+    Ok(accepted)
+}
+
 #[cfg(unix)]
 async fn join_tcp_handlers(handlers: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
     for handler in handlers {
@@ -1689,10 +1839,12 @@ mod tests {
     use super::{
         accept_async, accept_timeout_async, connect_async, connect_timeout_async, copy_async,
         copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, serve_tcp_n,
-        serve_tcp_until_idle, writable, write_all_async, write_all_timeout_async,
+        serve_tcp_until_idle, serve_tcp_until_stopped, writable, write_all_async,
+        write_all_timeout_async,
     };
     use super::{
-        block_on, executor_and_spawner, race, sleep, timeout, yield_now, RaceOutput, TimeoutError,
+        block_on, executor_and_spawner, race, sleep, stop_pair, timeout, yield_now, RaceOutput,
+        TimeoutError,
     };
     #[cfg(unix)]
     use std::io::{self, Read, Write};
@@ -1730,6 +1882,36 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(panic.downcast_ref::<&str>(), Some(&"root panic"));
+    }
+
+    #[test]
+    fn stop_token_completes_after_source_stops() {
+        let (source, token) = stop_pair();
+        assert!(!source.is_stopped());
+        assert!(source.stop());
+        assert!(!source.stop());
+        assert!(token.is_stopped());
+
+        block_on(token);
+    }
+
+    #[test]
+    fn cloned_stop_tokens_wake_multiple_waiters() {
+        let (executor, spawner) = executor_and_spawner();
+        let (source, token) = stop_pair();
+
+        let first = spawner.spawn_with_handle(token.clone()).unwrap();
+        let second = spawner.spawn_with_handle(token).unwrap();
+
+        executor.run_until(async {
+            yield_now().await;
+            assert!(source.stop());
+
+            first.await.unwrap();
+            second.await.unwrap();
+        });
+
+        drop(spawner);
     }
 
     #[test]
@@ -2900,6 +3082,116 @@ mod tests {
                     listener,
                     server_spawner,
                     Duration::from_millis(5),
+                    |_stream, _peer| async {
+                        Err(io::Error::new(io::ErrorKind::Other, "handler failed"))
+                    },
+                )
+                .await
+                .unwrap_err();
+                *output_for_task.lock().unwrap() = Some(error.kind());
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+        client.join().unwrap();
+
+        assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::Other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_until_stopped_stops_after_stop_signal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let clients = (0..3u8)
+            .map(|value| {
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(5 + u64::from(value) * 5));
+                    let mut stream = TcpStream::connect(address).unwrap();
+                    stream.write_all(&[b'a' + value]).unwrap();
+
+                    let mut echo = [0u8; 1];
+                    stream.read_exact(&mut echo).unwrap();
+                    echo[0]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (stop_source, stop_token) = stop_pair();
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                sleep(Duration::from_millis(30)).await;
+                stop_source.stop();
+            })
+            .unwrap();
+
+        spawner
+            .spawn(async move {
+                let accepted = serve_tcp_until_stopped(
+                    listener,
+                    server_spawner,
+                    stop_token,
+                    |mut stream, _peer| async move {
+                        let mut byte = [0u8; 1];
+                        read_exact_async(&mut stream, &mut byte).await?;
+                        write_all_async(&mut stream, &byte).await
+                    },
+                )
+                .await
+                .unwrap();
+                *output_for_task.lock().unwrap() = Some(accepted);
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        let mut echoed = clients
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .collect::<Vec<_>>();
+        echoed.sort();
+
+        assert_eq!(*output.lock().unwrap(), Some(3));
+        assert_eq!(&echoed, b"abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_until_stopped_returns_handler_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = thread::spawn(move || {
+            TcpStream::connect(address).unwrap();
+        });
+
+        let (stop_source, stop_token) = stop_pair();
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                sleep(Duration::from_millis(5)).await;
+                stop_source.stop();
+            })
+            .unwrap();
+
+        spawner
+            .spawn(async move {
+                let error = serve_tcp_until_stopped(
+                    listener,
+                    server_spawner,
+                    stop_token,
                     |_stream, _peer| async {
                         Err(io::Error::new(io::ErrorKind::Other, "handler failed"))
                     },

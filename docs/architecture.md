@@ -55,6 +55,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - `yield_now` proves cooperative wakeups without third-party runtimes
 - `race` composes two futures and completes with the first result, dropping the
   losing future through ordinary cancellation cleanup
+- stop tokens provide a small cooperative shutdown primitive for async
+  operations
 - on Unix, the executor sleeps on `OsReactor` when no tasks are ready
 - timer futures register task wakers in the scheduler and drive reactor timeouts
 - sleeping futures unregister their timers when dropped, which keeps cancelled
@@ -84,6 +86,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   spawns one handler per stream, and awaits the handler join results
 - `serve_tcp_until_idle` runs the same handler-spawning accept loop until the
   listener stays idle past a caller-provided timeout
+- `serve_tcp_until_stopped` races listener accepts against a stop token for
+  explicit accept-loop shutdown
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than
