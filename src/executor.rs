@@ -1278,6 +1278,42 @@ pub async fn accept_timeout_async(
     timeout_io(duration, accept_async(listener)).await
 }
 
+/// Accepts `connection_count` TCP connections and spawns one handler task for
+/// each accepted stream.
+///
+/// The listener is placed in non-blocking mode before serving starts. Handler
+/// futures run concurrently on `spawner`; this future waits for all spawned
+/// handlers before returning.
+#[cfg(unix)]
+pub async fn serve_tcp_n<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    connection_count: usize,
+    mut handler: H,
+) -> io::Result<()>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    let mut handlers = Vec::with_capacity(connection_count);
+
+    for _ in 0..connection_count {
+        let (stream, peer) = accept_async(&listener).await?;
+        handlers.push(
+            spawner
+                .spawn_with_handle(handler(stream, peer))
+                .map_err(spawn_error_to_io)?,
+        );
+    }
+
+    for handler in handlers {
+        handler.await.map_err(join_error_to_io)??;
+    }
+
+    Ok(())
+}
+
 /// Connects to a TCP address without blocking the executor.
 ///
 /// The returned stream is non-blocking.
@@ -1316,6 +1352,16 @@ where
             "async operation timed out",
         )),
     }
+}
+
+#[cfg(unix)]
+fn spawn_error_to_io(error: SpawnError) -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, error)
+}
+
+#[cfg(unix)]
+fn join_error_to_io(error: JoinError) -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
 }
 
 /// Future returned by [`readable`].
@@ -1596,14 +1642,14 @@ mod tests {
     #[cfg(unix)]
     use super::{
         accept_async, accept_timeout_async, connect_async, connect_timeout_async, copy_async,
-        copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, writable,
-        write_all_async, write_all_timeout_async,
+        copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, serve_tcp_n,
+        writable, write_all_async, write_all_timeout_async,
     };
     use super::{
         block_on, executor_and_spawner, race, sleep, timeout, yield_now, RaceOutput, TimeoutError,
     };
     #[cfg(unix)]
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     #[cfg(unix)]
     use std::net::{TcpListener, TcpStream};
     #[cfg(unix)]
@@ -2644,6 +2690,91 @@ mod tests {
         echoed.sort();
 
         assert_eq!(&echoed, b"abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_n_spawns_handlers_for_accepted_streams() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let clients = (0..3u8)
+            .map(|value| {
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(5 + u64::from(value) * 5));
+                    let mut stream = TcpStream::connect(address).unwrap();
+                    stream.write_all(&[b'a' + value]).unwrap();
+
+                    let mut echo = [0u8; 1];
+                    stream.read_exact(&mut echo).unwrap();
+                    echo[0]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+
+        spawner
+            .spawn(async move {
+                serve_tcp_n(
+                    listener,
+                    server_spawner,
+                    3,
+                    |mut stream, _peer| async move {
+                        let mut byte = [0u8; 1];
+                        read_exact_async(&mut stream, &mut byte).await?;
+                        write_all_async(&mut stream, &byte).await
+                    },
+                )
+                .await
+                .unwrap();
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        let mut echoed = clients
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .collect::<Vec<_>>();
+        echoed.sort();
+
+        assert_eq!(&echoed, b"abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_n_returns_handler_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = thread::spawn(move || {
+            TcpStream::connect(address).unwrap();
+        });
+
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                let error = serve_tcp_n(listener, server_spawner, 1, |_stream, _peer| async {
+                    Err(io::Error::new(io::ErrorKind::Other, "handler failed"))
+                })
+                .await
+                .unwrap_err();
+                *output_for_task.lock().unwrap() = Some(error.kind());
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+        client.join().unwrap();
+
+        assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::Other));
     }
 
     #[test]

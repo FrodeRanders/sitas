@@ -80,6 +80,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   I/O futures with executor timers and report `io::ErrorKind::TimedOut`
 - accepted TCP streams can be handed to spawned tasks, allowing one executor
   thread to interleave multiple connection handlers
+- `serve_tcp_n` owns a listener, accepts a bounded number of connections,
+  spawns one handler per stream, and awaits the handler join results
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than
