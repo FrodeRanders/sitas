@@ -915,6 +915,18 @@ where
     }
 }
 
+/// Returns a future that completes with whichever input future completes first.
+pub fn race<A, B>(first: A, second: B) -> Race<A, B>
+where
+    A: Future,
+    B: Future,
+{
+    Race {
+        first: Some(Box::pin(first)),
+        second: Some(Box::pin(second)),
+    }
+}
+
 /// Returns a future that completes when `fd` is readable.
 #[cfg(unix)]
 pub fn readable(fd: RawFd) -> Readable {
@@ -1349,6 +1361,73 @@ where
     }
 }
 
+/// Output returned by [`race`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaceOutput<A, B> {
+    /// The first future completed before the second future.
+    First(A),
+    /// The second future completed before the first future.
+    Second(B),
+}
+
+/// Future returned by [`race`].
+#[must_use = "futures do nothing unless polled or awaited"]
+pub struct Race<A, B>
+where
+    A: Future,
+    B: Future,
+{
+    first: Option<Pin<Box<A>>>,
+    second: Option<Pin<Box<B>>>,
+}
+
+impl<A, B> fmt::Debug for Race<A, B>
+where
+    A: Future,
+    B: Future,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Race").finish_non_exhaustive()
+    }
+}
+
+impl<A, B> Unpin for Race<A, B>
+where
+    A: Future,
+    B: Future,
+{
+}
+
+impl<A, B> Future for Race<A, B>
+where
+    A: Future,
+    B: Future,
+{
+    type Output = RaceOutput<A::Output, B::Output>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if let Some(first) = this.first.as_mut() {
+            if let Poll::Ready(output) = first.as_mut().poll(context) {
+                this.second.take();
+                this.first.take();
+                return Poll::Ready(RaceOutput::First(output));
+            }
+        }
+
+        if let Some(second) = this.second.as_mut() {
+            if let Poll::Ready(output) = second.as_mut().poll(context) {
+                this.first.take();
+                this.second.take();
+                return Poll::Ready(RaceOutput::Second(output));
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
 /// Returns a future that yields once before completing.
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
@@ -1383,7 +1462,9 @@ mod tests {
         copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, writable,
         write_all_async, write_all_timeout_async,
     };
-    use super::{block_on, executor_and_spawner, sleep, timeout, yield_now, TimeoutError};
+    use super::{
+        block_on, executor_and_spawner, race, sleep, timeout, yield_now, RaceOutput, TimeoutError,
+    };
     #[cfg(unix)]
     use std::io::{Read, Write};
     #[cfg(unix)]
@@ -1483,6 +1564,80 @@ mod tests {
         executor.run();
 
         assert_eq!(*output.lock().unwrap(), Some(Err(TimeoutError)));
+        assert!(executor
+            .scheduler
+            .state
+            .lock()
+            .expect("scheduler state mutex poisoned")
+            .timers
+            .is_empty());
+    }
+
+    #[test]
+    fn race_returns_first_future_output() {
+        let output = block_on(async {
+            race(
+                async {
+                    yield_now().await;
+                    "first"
+                },
+                async {
+                    sleep(Duration::from_secs(60)).await;
+                    "second"
+                },
+            )
+            .await
+        });
+
+        assert_eq!(output, RaceOutput::First("first"));
+    }
+
+    #[test]
+    fn race_returns_second_future_output() {
+        let output = block_on(async {
+            race(
+                async {
+                    sleep(Duration::from_secs(60)).await;
+                    "first"
+                },
+                async {
+                    yield_now().await;
+                    "second"
+                },
+            )
+            .await
+        });
+
+        assert_eq!(output, RaceOutput::Second("second"));
+    }
+
+    #[test]
+    fn race_drops_losing_sleep_timer() {
+        let (executor, spawner) = executor_and_spawner();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                let result = race(
+                    async {
+                        sleep(Duration::from_millis(5)).await;
+                        "fast"
+                    },
+                    async {
+                        sleep(Duration::from_secs(60)).await;
+                        "slow"
+                    },
+                )
+                .await;
+                *output_for_task.lock().unwrap() = Some(result);
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(*output.lock().unwrap(), Some(RaceOutput::First("fast")));
         assert!(executor
             .scheduler
             .state

@@ -15,7 +15,7 @@ standard library:
 - a small reusable std-only runtime layer
 - a minimal executor experiment with custom wakers, join handles, awaitable
   shard replies, cancellable spawned tasks, timers, timeouts, OS-backed
-  sleeping, and read/write-readiness futures on this branch
+  sleeping, racing futures, and read/write-readiness futures on this branch
 - small async connect, accept, read, write, and copy helpers layered on
   non-blocking Unix descriptors
 - timeout variants for the async Unix I/O helpers
@@ -203,6 +203,12 @@ Run the executor timeout example:
 cargo run --example executor_timeout
 ```
 
+Run the executor race example:
+
+```sh
+cargo run --example executor_race
+```
+
 Run the custom placement example:
 
 ```sh
@@ -252,6 +258,7 @@ cargo run --example async_write
 cargo run --example executor_sleep
 cargo run --example executor_abort
 cargo run --example executor_timeout
+cargo run --example executor_race
 cargo run --example custom_placement
 cargo run --example basic_counter
 cargo run --example os_reactor

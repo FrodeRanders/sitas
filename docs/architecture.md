@@ -46,6 +46,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - pending tasks can be aborted through their join handles, which drops their
   futures and lets timer/readiness cleanup run through normal future `Drop`
 - `yield_now` proves cooperative wakeups without third-party runtimes
+- `race` composes two futures and completes with the first result, dropping the
+  losing future through ordinary cancellation cleanup
 - on Unix, the executor sleeps on `OsReactor` when no tasks are ready
 - timer futures register task wakers in the scheduler and drive reactor timeouts
 - sleeping futures unregister their timers when dropped, which keeps cancelled
