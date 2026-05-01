@@ -119,7 +119,7 @@ impl PollFd {
     }
 }
 
-extern "C" {
+unsafe extern "C" {
     fn close(fd: c_int) -> c_int;
     fn connect(fd: c_int, address: *const c_void, length: SockLen) -> c_int;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
@@ -136,7 +136,7 @@ extern "C" {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-extern "C" {
+unsafe extern "C" {
     fn __error() -> *mut c_int;
 }
 
