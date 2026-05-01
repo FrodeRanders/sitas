@@ -279,11 +279,115 @@ impl Executor {
             self.scheduler.wake_expired_timers();
         }
     }
+
+    /// Runs `future` to completion while also driving spawned executor tasks.
+    pub fn run_until<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let root = Arc::new(RootWaker::new(Arc::clone(&self.scheduler)));
+        let waker = Waker::from(Arc::clone(&root));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+
+        loop {
+            if root.take_ready() {
+                CURRENT_SCHEDULER.with(|current| {
+                    *current.borrow_mut() = Some(Arc::clone(&self.scheduler));
+                });
+
+                let poll_result =
+                    panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut context)));
+
+                CURRENT_SCHEDULER.with(|current| {
+                    *current.borrow_mut() = None;
+                });
+
+                match poll_result {
+                    Ok(Poll::Ready(output)) => return output,
+                    Ok(Poll::Pending) => {}
+                    Err(payload) => panic::resume_unwind(payload),
+                }
+            }
+
+            while let Some(task) = self.scheduler.next_task() {
+                task.poll();
+            }
+
+            self.scheduler.wake_expired_timers();
+
+            if root.is_ready() {
+                continue;
+            }
+
+            #[cfg(unix)]
+            {
+                let event = self
+                    .reactor
+                    .wait_io(
+                        &self.scheduler.read_interest_fds(),
+                        &self.scheduler.write_interest_fds(),
+                        self.scheduler.time_until_next_timer(),
+                    )
+                    .expect("OS reactor wait failed while running root future");
+                self.scheduler.wake_readable_fds(&event.readable);
+                self.scheduler.wake_writable_fds(&event.writable);
+            }
+
+            self.scheduler.wake_expired_timers();
+        }
+    }
 }
 
 impl Drop for Executor {
     fn drop(&mut self) {
         self.scheduler.close();
+    }
+}
+
+struct RootWaker {
+    ready: Mutex<bool>,
+    scheduler: Arc<Scheduler>,
+}
+
+impl RootWaker {
+    fn new(scheduler: Arc<Scheduler>) -> Self {
+        Self {
+            ready: Mutex::new(true),
+            scheduler,
+        }
+    }
+
+    fn take_ready(&self) -> bool {
+        let mut ready = self.ready.lock().expect("root waker mutex poisoned");
+        let was_ready = *ready;
+        *ready = false;
+        was_ready
+    }
+
+    fn is_ready(&self) -> bool {
+        *self.ready.lock().expect("root waker mutex poisoned")
+    }
+
+    fn mark_ready(&self) {
+        *self.ready.lock().expect("root waker mutex poisoned") = true;
+        self.scheduler.wake_reactor();
+    }
+}
+
+impl fmt::Debug for RootWaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RootWaker").finish_non_exhaustive()
+    }
+}
+
+impl Wake for RootWaker {
+    fn wake(self: Arc<Self>) {
+        self.mark_ready();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.mark_ready();
     }
 }
 
@@ -857,38 +961,16 @@ pub fn executor_and_spawner() -> (Executor, Spawner) {
 
 /// Runs one future to completion on a fresh single-threaded executor.
 ///
-/// This is intentionally small and requires `Send + 'static` futures because it
-/// is implemented by spawning the root future into the executor.
+/// The root future is polled directly by the executor, so it may borrow from
+/// the caller's stack.
 pub fn block_on<F>(future: F) -> F::Output
 where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
+    F: Future,
 {
     let (executor, spawner) = executor_and_spawner();
-    let handle = spawner
-        .spawn_with_handle(future)
-        .expect("fresh executor should accept root future");
     drop(spawner);
 
-    executor.run();
-    take_join_handle_result(handle)
-}
-
-fn take_join_handle_result<T>(handle: JoinHandle<T>) -> T {
-    let mut state = handle
-        .shared
-        .lock()
-        .expect("join handle state mutex poisoned");
-
-    match state
-        .result
-        .take()
-        .expect("root future completed without producing a result")
-    {
-        Ok(output) => output,
-        Err(JoinError::Panic(payload)) => panic::resume_unwind(payload),
-        Err(JoinError::Cancelled) => panic!("root future was cancelled"),
-    }
+    executor.run_until(future)
 }
 
 /// Returns a future that completes after `duration`.
@@ -1484,6 +1566,14 @@ mod tests {
     }
 
     #[test]
+    fn block_on_accepts_stack_borrowing_future() {
+        let value = 42;
+        let borrowed = block_on(async { &value });
+
+        assert_eq!(*borrowed, 42);
+    }
+
+    #[test]
     fn block_on_preserves_root_future_panic() {
         let panic = std::panic::catch_unwind(|| {
             block_on(async {
@@ -1493,6 +1583,26 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(panic.downcast_ref::<&str>(), Some(&"root panic"));
+    }
+
+    #[test]
+    fn run_until_drives_spawned_tasks() {
+        let (executor, spawner) = executor_and_spawner();
+
+        let output = executor.run_until(async {
+            let worker = spawner
+                .spawn_with_handle(async {
+                    yield_now().await;
+                    7
+                })
+                .unwrap();
+
+            worker.await.unwrap()
+        });
+
+        drop(spawner);
+
+        assert_eq!(output, 7);
     }
 
     #[test]

@@ -16,6 +16,8 @@ standard library:
 - a minimal executor experiment with custom wakers, join handles, awaitable
   shard replies, cancellable spawned tasks, timers, timeouts, OS-backed
   sleeping, racing futures, and read/write-readiness futures on this branch
+- direct root-future driving without requiring the root future to be `Send` or
+  `'static`
 - small async connect, accept, read, write, and copy helpers layered on
   non-blocking Unix descriptors
 - timeout variants for the async Unix I/O helpers

@@ -40,7 +40,10 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - task panics are caught at the executor boundary so unrelated tasks can keep
   running
 - `block_on` and join handles preserve task panic payloads when observed
-- `block_on` drives one root future to completion
+- `block_on` drives one root future to completion without requiring that root
+  future to be `Send` or `'static`
+- `Executor::run_until` polls a root future directly while still driving
+  spawned executor tasks
 - join handles let tasks await typed outputs from spawned tasks and observe
   task panics as `JoinError`
 - pending tasks can be aborted through their join handles, which drops their
