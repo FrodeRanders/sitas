@@ -19,7 +19,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
@@ -541,6 +541,15 @@ impl Task {
         true
     }
 
+    fn drop_future(&self) {
+        let mut state = self.state.lock().expect("task state mutex poisoned");
+        state.cancel_requested = true;
+        if !state.polling {
+            state.future = None;
+            state.queued = false;
+        }
+    }
+
     fn clear_queued(&self) {
         self.state.lock().expect("task state mutex poisoned").queued = false;
     }
@@ -567,6 +576,7 @@ struct Scheduler {
 #[derive(Debug)]
 struct SchedulerState {
     queue: VecDeque<Arc<Task>>,
+    tasks: Vec<Weak<Task>>,
     timers: Vec<TimerEntry>,
     #[cfg(unix)]
     read_interests: InterestSet,
@@ -632,6 +642,11 @@ impl InterestSet {
         self.ready.retain(|ready_id| *ready_id != id);
     }
 
+    fn clear(&mut self) {
+        self.interests.clear();
+        self.ready.clear();
+    }
+
     fn fds(&self) -> Vec<RawFd> {
         self.interests.iter().map(|interest| interest.fd).collect()
     }
@@ -675,6 +690,7 @@ impl Scheduler {
         Self {
             state: Mutex::new(SchedulerState {
                 queue: VecDeque::new(),
+                tasks: Vec::new(),
                 timers: Vec::new(),
                 #[cfg(unix)]
                 read_interests: InterestSet::new(),
@@ -719,6 +735,7 @@ impl Scheduler {
                 return Err(SpawnError);
             }
             state.task_count += 1;
+            state.tasks.push(Arc::downgrade(&task));
             state.queue.push_back(task);
         }
 
@@ -767,9 +784,27 @@ impl Scheduler {
     }
 
     fn close(&self) {
-        {
+        let tasks = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
             state.accepting = false;
+            state.task_count = 0;
+            state.queue.clear();
+            state.timers.clear();
+            #[cfg(unix)]
+            {
+                state.read_interests.clear();
+                state.write_interests.clear();
+            }
+
+            state
+                .tasks
+                .drain(..)
+                .filter_map(|task| task.upgrade())
+                .collect::<Vec<_>>()
+        };
+
+        for task in tasks {
+            task.drop_future();
         }
 
         self.wake_reactor();
@@ -2643,6 +2678,59 @@ mod tests {
         drop(executor);
 
         assert!(spawner.spawn(async {}).is_err());
+    }
+
+    #[test]
+    fn dropping_executor_cancels_pending_sleep_task() {
+        let (executor, spawner) = executor_and_spawner();
+        let worker = spawner
+            .spawn_with_handle(async {
+                sleep(Duration::from_secs(60)).await;
+                7
+            })
+            .unwrap();
+
+        executor.poll_ready_tasks();
+        assert!(!executor
+            .scheduler
+            .state
+            .lock()
+            .expect("scheduler state mutex poisoned")
+            .timers
+            .is_empty());
+
+        drop(executor);
+
+        assert!(!worker.abort());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_executor_cancels_pending_readable_task() {
+        let (executor, spawner) = executor_and_spawner();
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let fd = reader.as_raw_fd();
+
+        let worker = spawner
+            .spawn_with_handle(async move {
+                readable(fd).await;
+                7
+            })
+            .unwrap();
+
+        executor.poll_ready_tasks();
+        assert!(!executor
+            .scheduler
+            .state
+            .lock()
+            .expect("scheduler state mutex poisoned")
+            .read_interests
+            .is_empty());
+
+        drop(executor);
+
+        assert!(!worker.abort());
     }
 
     struct WakeTwiceThenPending;

@@ -50,6 +50,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   task panics as `JoinError`
 - pending tasks can be aborted through their join handles, which drops their
   futures and lets timer/readiness cleanup run through normal future `Drop`
+- executor shutdown tracks spawned tasks, clears timer/readiness registrations,
+  and drops pending task futures
 - `yield_now` proves cooperative wakeups without third-party runtimes
 - `race` composes two futures and completes with the first result, dropping the
   losing future through ordinary cancellation cleanup

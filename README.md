@@ -20,6 +20,8 @@ standard library:
   `'static`
 - budgeted ready-queue polling so timers and I/O can progress under repeated
   task wakeups
+- executor shutdown cleanup for pending task futures and readiness/timer
+  registrations
 - small async connect, accept, read, write, and copy helpers layered on
   non-blocking Unix descriptors
 - timeout variants for the async Unix I/O helpers
