@@ -90,8 +90,12 @@ such as `epoll`, `kqueue`, or `io_uring`.
   thread to interleave multiple connection handlers
 - `serve_tcp_n` owns a listener, accepts a bounded number of connections,
   spawns one handler per stream, and awaits the handler join results
+- `serve_tcp_n_timeout` adds a bounded handler-join deadline after the fixed
+  accept count has been reached
 - `serve_tcp_until_idle` runs the same handler-spawning accept loop until the
   listener stays idle past a caller-provided timeout
+- `serve_tcp_until_idle_timeout` adds a bounded handler-join deadline after
+  the idle accept loop stops
 - `serve_tcp_until_stopped` races listener accepts against a stop token for
   explicit accept-loop shutdown
 - `serve_tcp_until_stopped_timeout` adds a bounded handler-join deadline for

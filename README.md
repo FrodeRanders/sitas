@@ -31,9 +31,10 @@ standard library:
 - a bounded async TCP server helper that spawns and joins one handler per
   accepted connection
 - an idle-timeout async TCP server helper for cancellable accept loops
+- bounded handler-join variants for fixed-count, idle-timeout, and stoppable
+  TCP server helpers
 - stop tokens and a stoppable async TCP server helper for explicit accept-loop
-  shutdown, including a bounded handler-join variant that aborts handlers when
-  shutdown exceeds a caller-provided deadline
+  shutdown
 - a scoped async TCP server helper that propagates shutdown into accepted
   connection handlers, stops accepting when a handler fails, and can bound
   handler shutdown time

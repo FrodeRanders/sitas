@@ -1711,6 +1711,38 @@ where
     Ok(())
 }
 
+/// Accepts `connection_count` TCP connections, then gives handler tasks up to
+/// `shutdown_timeout` to finish.
+///
+/// If the shutdown timeout elapses, still-running handler tasks are aborted and
+/// this future returns `io::ErrorKind::TimedOut`.
+#[cfg(unix)]
+pub async fn serve_tcp_n_timeout<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    connection_count: usize,
+    shutdown_timeout: Duration,
+    mut handler: H,
+) -> io::Result<()>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    let mut handlers = Vec::with_capacity(connection_count);
+
+    for _ in 0..connection_count {
+        let (stream, peer) = accept_async(&listener).await?;
+        handlers.push(
+            spawner
+                .spawn_with_handle(handler(stream, peer))
+                .map_err(spawn_error_to_io)?,
+        );
+    }
+
+    join_tcp_handlers_timeout(handlers, shutdown_timeout).await
+}
+
 /// Accepts TCP connections until `idle_timeout` elapses without a new
 /// connection, spawning one handler task for each accepted stream.
 ///
@@ -1747,6 +1779,46 @@ where
 
     let accepted = handlers.len();
     join_tcp_handlers(handlers).await?;
+
+    Ok(accepted)
+}
+
+/// Accepts TCP connections until `idle_timeout` elapses without a new
+/// connection, then gives handler tasks up to `shutdown_timeout` to finish.
+///
+/// If the shutdown timeout elapses, still-running handler tasks are aborted and
+/// this future returns `io::ErrorKind::TimedOut`.
+#[cfg(unix)]
+pub async fn serve_tcp_until_idle_timeout<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    idle_timeout: Duration,
+    shutdown_timeout: Duration,
+    mut handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    let mut handlers = Vec::new();
+
+    loop {
+        match accept_timeout_async(&listener, idle_timeout).await {
+            Ok((stream, peer)) => {
+                handlers.push(
+                    spawner
+                        .spawn_with_handle(handler(stream, peer))
+                        .map_err(spawn_error_to_io)?,
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
+            Err(error) => return Err(error),
+        }
+    }
+
+    let accepted = handlers.len();
+    join_tcp_handlers_timeout(handlers, shutdown_timeout).await?;
 
     Ok(accepted)
 }
@@ -2351,7 +2423,8 @@ mod tests {
     use super::{
         accept_async, accept_timeout_async, connect_async, connect_timeout_async, copy_async,
         copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, serve_tcp_n,
-        serve_tcp_until_idle, serve_tcp_until_stopped, serve_tcp_until_stopped_scoped,
+        serve_tcp_n_timeout, serve_tcp_until_idle, serve_tcp_until_idle_timeout,
+        serve_tcp_until_stopped, serve_tcp_until_stopped_scoped,
         serve_tcp_until_stopped_scoped_timeout, serve_tcp_until_stopped_timeout, writable,
         write_all_async, write_all_timeout_async,
     };
@@ -3698,6 +3771,48 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn serve_tcp_n_timeout_aborts_uncooperative_handler() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap_err().kind()
+        });
+
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                let error = serve_tcp_n_timeout(
+                    listener,
+                    server_spawner,
+                    1,
+                    Duration::from_millis(5),
+                    |_stream, _peer| async move {
+                        sleep(Duration::from_secs(1)).await;
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap_err();
+                *output_for_task.lock().unwrap() = Some(error.kind());
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(client.join().unwrap(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::TimedOut));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn serve_tcp_until_idle_stops_after_idle_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3786,6 +3901,48 @@ mod tests {
         client.join().unwrap();
 
         assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::Other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_until_idle_timeout_aborts_uncooperative_handler() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap_err().kind()
+        });
+
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                let error = serve_tcp_until_idle_timeout(
+                    listener,
+                    server_spawner,
+                    Duration::from_millis(5),
+                    Duration::from_millis(5),
+                    |_stream, _peer| async move {
+                        sleep(Duration::from_secs(1)).await;
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap_err();
+                *output_for_task.lock().unwrap() = Some(error.kind());
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(client.join().unwrap(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::TimedOut));
     }
 
     #[cfg(unix)]
