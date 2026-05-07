@@ -131,7 +131,7 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "linux")]
-extern "C" {
+unsafe extern "C" {
     fn __errno_location() -> *mut c_int;
 }
 

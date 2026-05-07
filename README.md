@@ -20,6 +20,8 @@ standard library:
   `'static`
 - budgeted ready-queue polling so timers and I/O can progress under repeated
   task wakeups
+- task scopes that group child tasks under one cooperative stop signal and
+  abort still-owned children when dropped
 - executor shutdown cleanup for pending task futures and readiness/timer
   registrations
 - small async connect, accept, read, write, and copy helpers layered on
@@ -238,6 +240,12 @@ Run the executor race example:
 cargo run --example executor_race
 ```
 
+Run the executor task scope example:
+
+```sh
+cargo run --example executor_task_scope
+```
+
 Run the custom placement example:
 
 ```sh
@@ -291,6 +299,7 @@ cargo run --example executor_sleep
 cargo run --example executor_abort
 cargo run --example executor_timeout
 cargo run --example executor_race
+cargo run --example executor_task_scope
 cargo run --example custom_placement
 cargo run --example basic_counter
 cargo run --example os_reactor

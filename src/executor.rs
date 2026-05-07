@@ -352,6 +352,102 @@ fn complete_join<T>(shared: &Arc<Mutex<JoinState<T>>>, result: JoinResult<T>) {
     }
 }
 
+/// Owns a group of spawned tasks and a shared cooperative stop signal.
+///
+/// Dropping a scope requests stop and aborts any children that are still owned
+/// by the scope. Use [`TaskScope::shutdown`] when children should observe the
+/// stop token and finish cooperatively.
+#[must_use = "task scopes abort their children when dropped"]
+pub struct TaskScope {
+    spawner: Spawner,
+    stop_source: StopSource,
+    stop_token: StopToken,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl TaskScope {
+    /// Creates a new scope that spawns tasks on `spawner`.
+    pub fn new(spawner: Spawner) -> Self {
+        let (stop_source, stop_token) = stop_pair();
+
+        Self {
+            spawner,
+            stop_source,
+            stop_token,
+            handles: Vec::new(),
+        }
+    }
+
+    /// Returns a clone of the scope's stop token.
+    pub fn stop_token(&self) -> StopToken {
+        self.stop_token.clone()
+    }
+
+    /// Returns true if this scope has already been asked to stop.
+    pub fn is_stopped(&self) -> bool {
+        self.stop_source.is_stopped()
+    }
+
+    /// Requests cooperative stop for tasks in this scope.
+    pub fn stop(&self) -> bool {
+        self.stop_source.stop()
+    }
+
+    /// Spawns a child task owned by this scope.
+    pub fn spawn<F>(&mut self, future: F) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.handles.push(self.spawner.spawn_with_handle(future)?);
+        Ok(())
+    }
+
+    /// Spawns a child task that receives this scope's stop token.
+    pub fn spawn_with_stop<F, Fut>(&mut self, make_future: F) -> Result<(), SpawnError>
+    where
+        F: FnOnce(StopToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn(make_future(self.stop_token()))
+    }
+
+    /// Aborts all child tasks still owned by this scope.
+    pub fn abort_all(&self) -> usize {
+        self.handles.iter().filter(|handle| handle.abort()).count()
+    }
+
+    /// Waits for all child tasks to finish.
+    pub async fn wait(mut self) -> Result<(), JoinError> {
+        for handle in self.handles.drain(..) {
+            handle.await?;
+        }
+
+        Ok(())
+    }
+
+    /// Requests cooperative stop and waits for all child tasks to finish.
+    pub async fn shutdown(self) -> Result<(), JoinError> {
+        self.stop();
+        self.wait().await
+    }
+}
+
+impl fmt::Debug for TaskScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskScope")
+            .field("stopped", &self.is_stopped())
+            .field("children", &self.handles.len())
+            .finish()
+    }
+}
+
+impl Drop for TaskScope {
+    fn drop(&mut self) {
+        self.stop();
+        self.abort_all();
+    }
+}
+
 /// Single-threaded executor that polls tasks from a ready queue.
 #[derive(Debug)]
 pub struct Executor {
@@ -956,7 +1052,7 @@ impl Scheduler {
                 }),
             }
 
-            previous_next.map_or(true, |previous| deadline < previous)
+            previous_next.is_none_or(|previous| deadline < previous)
         };
 
         if should_wake {
@@ -1787,20 +1883,20 @@ where
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        if let Some(first) = this.first.as_mut() {
-            if let Poll::Ready(output) = first.as_mut().poll(context) {
-                this.second.take();
-                this.first.take();
-                return Poll::Ready(RaceOutput::First(output));
-            }
+        if let Some(first) = this.first.as_mut()
+            && let Poll::Ready(output) = first.as_mut().poll(context)
+        {
+            this.second.take();
+            this.first.take();
+            return Poll::Ready(RaceOutput::First(output));
         }
 
-        if let Some(second) = this.second.as_mut() {
-            if let Poll::Ready(output) = second.as_mut().poll(context) {
-                this.first.take();
-                this.second.take();
-                return Poll::Ready(RaceOutput::Second(output));
-            }
+        if let Some(second) = this.second.as_mut()
+            && let Poll::Ready(output) = second.as_mut().poll(context)
+        {
+            this.first.take();
+            this.second.take();
+            return Poll::Ready(RaceOutput::Second(output));
         }
 
         Poll::Pending
@@ -1836,8 +1932,8 @@ impl Future for YieldNow {
 #[cfg(test)]
 mod tests {
     use super::{
-        RaceOutput, TimeoutError, block_on, executor_and_spawner, race, sleep, stop_pair, timeout,
-        yield_now,
+        RaceOutput, TaskScope, TimeoutError, block_on, executor_and_spawner, race, sleep,
+        stop_pair, timeout, yield_now,
     };
     #[cfg(unix)]
     use super::{
@@ -1912,6 +2008,82 @@ mod tests {
         });
 
         drop(spawner);
+    }
+
+    #[test]
+    fn task_scope_waits_for_children() {
+        let (executor, spawner) = executor_and_spawner();
+        let mut scope = TaskScope::new(spawner.clone());
+        let values = Arc::new(Mutex::new(Vec::new()));
+
+        for value in [1, 2] {
+            let values = Arc::clone(&values);
+            scope
+                .spawn(async move {
+                    yield_now().await;
+                    values.lock().unwrap().push(value);
+                })
+                .unwrap();
+        }
+
+        executor.run_until(async move {
+            scope.wait().await.unwrap();
+        });
+
+        drop(spawner);
+
+        let mut values = values.lock().unwrap().clone();
+        values.sort();
+        assert_eq!(values, [1, 2]);
+    }
+
+    #[test]
+    fn task_scope_shutdown_wakes_stop_token_children() {
+        let (executor, spawner) = executor_and_spawner();
+        let mut scope = TaskScope::new(spawner.clone());
+        let stopped = Arc::new(Mutex::new(false));
+        let stopped_for_task = Arc::clone(&stopped);
+
+        scope
+            .spawn_with_stop(move |stop| async move {
+                stop.await;
+                *stopped_for_task.lock().unwrap() = true;
+            })
+            .unwrap();
+
+        executor.run_until(async move {
+            yield_now().await;
+            scope.shutdown().await.unwrap();
+        });
+
+        drop(spawner);
+
+        assert!(*stopped.lock().unwrap());
+    }
+
+    #[test]
+    fn dropping_task_scope_aborts_children() {
+        let (executor, spawner) = executor_and_spawner();
+        let mut scope = TaskScope::new(spawner.clone());
+        let completed = Arc::new(Mutex::new(false));
+        let completed_for_task = Arc::clone(&completed);
+
+        scope
+            .spawn(async move {
+                sleep(Duration::from_secs(1)).await;
+                *completed_for_task.lock().unwrap() = true;
+            })
+            .unwrap();
+
+        drop(scope);
+
+        executor.run_until(async {
+            yield_now().await;
+        });
+
+        drop(spawner);
+
+        assert!(!*completed.lock().unwrap());
     }
 
     #[test]
@@ -3000,7 +3172,7 @@ mod tests {
         spawner
             .spawn(async move {
                 let error = serve_tcp_n(listener, server_spawner, 1, |_stream, _peer| async {
-                    Err(io::Error::new(io::ErrorKind::Other, "handler failed"))
+                    Err(io::Error::other("handler failed"))
                 })
                 .await
                 .unwrap_err();
@@ -3092,9 +3264,7 @@ mod tests {
                     listener,
                     server_spawner,
                     Duration::from_millis(5),
-                    |_stream, _peer| async {
-                        Err(io::Error::new(io::ErrorKind::Other, "handler failed"))
-                    },
+                    |_stream, _peer| async { Err(io::Error::other("handler failed")) },
                 )
                 .await
                 .unwrap_err();
@@ -3202,9 +3372,7 @@ mod tests {
                     listener,
                     server_spawner,
                     stop_token,
-                    |_stream, _peer| async {
-                        Err(io::Error::new(io::ErrorKind::Other, "handler failed"))
-                    },
+                    |_stream, _peer| async { Err(io::Error::other("handler failed")) },
                 )
                 .await
                 .unwrap_err();

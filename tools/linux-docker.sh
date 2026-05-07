@@ -33,6 +33,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example executor_abort
         cargo run --example executor_timeout
         cargo run --example executor_race
+        cargo run --example executor_task_scope
         cargo run --example custom_placement
         cargo run --example basic_counter
         cargo run --example os_reactor
