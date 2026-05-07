@@ -296,6 +296,59 @@ impl fmt::Display for JoinError {
 
 impl Error for JoinError {}
 
+/// Error returned when a task scope cannot shut down cleanly.
+pub enum TaskScopeError {
+    /// A child task failed while the scope was waiting for shutdown.
+    Join(JoinError),
+    /// The shutdown deadline elapsed before all child tasks completed.
+    TimedOut,
+}
+
+impl TaskScopeError {
+    /// Returns true if shutdown timed out.
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, TaskScopeError::TimedOut)
+    }
+
+    /// Returns true if a child task failed while shutting down.
+    pub fn is_join_error(&self) -> bool {
+        matches!(self, TaskScopeError::Join(_))
+    }
+}
+
+impl From<JoinError> for TaskScopeError {
+    fn from(error: JoinError) -> Self {
+        TaskScopeError::Join(error)
+    }
+}
+
+impl fmt::Debug for TaskScopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskScopeError::Join(error) => f.debug_tuple("Join").field(error).finish(),
+            TaskScopeError::TimedOut => f.write_str("TimedOut"),
+        }
+    }
+}
+
+impl fmt::Display for TaskScopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskScopeError::Join(error) => write!(f, "task scope child failed: {error}"),
+            TaskScopeError::TimedOut => write!(f, "task scope shutdown timed out"),
+        }
+    }
+}
+
+impl Error for TaskScopeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            TaskScopeError::Join(error) => Some(error),
+            TaskScopeError::TimedOut => None,
+        }
+    }
+}
+
 impl<T> fmt::Debug for JoinHandle<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JoinHandle").finish_non_exhaustive()
@@ -429,6 +482,34 @@ impl TaskScope {
     pub async fn shutdown(self) -> Result<(), JoinError> {
         self.stop();
         self.wait().await
+    }
+
+    /// Requests cooperative stop and waits up to `duration` for children to
+    /// finish before aborting the still-owned tasks.
+    pub async fn shutdown_timeout(mut self, duration: Duration) -> Result<(), TaskScopeError> {
+        self.stop();
+        let deadline = Instant::now() + duration;
+
+        while let Some(mut handle) = self.handles.pop() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                handle.abort();
+                self.abort_all();
+                return Err(TaskScopeError::TimedOut);
+            }
+
+            match timeout(remaining, &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(TaskScopeError::Join(error)),
+                Err(TimeoutError) => {
+                    handle.abort();
+                    self.abort_all();
+                    return Err(TaskScopeError::TimedOut);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -2002,8 +2083,8 @@ impl Future for YieldNow {
 #[cfg(test)]
 mod tests {
     use super::{
-        RaceOutput, TaskScope, TimeoutError, block_on, executor_and_spawner, race, sleep,
-        stop_pair, timeout, yield_now,
+        RaceOutput, TaskScope, TaskScopeError, TimeoutError, block_on, executor_and_spawner, race,
+        sleep, stop_pair, timeout, yield_now,
     };
     #[cfg(unix)]
     use super::{
@@ -2129,6 +2210,56 @@ mod tests {
         drop(spawner);
 
         assert!(*stopped.lock().unwrap());
+    }
+
+    #[test]
+    fn task_scope_shutdown_timeout_waits_for_cooperative_children() {
+        let (executor, spawner) = executor_and_spawner();
+        let mut scope = TaskScope::new(spawner.clone());
+        let stopped = Arc::new(Mutex::new(false));
+        let stopped_for_task = Arc::clone(&stopped);
+
+        scope
+            .spawn_with_stop(move |stop| async move {
+                stop.await;
+                *stopped_for_task.lock().unwrap() = true;
+            })
+            .unwrap();
+
+        let result =
+            executor.run_until(async move { scope.shutdown_timeout(Duration::from_secs(1)).await });
+
+        drop(spawner);
+
+        assert!(result.is_ok());
+        assert!(*stopped.lock().unwrap());
+    }
+
+    #[test]
+    fn task_scope_shutdown_timeout_aborts_uncooperative_children() {
+        let (executor, spawner) = executor_and_spawner();
+        let mut scope = TaskScope::new(spawner.clone());
+        let completed = Arc::new(Mutex::new(false));
+        let completed_for_task = Arc::clone(&completed);
+
+        scope
+            .spawn(async move {
+                sleep(Duration::from_secs(1)).await;
+                *completed_for_task.lock().unwrap() = true;
+            })
+            .unwrap();
+
+        let result = executor
+            .run_until(async move { scope.shutdown_timeout(Duration::from_millis(5)).await });
+
+        executor.run_until(async {
+            yield_now().await;
+        });
+
+        drop(spawner);
+
+        assert!(matches!(result, Err(TaskScopeError::TimedOut)));
+        assert!(!*completed.lock().unwrap());
     }
 
     #[test]

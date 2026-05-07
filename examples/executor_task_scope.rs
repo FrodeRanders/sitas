@@ -20,7 +20,10 @@ fn main() {
     let events = Arc::clone(&events);
     executor.run_until(async move {
         sleep(Duration::from_millis(10)).await;
-        scope.shutdown().await.unwrap();
+        scope
+            .shutdown_timeout(Duration::from_secs(1))
+            .await
+            .unwrap();
 
         let mut events = events.lock().unwrap().clone();
         events.sort();

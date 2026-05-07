@@ -52,7 +52,7 @@ such as `epoll`, `kqueue`, or `io_uring`.
   futures and lets timer/readiness cleanup run through normal future `Drop`
 - `TaskScope` groups child tasks under one stop token, supports cooperative
   shutdown by requesting stop and joining children, and aborts still-owned
-  children when the scope is dropped
+  children when the scope is dropped or when bounded shutdown times out
 - executor shutdown tracks spawned tasks, clears timer/readiness registrations,
   and drops pending task futures
 - `yield_now` proves cooperative wakeups without third-party runtimes
