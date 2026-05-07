@@ -503,7 +503,7 @@ fn run_counter_shard(receiver: mpsc::Receiver<CounterCommand>) {
 mod tests {
     use super::{CounterCommand, CounterService, ShardedCounter, ShardedCounterConfig};
     use crate::runtime::reply_channel;
-    use crate::{ShardError, ShardId, DEFAULT_MAILBOX_CAPACITY};
+    use crate::{DEFAULT_MAILBOX_CAPACITY, ShardError, ShardId};
     use std::time::Duration;
 
     #[test]

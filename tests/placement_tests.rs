@@ -1,4 +1,4 @@
-use sitas::placement::{shard_for_hash, HashPlacement, Placement};
+use sitas::placement::{HashPlacement, Placement, shard_for_hash};
 use sitas::{ShardId, ShardedKv};
 
 #[test]

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use sitas::executor::{block_on, race, sleep, RaceOutput};
+use sitas::executor::{RaceOutput, block_on, race, sleep};
 
 fn main() {
     let winner = block_on(async {

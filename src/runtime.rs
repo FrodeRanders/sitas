@@ -481,9 +481,9 @@ fn map_try_send_error<C>(error: mpsc::TrySendError<C>) -> ShardError {
 
 #[cfg(test)]
 mod tests {
-    use super::{reply_channel, ShardConfig, DEFAULT_MAILBOX_CAPACITY};
-    use crate::executor::block_on;
+    use super::{DEFAULT_MAILBOX_CAPACITY, ShardConfig, reply_channel};
     use crate::ShardError;
+    use crate::executor::block_on;
     use std::thread;
     use std::time::Duration;
 

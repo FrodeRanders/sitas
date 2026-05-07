@@ -570,7 +570,7 @@ fn errno() -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_pipe, OsReactor};
+    use super::{OsReactor, create_pipe};
     use std::os::raw::c_void;
     use std::os::unix::io::RawFd;
     use std::thread;

@@ -1264,7 +1264,7 @@ fn run_kv_shard(receiver: mpsc::Receiver<KvCommand>) {
 mod tests {
     use super::{KvCommand, KvService, ShardedKv, ShardedKvConfig};
     use crate::runtime::reply_channel;
-    use crate::{ShardError, ShardId, DEFAULT_MAILBOX_CAPACITY};
+    use crate::{DEFAULT_MAILBOX_CAPACITY, ShardError, ShardId};
     use std::time::Duration;
 
     #[test]

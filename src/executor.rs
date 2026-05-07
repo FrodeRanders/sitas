@@ -25,7 +25,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use crate::os::{tcp_connect_start, OsReactor, OsWaker};
+use crate::os::{OsReactor, OsWaker, tcp_connect_start};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
@@ -1835,16 +1835,16 @@ impl Future for YieldNow {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        RaceOutput, TimeoutError, block_on, executor_and_spawner, race, sleep, stop_pair, timeout,
+        yield_now,
+    };
     #[cfg(unix)]
     use super::{
         accept_async, accept_timeout_async, connect_async, connect_timeout_async, copy_async,
         copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, serve_tcp_n,
         serve_tcp_until_idle, serve_tcp_until_stopped, writable, write_all_async,
         write_all_timeout_async,
-    };
-    use super::{
-        block_on, executor_and_spawner, race, sleep, stop_pair, timeout, yield_now, RaceOutput,
-        TimeoutError,
     };
     #[cfg(unix)]
     use std::io::{self, Read, Write};
@@ -2018,13 +2018,15 @@ mod tests {
         executor.run();
 
         assert_eq!(*output.lock().unwrap(), Some(Err(TimeoutError)));
-        assert!(executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .timers
-            .is_empty());
+        assert!(
+            executor
+                .scheduler
+                .state
+                .lock()
+                .expect("scheduler state mutex poisoned")
+                .timers
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2092,13 +2094,15 @@ mod tests {
         executor.run();
 
         assert_eq!(*output.lock().unwrap(), Some(RaceOutput::First("fast")));
-        assert!(executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .timers
-            .is_empty());
+        assert!(
+            executor
+                .scheduler
+                .state
+                .lock()
+                .expect("scheduler state mutex poisoned")
+                .timers
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2304,13 +2308,15 @@ mod tests {
         executor.run();
 
         assert_eq!(*result.lock().unwrap(), Some((true, true)));
-        assert!(executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .timers
-            .is_empty());
+        assert!(
+            executor
+                .scheduler
+                .state
+                .lock()
+                .expect("scheduler state mutex poisoned")
+                .timers
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2529,13 +2535,15 @@ mod tests {
         executor.run();
 
         assert_eq!(*output.lock().unwrap(), Some(std::io::ErrorKind::TimedOut));
-        assert!(executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .read_interests
-            .is_empty());
+        assert!(
+            executor
+                .scheduler
+                .state
+                .lock()
+                .expect("scheduler state mutex poisoned")
+                .read_interests
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -2697,13 +2705,15 @@ mod tests {
         executor.run();
 
         assert_eq!(*output.lock().unwrap(), Some(std::io::ErrorKind::TimedOut));
-        assert!(executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .read_interests
-            .is_empty());
+        assert!(
+            executor
+                .scheduler
+                .state
+                .lock()
+                .expect("scheduler state mutex poisoned")
+                .read_interests
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -3254,13 +3264,15 @@ mod tests {
             .unwrap();
 
         executor.poll_ready_tasks();
-        assert!(!executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .timers
-            .is_empty());
+        assert!(
+            !executor
+                .scheduler
+                .state
+                .lock()
+                .expect("scheduler state mutex poisoned")
+                .timers
+                .is_empty()
+        );
 
         drop(executor);
 
@@ -3283,13 +3295,15 @@ mod tests {
             .unwrap();
 
         executor.poll_ready_tasks();
-        assert!(!executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .read_interests
-            .is_empty());
+        assert!(
+            !executor
+                .scheduler
+                .state
+                .lock()
+                .expect("scheduler state mutex poisoned")
+                .read_interests
+                .is_empty()
+        );
 
         drop(executor);
 

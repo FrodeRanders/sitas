@@ -1,6 +1,6 @@
 use sitas::{
-    executor::block_on, CounterShardSnapshot, RuntimeSnapshot, ShardError, ShardId, ShardedCounter,
-    ShardedCounterConfig, DEFAULT_MAILBOX_CAPACITY,
+    CounterShardSnapshot, DEFAULT_MAILBOX_CAPACITY, RuntimeSnapshot, ShardError, ShardId,
+    ShardedCounter, ShardedCounterConfig, executor::block_on,
 };
 
 #[test]

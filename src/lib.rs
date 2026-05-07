@@ -54,5 +54,5 @@ pub use kv::{
     KvAllKeysReply, KvDeleteManyReply, KvGetManyReply, KvReply, KvShardSnapshotsReply,
     KvTotalLenReply, ShardedKv, ShardedKvConfig,
 };
-pub use runtime::{ReplyFuture, RuntimeSnapshot, DEFAULT_MAILBOX_CAPACITY};
+pub use runtime::{DEFAULT_MAILBOX_CAPACITY, ReplyFuture, RuntimeSnapshot};
 pub use shard::{ShardId, ShardSnapshot};

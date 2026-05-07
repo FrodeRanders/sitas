@@ -313,13 +313,15 @@ fn compare_and_put_replaces_only_when_expected_value_matches() {
 
     kv.put("alpha", "one").unwrap();
 
-    assert!(!kv
-        .compare_and_put("alpha", Some("wrong".to_string()), "two")
-        .unwrap());
+    assert!(
+        !kv.compare_and_put("alpha", Some("wrong".to_string()), "two")
+            .unwrap()
+    );
     assert_eq!(kv.get("alpha").unwrap(), Some("one".to_string()));
-    assert!(kv
-        .compare_and_put("alpha", Some("one".to_string()), "two")
-        .unwrap());
+    assert!(
+        kv.compare_and_put("alpha", Some("one".to_string()), "two")
+            .unwrap()
+    );
     assert_eq!(kv.get("alpha").unwrap(), Some("two".to_string()));
 
     kv.stop().unwrap();

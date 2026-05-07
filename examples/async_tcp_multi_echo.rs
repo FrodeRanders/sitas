@@ -1,5 +1,5 @@
 use sitas::executor::{
-    accept_async, executor_and_spawner, read_exact_async, write_all_async, Spawner,
+    Spawner, accept_async, executor_and_spawner, read_exact_async, write_all_async,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
