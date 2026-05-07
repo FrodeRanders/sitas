@@ -32,7 +32,7 @@ standard library:
 - stop tokens and a stoppable async TCP server helper for explicit accept-loop
   shutdown
 - a scoped async TCP server helper that propagates shutdown into accepted
-  connection handlers
+  connection handlers and stops accepting when a handler fails
 - timeout variants for the async Unix I/O helpers
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
   and descriptor readiness

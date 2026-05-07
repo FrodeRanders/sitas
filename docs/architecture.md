@@ -93,7 +93,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   explicit accept-loop shutdown
 - `serve_tcp_until_stopped_scoped` uses a task scope for accepted connection
   handlers, passing each handler a stop token so shutdown propagates beyond the
-  listener accept loop
+  listener accept loop; the first handler error wakes and stops the accept loop,
+  triggers scoped handler shutdown, and is returned to the caller
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than

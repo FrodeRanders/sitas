@@ -1619,12 +1619,19 @@ where
     listener.set_nonblocking(true)?;
     let mut handlers = TaskScope::new(spawner);
     let handler_error = Arc::new(Mutex::new(None));
+    let (handler_error_source, handler_error_token) = stop_pair();
     let mut accepted = 0usize;
 
     loop {
-        match race(accept_async(&listener), stop.clone()).await {
+        match race(
+            accept_async(&listener),
+            race(stop.clone(), handler_error_token.clone()),
+        )
+        .await
+        {
             RaceOutput::First(Ok((stream, peer))) => {
                 let handler_error = Arc::clone(&handler_error);
+                let handler_error_source = handler_error_source.clone();
                 handlers
                     .spawn({
                         let future = handler(stream, peer, handlers.stop_token());
@@ -1636,6 +1643,7 @@ where
                                 if stored.is_none() {
                                     *stored = Some(error);
                                 }
+                                handler_error_source.stop();
                             }
                         }
                     })
@@ -1643,7 +1651,7 @@ where
                 accepted += 1;
             }
             RaceOutput::First(Err(error)) => return Err(error),
-            RaceOutput::Second(()) => break,
+            RaceOutput::Second(_) => break,
         }
     }
 
@@ -3509,18 +3517,11 @@ mod tests {
             TcpStream::connect(address).unwrap();
         });
 
-        let (stop_source, stop_token) = stop_pair();
+        let (_stop_source, stop_token) = stop_pair();
         let (executor, spawner) = executor_and_spawner();
         let server_spawner = spawner.clone();
         let output = Arc::new(Mutex::new(None));
         let output_for_task = Arc::clone(&output);
-
-        spawner
-            .spawn(async move {
-                sleep(Duration::from_millis(5)).await;
-                stop_source.stop();
-            })
-            .unwrap();
 
         spawner
             .spawn(async move {
