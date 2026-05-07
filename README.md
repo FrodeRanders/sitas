@@ -181,10 +181,22 @@ Run the bounded async TCP server helper example:
 cargo run --example async_tcp_server
 ```
 
+Run the bounded-shutdown fixed-count TCP server helper example:
+
+```sh
+cargo run --example async_tcp_server_timeout
+```
+
 Run the idle-timeout async TCP server helper example:
 
 ```sh
 cargo run --example async_tcp_idle_server
+```
+
+Run the bounded-shutdown idle-timeout TCP server helper example:
+
+```sh
+cargo run --example async_tcp_idle_server_timeout
 ```
 
 Run the stoppable async TCP server helper example:
@@ -301,7 +313,9 @@ cargo run --example async_connect
 cargo run --example async_tcp_echo
 cargo run --example async_tcp_pair
 cargo run --example async_tcp_server
+cargo run --example async_tcp_server_timeout
 cargo run --example async_tcp_idle_server
+cargo run --example async_tcp_idle_server_timeout
 cargo run --example async_tcp_stoppable_server
 cargo run --example async_tcp_scoped_server
 cargo run --example async_tcp_timeout
