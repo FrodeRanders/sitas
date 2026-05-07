@@ -91,6 +91,9 @@ such as `epoll`, `kqueue`, or `io_uring`.
   listener stays idle past a caller-provided timeout
 - `serve_tcp_until_stopped` races listener accepts against a stop token for
   explicit accept-loop shutdown
+- `serve_tcp_until_stopped_timeout` adds a bounded handler-join deadline for
+  the non-scoped stoppable server path, aborting uncooperative handlers if the
+  deadline elapses after the accept loop stops
 - `serve_tcp_until_stopped_scoped` uses a task scope for accepted connection
   handlers, passing each handler a stop token so shutdown propagates beyond the
   listener accept loop; the first handler error wakes and stops the accept loop,

@@ -1,5 +1,5 @@
 use sitas::executor::{
-    executor_and_spawner, read_exact_async, serve_tcp_until_stopped, sleep, stop_pair,
+    executor_and_spawner, read_exact_async, serve_tcp_until_stopped_timeout, sleep, stop_pair,
     write_all_async,
 };
 use std::io::{Read, Write};
@@ -39,10 +39,11 @@ fn main() -> std::io::Result<()> {
         .unwrap();
 
     let accepted = executor.run_until(async move {
-        serve_tcp_until_stopped(
+        serve_tcp_until_stopped_timeout(
             listener,
             server_spawner,
             stop_token,
+            Duration::from_secs(1),
             |mut stream, _peer| async move {
                 let mut byte = [0u8; 1];
                 read_exact_async(&mut stream, &mut byte).await?;
