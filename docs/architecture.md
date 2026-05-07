@@ -95,6 +95,8 @@ such as `epoll`, `kqueue`, or `io_uring`.
   handlers, passing each handler a stop token so shutdown propagates beyond the
   listener accept loop; the first handler error wakes and stops the accept loop,
   triggers scoped handler shutdown, and is returned to the caller
+- `serve_tcp_until_stopped_scoped_timeout` adds a bounded handler shutdown
+  deadline and aborts uncooperative handlers if the deadline elapses
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than

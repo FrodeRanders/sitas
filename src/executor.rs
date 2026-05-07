@@ -1749,6 +1749,80 @@ where
     Ok(accepted)
 }
 
+/// Accepts TCP connections until `stop` completes, then gives handler tasks up
+/// to `shutdown_timeout` to finish after receiving their shared stop token.
+///
+/// If the shutdown timeout elapses, still-running handler tasks are aborted and
+/// this future returns `io::ErrorKind::TimedOut`.
+#[cfg(unix)]
+pub async fn serve_tcp_until_stopped_scoped_timeout<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    stop: StopToken,
+    shutdown_timeout: Duration,
+    mut handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr, StopToken) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    let mut handlers = TaskScope::new(spawner);
+    let handler_error = Arc::new(Mutex::new(None));
+    let (handler_error_source, handler_error_token) = stop_pair();
+    let mut accepted = 0usize;
+
+    loop {
+        match race(
+            accept_async(&listener),
+            race(stop.clone(), handler_error_token.clone()),
+        )
+        .await
+        {
+            RaceOutput::First(Ok((stream, peer))) => {
+                let handler_error = Arc::clone(&handler_error);
+                let handler_error_source = handler_error_source.clone();
+                handlers
+                    .spawn({
+                        let future = handler(stream, peer, handlers.stop_token());
+                        async move {
+                            if let Err(error) = future.await {
+                                let mut stored = handler_error
+                                    .lock()
+                                    .expect("TCP handler error mutex poisoned");
+                                if stored.is_none() {
+                                    *stored = Some(error);
+                                }
+                                handler_error_source.stop();
+                            }
+                        }
+                    })
+                    .map_err(spawn_error_to_io)?;
+                accepted += 1;
+            }
+            RaceOutput::First(Err(error)) => return Err(error),
+            RaceOutput::Second(_) => break,
+        }
+    }
+
+    let shutdown_result = handlers
+        .shutdown_timeout(shutdown_timeout)
+        .await
+        .map_err(task_scope_error_to_io);
+
+    if let Some(error) = handler_error
+        .lock()
+        .expect("TCP handler error mutex poisoned")
+        .take()
+    {
+        return Err(error);
+    }
+
+    shutdown_result?;
+
+    Ok(accepted)
+}
+
 #[cfg(unix)]
 async fn join_tcp_handlers(handlers: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
     for handler in handlers {
@@ -1805,6 +1879,14 @@ fn spawn_error_to_io(error: SpawnError) -> io::Error {
 #[cfg(unix)]
 fn join_error_to_io(error: JoinError) -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
+}
+
+#[cfg(unix)]
+fn task_scope_error_to_io(error: TaskScopeError) -> io::Error {
+    match error {
+        TaskScopeError::Join(error) => join_error_to_io(error),
+        TaskScopeError::TimedOut => io::Error::new(io::ErrorKind::TimedOut, error.to_string()),
+    }
 }
 
 /// Future returned by [`readable`].
@@ -2090,8 +2172,8 @@ mod tests {
     use super::{
         accept_async, accept_timeout_async, connect_async, connect_timeout_async, copy_async,
         copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, serve_tcp_n,
-        serve_tcp_until_idle, serve_tcp_until_stopped, serve_tcp_until_stopped_scoped, writable,
-        write_all_async, write_all_timeout_async,
+        serve_tcp_until_idle, serve_tcp_until_stopped, serve_tcp_until_stopped_scoped,
+        serve_tcp_until_stopped_scoped_timeout, writable, write_all_async, write_all_timeout_async,
     };
     #[cfg(unix)]
     use std::io::{self, Read, Write};
@@ -3675,6 +3757,56 @@ mod tests {
         client.join().unwrap();
 
         assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::Other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_until_stopped_scoped_timeout_aborts_uncooperative_handler() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap_err().kind()
+        });
+
+        let (stop_source, stop_token) = stop_pair();
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                sleep(Duration::from_millis(5)).await;
+                stop_source.stop();
+            })
+            .unwrap();
+
+        spawner
+            .spawn(async move {
+                let error = serve_tcp_until_stopped_scoped_timeout(
+                    listener,
+                    server_spawner,
+                    stop_token,
+                    Duration::from_millis(5),
+                    |_stream, _peer, _handler_stop| async move {
+                        sleep(Duration::from_secs(1)).await;
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap_err();
+                *output_for_task.lock().unwrap() = Some(error.kind());
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(client.join().unwrap(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::TimedOut));
     }
 
     #[test]
