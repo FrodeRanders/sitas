@@ -1846,62 +1846,14 @@ pub async fn serve_tcp_until_stopped_scoped<H, F>(
     listener: TcpListener,
     spawner: Spawner,
     stop: StopToken,
-    mut handler: H,
+    handler: H,
 ) -> io::Result<usize>
 where
     H: FnMut(TcpStream, SocketAddr, StopToken) -> F,
     F: Future<Output = io::Result<()>> + Send + 'static,
 {
-    listener.set_nonblocking(true)?;
-    let mut handlers = TaskScope::new(spawner);
-    let handler_error = Arc::new(Mutex::new(None));
-    let handler_error_notify = Notify::new();
-    let mut accepted = 0usize;
-
-    loop {
-        match race(
-            accept_async(&listener),
-            race(stop.clone(), handler_error_notify.notified()),
-        )
+    serve_tcp_until_stopped_scoped_with(listener, spawner, stop, ScopedTcpShutdown::Wait, handler)
         .await
-        {
-            RaceOutput::First(Ok((stream, peer))) => {
-                let handler_error = Arc::clone(&handler_error);
-                let handler_error_notify = handler_error_notify.clone();
-                handlers
-                    .spawn({
-                        let future = handler(stream, peer, handlers.stop_token());
-                        async move {
-                            if let Err(error) = future.await {
-                                let mut stored = handler_error
-                                    .lock()
-                                    .expect("TCP handler error mutex poisoned");
-                                if stored.is_none() {
-                                    *stored = Some(error);
-                                }
-                                handler_error_notify.notify_waiters();
-                            }
-                        }
-                    })
-                    .map_err(spawn_error_to_io)?;
-                accepted += 1;
-            }
-            RaceOutput::First(Err(error)) => return Err(error),
-            RaceOutput::Second(_) => break,
-        }
-    }
-
-    handlers.shutdown().await.map_err(join_error_to_io)?;
-
-    if let Some(error) = handler_error
-        .lock()
-        .expect("TCP handler error mutex poisoned")
-        .take()
-    {
-        return Err(error);
-    }
-
-    Ok(accepted)
 }
 
 /// Accepts TCP connections until `stop` completes, then gives handler tasks up
@@ -1915,6 +1867,35 @@ pub async fn serve_tcp_until_stopped_scoped_timeout<H, F>(
     spawner: Spawner,
     stop: StopToken,
     shutdown_timeout: Duration,
+    handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr, StopToken) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_until_stopped_scoped_with(
+        listener,
+        spawner,
+        stop,
+        ScopedTcpShutdown::Timeout(shutdown_timeout),
+        handler,
+    )
+    .await
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum ScopedTcpShutdown {
+    Wait,
+    Timeout(Duration),
+}
+
+#[cfg(unix)]
+async fn serve_tcp_until_stopped_scoped_with<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    stop: StopToken,
+    shutdown: ScopedTcpShutdown,
     mut handler: H,
 ) -> io::Result<usize>
 where
@@ -1960,22 +1941,24 @@ where
         }
     }
 
-    let shutdown_result = handlers
-        .shutdown_timeout(shutdown_timeout)
-        .await
-        .map_err(task_scope_error_to_io);
-
-    if let Some(error) = handler_error
+    let shutdown_result = match shutdown {
+        ScopedTcpShutdown::Wait => handlers.shutdown().await.map_err(join_error_to_io),
+        ScopedTcpShutdown::Timeout(duration) => handlers
+            .shutdown_timeout(duration)
+            .await
+            .map_err(task_scope_error_to_io),
+    };
+    let handler_error = handler_error
         .lock()
         .expect("TCP handler error mutex poisoned")
-        .take()
-    {
-        return Err(error);
+        .take();
+
+    match (shutdown, shutdown_result, handler_error) {
+        (ScopedTcpShutdown::Timeout(_), _, Some(error)) => Err(error),
+        (_, Err(error), _) => Err(error),
+        (_, Ok(()), Some(error)) => Err(error),
+        (_, Ok(()), None) => Ok(accepted),
     }
-
-    shutdown_result?;
-
-    Ok(accepted)
 }
 
 #[cfg(unix)]
