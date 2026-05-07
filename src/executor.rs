@@ -1598,6 +1598,68 @@ where
     Ok(accepted)
 }
 
+/// Accepts TCP connections until `stop` completes, spawning one stop-aware
+/// handler task for each accepted stream.
+///
+/// The listener is placed in non-blocking mode before serving starts. Once
+/// `stop` completes, the accept loop stops, all handler tasks receive a shared
+/// scope stop token, and this future waits for them before returning the number
+/// of accepted connections.
+#[cfg(unix)]
+pub async fn serve_tcp_until_stopped_scoped<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    stop: StopToken,
+    mut handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr, StopToken) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    let mut handlers = TaskScope::new(spawner);
+    let handler_error = Arc::new(Mutex::new(None));
+    let mut accepted = 0usize;
+
+    loop {
+        match race(accept_async(&listener), stop.clone()).await {
+            RaceOutput::First(Ok((stream, peer))) => {
+                let handler_error = Arc::clone(&handler_error);
+                handlers
+                    .spawn({
+                        let future = handler(stream, peer, handlers.stop_token());
+                        async move {
+                            if let Err(error) = future.await {
+                                let mut stored = handler_error
+                                    .lock()
+                                    .expect("TCP handler error mutex poisoned");
+                                if stored.is_none() {
+                                    *stored = Some(error);
+                                }
+                            }
+                        }
+                    })
+                    .map_err(spawn_error_to_io)?;
+                accepted += 1;
+            }
+            RaceOutput::First(Err(error)) => return Err(error),
+            RaceOutput::Second(()) => break,
+        }
+    }
+
+    handlers.shutdown().await.map_err(join_error_to_io)?;
+
+    if let Some(error) = handler_error
+        .lock()
+        .expect("TCP handler error mutex poisoned")
+        .take()
+    {
+        return Err(error);
+    }
+
+    Ok(accepted)
+}
+
 #[cfg(unix)]
 async fn join_tcp_handlers(handlers: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
     for handler in handlers {
@@ -1939,8 +2001,8 @@ mod tests {
     use super::{
         accept_async, accept_timeout_async, connect_async, connect_timeout_async, copy_async,
         copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, serve_tcp_n,
-        serve_tcp_until_idle, serve_tcp_until_stopped, writable, write_all_async,
-        write_all_timeout_async,
+        serve_tcp_until_idle, serve_tcp_until_stopped, serve_tcp_until_stopped_scoped, writable,
+        write_all_async, write_all_timeout_async,
     };
     #[cfg(unix)]
     use std::io::{self, Read, Write};
@@ -3373,6 +3435,102 @@ mod tests {
                     server_spawner,
                     stop_token,
                     |_stream, _peer| async { Err(io::Error::other("handler failed")) },
+                )
+                .await
+                .unwrap_err();
+                *output_for_task.lock().unwrap() = Some(error.kind());
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+        client.join().unwrap();
+
+        assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::Other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_until_stopped_scoped_stops_handlers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            byte[0]
+        });
+
+        let (stop_source, stop_token) = stop_pair();
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                sleep(Duration::from_millis(10)).await;
+                stop_source.stop();
+            })
+            .unwrap();
+
+        spawner
+            .spawn(async move {
+                let accepted = serve_tcp_until_stopped_scoped(
+                    listener,
+                    server_spawner,
+                    stop_token,
+                    |mut stream, _peer, handler_stop| async move {
+                        handler_stop.await;
+                        write_all_async(&mut stream, b"x").await
+                    },
+                )
+                .await
+                .unwrap();
+                *output_for_task.lock().unwrap() = Some(accepted);
+            })
+            .unwrap();
+
+        drop(spawner);
+        executor.run();
+
+        assert_eq!(client.join().unwrap(), b'x');
+        assert_eq!(*output.lock().unwrap(), Some(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_tcp_until_stopped_scoped_returns_handler_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let client = thread::spawn(move || {
+            TcpStream::connect(address).unwrap();
+        });
+
+        let (stop_source, stop_token) = stop_pair();
+        let (executor, spawner) = executor_and_spawner();
+        let server_spawner = spawner.clone();
+        let output = Arc::new(Mutex::new(None));
+        let output_for_task = Arc::clone(&output);
+
+        spawner
+            .spawn(async move {
+                sleep(Duration::from_millis(5)).await;
+                stop_source.stop();
+            })
+            .unwrap();
+
+        spawner
+            .spawn(async move {
+                let error = serve_tcp_until_stopped_scoped(
+                    listener,
+                    server_spawner,
+                    stop_token,
+                    |_stream, _peer, _handler_stop| async {
+                        Err(io::Error::other("handler failed"))
+                    },
                 )
                 .await
                 .unwrap_err();

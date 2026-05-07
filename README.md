@@ -31,6 +31,8 @@ standard library:
 - an idle-timeout async TCP server helper for cancellable accept loops
 - stop tokens and a stoppable async TCP server helper for explicit accept-loop
   shutdown
+- a scoped async TCP server helper that propagates shutdown into accepted
+  connection handlers
 - timeout variants for the async Unix I/O helpers
 - an early Unix runtime backend experiment using direct OS FFI for reactor wakes
   and descriptor readiness
@@ -186,6 +188,12 @@ Run the stoppable async TCP server helper example:
 cargo run --example async_tcp_stoppable_server
 ```
 
+Run the scoped async TCP server helper example:
+
+```sh
+cargo run --example async_tcp_scoped_server
+```
+
 Run the async TCP timeout example:
 
 ```sh
@@ -290,6 +298,7 @@ cargo run --example async_tcp_pair
 cargo run --example async_tcp_server
 cargo run --example async_tcp_idle_server
 cargo run --example async_tcp_stoppable_server
+cargo run --example async_tcp_scoped_server
 cargo run --example async_tcp_timeout
 cargo run --example async_tcp_multi_echo
 cargo run --example async_copy
