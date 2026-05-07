@@ -53,6 +53,9 @@ such as `epoll`, `kqueue`, or `io_uring`.
 - `TaskScope` groups child tasks under one stop token, supports cooperative
   shutdown by requesting stop and joining children, and aborts still-owned
   children when the scope is dropped or when bounded shutdown times out
+- `Notify` provides a cloneable one-shot async event for waking one or more
+  tasks when something happens without treating that event as cooperative
+  shutdown
 - executor shutdown tracks spawned tasks, clears timer/readiness registrations,
   and drops pending task futures
 - `yield_now` proves cooperative wakeups without third-party runtimes

@@ -22,6 +22,8 @@ standard library:
   task wakeups
 - task scopes that group child tasks under one cooperative stop signal and
   abort still-owned children when dropped or when bounded shutdown times out
+- a one-shot async notification primitive for waking one or more executor tasks
+  without modeling the event as shutdown
 - executor shutdown cleanup for pending task futures and readiness/timer
   registrations
 - small async connect, accept, read, write, and copy helpers layered on

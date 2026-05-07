@@ -159,6 +159,118 @@ impl Future for StopToken {
     }
 }
 
+/// Cloneable one-shot async notification primitive.
+///
+/// `Notify` starts unnotified. Calling [`Notify::notify_waiters`] marks it as
+/// notified and wakes all current waiters. Once notified, future
+/// [`Notify::notified`] futures complete immediately.
+#[derive(Clone)]
+pub struct Notify {
+    shared: Arc<Mutex<NotifyState>>,
+}
+
+#[derive(Debug)]
+struct NotifyState {
+    notified: bool,
+    wakers: Vec<Waker>,
+}
+
+/// Future returned by [`Notify::notified`].
+#[derive(Clone)]
+#[must_use = "notification futures do nothing unless polled or awaited"]
+pub struct Notified {
+    shared: Arc<Mutex<NotifyState>>,
+}
+
+impl Notify {
+    /// Creates an unnotified event.
+    pub fn new() -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(NotifyState {
+                notified: false,
+                wakers: Vec::new(),
+            })),
+        }
+    }
+
+    /// Returns a future that completes once this event is notified.
+    pub fn notified(&self) -> Notified {
+        Notified {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// Marks this event as notified and wakes current waiters.
+    ///
+    /// Returns `true` if this call changed the event from unnotified to
+    /// notified, or `false` if it had already been notified.
+    pub fn notify_waiters(&self) -> bool {
+        let wakers = {
+            let mut state = self.shared.lock().expect("notify mutex poisoned");
+            if state.notified {
+                return false;
+            }
+
+            state.notified = true;
+            mem::take(&mut state.wakers)
+        };
+
+        for waker in wakers {
+            waker.wake();
+        }
+
+        true
+    }
+
+    /// Returns true if this event has already been notified.
+    pub fn is_notified(&self) -> bool {
+        self.shared.lock().expect("notify mutex poisoned").notified
+    }
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for Notify {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Notify")
+            .field("notified", &self.is_notified())
+            .finish()
+    }
+}
+
+impl fmt::Debug for Notified {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let notified = self.shared.lock().expect("notify mutex poisoned").notified;
+        f.debug_struct("Notified")
+            .field("notified", &notified)
+            .finish()
+    }
+}
+
+impl Future for Notified {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.shared.lock().expect("notify mutex poisoned");
+        if state.notified {
+            Poll::Ready(())
+        } else {
+            if !state
+                .wakers
+                .iter()
+                .any(|waker| waker.will_wake(context.waker()))
+            {
+                state.wakers.push(context.waker().clone());
+            }
+            Poll::Pending
+        }
+    }
+}
+
 /// Handle used to submit futures to an [`Executor`].
 #[derive(Debug)]
 pub struct Spawner {
@@ -1743,19 +1855,19 @@ where
     listener.set_nonblocking(true)?;
     let mut handlers = TaskScope::new(spawner);
     let handler_error = Arc::new(Mutex::new(None));
-    let (handler_error_source, handler_error_token) = stop_pair();
+    let handler_error_notify = Notify::new();
     let mut accepted = 0usize;
 
     loop {
         match race(
             accept_async(&listener),
-            race(stop.clone(), handler_error_token.clone()),
+            race(stop.clone(), handler_error_notify.notified()),
         )
         .await
         {
             RaceOutput::First(Ok((stream, peer))) => {
                 let handler_error = Arc::clone(&handler_error);
-                let handler_error_source = handler_error_source.clone();
+                let handler_error_notify = handler_error_notify.clone();
                 handlers
                     .spawn({
                         let future = handler(stream, peer, handlers.stop_token());
@@ -1767,7 +1879,7 @@ where
                                 if stored.is_none() {
                                     *stored = Some(error);
                                 }
-                                handler_error_source.stop();
+                                handler_error_notify.notify_waiters();
                             }
                         }
                     })
@@ -1812,19 +1924,19 @@ where
     listener.set_nonblocking(true)?;
     let mut handlers = TaskScope::new(spawner);
     let handler_error = Arc::new(Mutex::new(None));
-    let (handler_error_source, handler_error_token) = stop_pair();
+    let handler_error_notify = Notify::new();
     let mut accepted = 0usize;
 
     loop {
         match race(
             accept_async(&listener),
-            race(stop.clone(), handler_error_token.clone()),
+            race(stop.clone(), handler_error_notify.notified()),
         )
         .await
         {
             RaceOutput::First(Ok((stream, peer))) => {
                 let handler_error = Arc::clone(&handler_error);
-                let handler_error_source = handler_error_source.clone();
+                let handler_error_notify = handler_error_notify.clone();
                 handlers
                     .spawn({
                         let future = handler(stream, peer, handlers.stop_token());
@@ -1836,7 +1948,7 @@ where
                                 if stored.is_none() {
                                     *stored = Some(error);
                                 }
-                                handler_error_source.stop();
+                                handler_error_notify.notify_waiters();
                             }
                         }
                     })
@@ -2249,8 +2361,8 @@ impl Future for YieldNow {
 #[cfg(test)]
 mod tests {
     use super::{
-        RaceOutput, TaskScope, TaskScopeError, TimeoutError, block_on, executor_and_spawner, race,
-        sleep, stop_pair, timeout, yield_now,
+        Notify, RaceOutput, TaskScope, TaskScopeError, TimeoutError, block_on,
+        executor_and_spawner, race, sleep, stop_pair, timeout, yield_now,
     };
     #[cfg(unix)]
     use super::{
@@ -2323,6 +2435,52 @@ mod tests {
 
             first.await.unwrap();
             second.await.unwrap();
+        });
+
+        drop(spawner);
+    }
+
+    #[test]
+    fn notify_waiters_completes_after_notification() {
+        let notify = Notify::new();
+        assert!(!notify.is_notified());
+        assert!(notify.notify_waiters());
+        assert!(!notify.notify_waiters());
+        assert!(notify.is_notified());
+
+        block_on(notify.notified());
+    }
+
+    #[test]
+    fn cloned_notify_wakes_multiple_waiters() {
+        let (executor, spawner) = executor_and_spawner();
+        let notify = Notify::new();
+
+        let first = spawner.spawn_with_handle(notify.notified()).unwrap();
+        let second = spawner.spawn_with_handle(notify.notified()).unwrap();
+        let notify_for_task = notify.clone();
+
+        executor.run_until(async {
+            yield_now().await;
+            assert!(notify_for_task.notify_waiters());
+
+            first.await.unwrap();
+            second.await.unwrap();
+        });
+
+        drop(spawner);
+    }
+
+    #[test]
+    fn notify_completes_future_created_after_notification() {
+        let (executor, spawner) = executor_and_spawner();
+        let notify = Notify::new();
+        assert!(notify.notify_waiters());
+
+        executor.run_until(async {
+            timeout(Duration::from_millis(1), notify.notified())
+                .await
+                .unwrap();
         });
 
         drop(spawner);
