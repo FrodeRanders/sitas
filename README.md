@@ -32,6 +32,8 @@ standard library:
   accepted connection
 - a first shard-per-thread async runtime that starts one executor/reactor per
   shard thread and places tasks explicitly by `ShardId`
+- dependency-free executor snapshots for named tasks, task states, poll counts,
+  queue depth, timers, and I/O interests across shards
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
@@ -158,6 +160,12 @@ Run the shard-per-thread executor example:
 
 ```sh
 cargo run --example sharded_executor
+```
+
+Run the shard-per-thread observability example:
+
+```sh
+cargo run --example sharded_observability
 ```
 
 Run the executor async accept helper example:

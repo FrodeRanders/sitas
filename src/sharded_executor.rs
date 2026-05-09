@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::error::ShardError;
-use crate::executor::{JoinHandle, SpawnError, Spawner, executor_and_spawner};
+use crate::executor::{ExecutorSnapshot, JoinHandle, SpawnError, Spawner, executor_and_spawner};
 use crate::runtime::join_all;
 use crate::shard::ShardId;
 
@@ -95,6 +95,21 @@ impl ShardedExecutor {
             .map_err(ShardedSpawnError::Spawn)
     }
 
+    /// Spawns a named task onto a specific executor shard.
+    pub fn spawn_named_on<F>(
+        &self,
+        shard_id: ShardId,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawner_for(shard_id)?
+            .spawn_named(name, future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
     /// Spawns a task onto a specific executor shard and returns an awaitable
     /// handle for its output.
     pub fn spawn_with_handle_on<F>(
@@ -109,6 +124,39 @@ impl ShardedExecutor {
         self.spawner_for(shard_id)?
             .spawn_with_handle(future)
             .map_err(ShardedSpawnError::Spawn)
+    }
+
+    /// Spawns a named task onto a specific executor shard and returns an
+    /// awaitable handle for its output.
+    pub fn spawn_with_handle_named_on<F>(
+        &self,
+        shard_id: ShardId,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, ShardedSpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawner_for(shard_id)?
+            .spawn_with_handle_named(name, future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
+    /// Returns an owned point-in-time snapshot of all executor shards.
+    pub fn snapshot(&self) -> ShardedExecutorSnapshot {
+        ShardedExecutorSnapshot {
+            shard_count: self.shard_count(),
+            running: !self.joins.is_empty(),
+            shards: self
+                .shards
+                .iter()
+                .map(|shard| ShardedExecutorShardSnapshot {
+                    shard_id: shard.shard_id,
+                    executor: shard.spawner.as_ref().map(Spawner::snapshot),
+                })
+                .collect(),
+        }
     }
 
     /// Stops all owned shard executors and joins their threads.
@@ -138,6 +186,28 @@ impl ShardedExecutor {
             .as_ref()
             .ok_or(ShardedSpawnError::Stopped(shard_id))
     }
+}
+
+/// Owned point-in-time summary of a sharded executor runtime.
+#[must_use]
+#[derive(Debug, Clone)]
+pub struct ShardedExecutorSnapshot {
+    /// Number of configured executor shards.
+    pub shard_count: usize,
+    /// Whether the runtime still owns running shard threads.
+    pub running: bool,
+    /// Per-shard executor snapshots.
+    pub shards: Vec<ShardedExecutorShardSnapshot>,
+}
+
+/// Owned point-in-time summary of one async executor shard.
+#[must_use]
+#[derive(Debug, Clone)]
+pub struct ShardedExecutorShardSnapshot {
+    /// The shard this snapshot describes.
+    pub shard_id: ShardId,
+    /// Executor snapshot, or `None` if the shard has already stopped.
+    pub executor: Option<ExecutorSnapshot>,
 }
 
 impl fmt::Debug for ShardedExecutor {
@@ -192,7 +262,9 @@ mod tests {
     use super::{ShardedExecutor, ShardedSpawnError, current_executor_shard};
     use crate::ShardId;
     use crate::executor::block_on;
+    use crate::executor::{TaskStatus, TaskWait, sleep};
     use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn start_rejects_zero_shards() {
@@ -263,5 +335,43 @@ mod tests {
             .expect_err("stopped shard should fail");
 
         assert_eq!(error, ShardedSpawnError::Stopped(ShardId(0)));
+    }
+
+    #[test]
+    fn snapshot_reports_named_waiting_tasks_by_shard() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+
+        runtime
+            .spawn_named_on(ShardId(1), "slow-worker", async move {
+                sender.send(()).unwrap();
+                sleep(Duration::from_millis(100)).await;
+            })
+            .unwrap();
+
+        receiver.recv().unwrap();
+
+        let snapshot = runtime.snapshot();
+        let shard = snapshot
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == ShardId(1))
+            .unwrap();
+        let executor = shard.executor.as_ref().unwrap();
+        let task = executor
+            .tasks
+            .iter()
+            .find(|task| task.name.as_deref() == Some("slow-worker"))
+            .unwrap();
+
+        assert_eq!(snapshot.shard_count, 2);
+        assert!(snapshot.running);
+        assert_eq!(task.status, TaskStatus::Waiting);
+        assert!(matches!(task.waiting_for, Some(TaskWait::Timer { .. })));
+        assert!(task.poll_count >= 1);
+        assert_eq!(executor.task_count, 1);
+        assert_eq!(executor.timer_count, 1);
+
+        runtime.stop().unwrap();
     }
 }

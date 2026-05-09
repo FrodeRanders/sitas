@@ -114,15 +114,25 @@ direction:
 
 - `ShardedExecutor::start` starts one executor/reactor on each shard thread
 - `spawn_on` places a future on an explicit `ShardId`
+- `spawn_named_on` places a future with a human-readable name for snapshots
 - `spawn_with_handle_on` places a future and returns an awaitable join handle
 - `current_executor_shard` lets code running on a shard thread observe its
   current shard identity
+- `snapshot` returns owned per-shard executor snapshots with ready queue depth,
+  task count, timer count, I/O interest counts, and named task states
 - stopping the runtime drops the owned spawners and joins the executor threads
 
 This is not CPU pinning yet, and it does not implement load balancing or
 scheduling classes. It establishes the first shared-nothing async shape: work is
 owned by a shard thread and remains on that shard unless callers explicitly
 submit different work to a different shard.
+
+Executor observability is deliberately snapshot-based instead of tracing-based
+for now. `TaskSnapshot` exposes each observable task's id, optional name,
+lifecycle state, last known wait interest, poll count, accumulated poll time,
+and key timestamps. This is enough to build simple long-running task progress
+views without adding a logging framework, Tokio console, or third-party
+dependencies.
 
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than

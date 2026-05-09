@@ -36,6 +36,103 @@ const READY_POLL_BUDGET: usize = 64;
 
 thread_local! {
     static CURRENT_SCHEDULER: RefCell<Option<Arc<Scheduler>>> = const { RefCell::new(None) };
+    static CURRENT_TASK: RefCell<Option<Arc<Task>>> = const { RefCell::new(None) };
+}
+
+/// Identifier assigned to a task when it is spawned.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TaskId(pub usize);
+
+/// Coarse lifecycle state for a task in an executor snapshot.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    /// The task is in the ready queue.
+    Queued,
+    /// The task is currently being polled.
+    Polling,
+    /// The task is pending and waiting for another wakeup.
+    Waiting,
+    /// The task completed normally.
+    Completed,
+    /// The task was cancelled before completing.
+    Cancelled,
+}
+
+/// What a pending task last registered interest in.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskWait {
+    /// The task yielded or is waiting on an opaque waker.
+    Unknown,
+    /// The task is waiting for an executor timer.
+    Timer {
+        /// The instant at which the timer becomes ready.
+        deadline: Instant,
+    },
+    /// The task is waiting for a file descriptor to become readable.
+    #[cfg(unix)]
+    Readable {
+        /// File descriptor registered for readability.
+        fd: RawFd,
+    },
+    /// The task is waiting for a file descriptor to become writable.
+    #[cfg(unix)]
+    Writable {
+        /// File descriptor registered for writability.
+        fd: RawFd,
+    },
+}
+
+/// Owned point-in-time summary of one task.
+#[must_use]
+#[derive(Debug, Clone)]
+pub struct TaskSnapshot {
+    /// Executor-local task identifier.
+    pub id: TaskId,
+    /// Optional human-readable task name supplied by the spawner.
+    pub name: Option<String>,
+    /// Current coarse task lifecycle state.
+    pub status: TaskStatus,
+    /// Last wait interest registered by this task, if known.
+    pub waiting_for: Option<TaskWait>,
+    /// Number of times the task future has been polled.
+    pub poll_count: u64,
+    /// Total wall-clock time spent polling this task.
+    pub total_poll_time: Duration,
+    /// When this task was created.
+    pub created_at: Instant,
+    /// When this task was last placed on the ready queue.
+    pub last_scheduled_at: Option<Instant>,
+    /// When this task's most recent poll started.
+    pub last_poll_started_at: Option<Instant>,
+    /// When this task's most recent poll finished.
+    pub last_poll_finished_at: Option<Instant>,
+}
+
+/// Owned point-in-time summary of one executor.
+#[must_use]
+#[derive(Debug, Clone)]
+pub struct ExecutorSnapshot {
+    /// Whether this executor still accepts new tasks.
+    pub accepting: bool,
+    /// Number of live spawner handles.
+    pub spawner_count: usize,
+    /// Number of tasks the scheduler still considers unfinished.
+    pub task_count: usize,
+    /// Number of tasks currently queued for polling.
+    pub ready_queue_len: usize,
+    /// Number of registered timers.
+    pub timer_count: usize,
+    /// Number of registered read-readiness interests.
+    #[cfg(unix)]
+    pub read_interest_count: usize,
+    /// Number of registered write-readiness interests.
+    #[cfg(unix)]
+    pub write_interest_count: usize,
+    /// Owned snapshots for tasks that are still externally observable.
+    pub tasks: Vec<TaskSnapshot>,
 }
 
 /// Error returned when a task cannot be submitted to an executor.
@@ -299,11 +396,52 @@ impl Spawner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_with_panic_handler(future, None).map(|_| ())
+        self.spawn_with_name(None, future)
+    }
+
+    /// Spawns a named future onto the executor's ready queue.
+    pub fn spawn_named<F>(&self, name: impl Into<String>, future: F) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_name(Some(name.into()), future)
+    }
+
+    fn spawn_with_name<F>(&self, name: Option<String>, future: F) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_panic_handler(name, future, None)
+            .map(|_| ())
     }
 
     /// Spawns a future and returns a handle that can await its output.
     pub fn spawn_with_handle<F>(&self, future: F) -> Result<JoinHandle<F::Output>, SpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_with_handle_and_name(None, future)
+    }
+
+    /// Spawns a named future and returns a handle that can await its output.
+    pub fn spawn_with_handle_named<F>(
+        &self,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, SpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_with_handle_and_name(Some(name.into()), future)
+    }
+
+    fn spawn_with_handle_and_name<F>(
+        &self,
+        name: Option<String>,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, SpawnError>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -316,6 +454,7 @@ impl Spawner {
         let shared_for_panic = Arc::clone(&shared);
 
         let task = self.spawn_with_panic_handler(
+            name,
             async move {
                 let output = future.await;
                 complete_join(&shared_for_task, Ok(output));
@@ -330,13 +469,17 @@ impl Spawner {
 
     fn spawn_with_panic_handler<F>(
         &self,
+        name: Option<String>,
         future: F,
         panic_handler: Option<PanicHandler>,
     ) -> Result<Arc<Task>, SpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let id = self.scheduler.allocate_task_id();
         let task = Arc::new(Task::new(
+            id,
+            name,
             Box::pin(future),
             Arc::clone(&self.scheduler),
             panic_handler,
@@ -344,6 +487,11 @@ impl Spawner {
 
         self.scheduler.schedule(Arc::clone(&task))?;
         Ok(task)
+    }
+
+    /// Returns an owned snapshot of this spawner's executor.
+    pub fn snapshot(&self) -> ExecutorSnapshot {
+        self.scheduler.snapshot()
     }
 }
 
@@ -650,6 +798,11 @@ pub struct Executor {
 }
 
 impl Executor {
+    /// Returns an owned snapshot of this executor's scheduler and tasks.
+    pub fn snapshot(&self) -> ExecutorSnapshot {
+        self.scheduler.snapshot()
+    }
+
     /// Runs tasks until all spawners and runnable tasks are gone.
     pub fn run(&self) {
         loop {
@@ -802,6 +955,9 @@ impl Wake for RootWaker {
 }
 
 struct Task {
+    id: TaskId,
+    name: Option<String>,
+    created_at: Instant,
     state: Mutex<TaskState>,
     scheduler: Arc<Scheduler>,
 }
@@ -812,6 +968,13 @@ struct TaskState {
     queued: bool,
     polling: bool,
     cancel_requested: bool,
+    completed: bool,
+    poll_count: u64,
+    total_poll_time: Duration,
+    waiting_for: Option<TaskWait>,
+    last_scheduled_at: Option<Instant>,
+    last_poll_started_at: Option<Instant>,
+    last_poll_finished_at: Option<Instant>,
 }
 
 impl fmt::Debug for Task {
@@ -822,17 +985,29 @@ impl fmt::Debug for Task {
 
 impl Task {
     fn new(
+        id: TaskId,
+        name: Option<String>,
         future: BoxFuture,
         scheduler: Arc<Scheduler>,
         panic_handler: Option<PanicHandler>,
     ) -> Self {
         Self {
+            id,
+            name,
+            created_at: Instant::now(),
             state: Mutex::new(TaskState {
                 future: Some(future),
                 panic_handler,
                 queued: false,
                 polling: false,
                 cancel_requested: false,
+                completed: false,
+                poll_count: 0,
+                total_poll_time: Duration::ZERO,
+                waiting_for: None,
+                last_scheduled_at: None,
+                last_poll_started_at: None,
+                last_poll_finished_at: None,
             }),
             scheduler,
         }
@@ -841,6 +1016,7 @@ impl Task {
     fn poll(self: Arc<Self>) {
         let waker = Waker::from(self.clone());
         let mut context = Context::from_waker(&waker);
+        let poll_started_at = Instant::now();
         let mut future = {
             let mut state = self.state.lock().expect("task state mutex poisoned");
             state.queued = false;
@@ -849,6 +1025,9 @@ impl Task {
                 return;
             };
             state.polling = true;
+            state.waiting_for = None;
+            state.last_poll_started_at = Some(poll_started_at);
+            state.poll_count += 1;
             future
         };
 
@@ -856,27 +1035,46 @@ impl Task {
         CURRENT_SCHEDULER.with(|current| {
             *current.borrow_mut() = Some(scheduler);
         });
+        CURRENT_TASK.with(|current| {
+            *current.borrow_mut() = Some(Arc::clone(&self));
+        });
 
         let poll_result =
             panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut context)));
 
+        CURRENT_TASK.with(|current| {
+            *current.borrow_mut() = None;
+        });
         CURRENT_SCHEDULER.with(|current| {
             *current.borrow_mut() = None;
         });
 
+        let poll_finished_at = Instant::now();
+        let poll_duration = poll_finished_at.saturating_duration_since(poll_started_at);
+
         match poll_result {
             Ok(Poll::Ready(())) => {
-                self.state
-                    .lock()
-                    .expect("task state mutex poisoned")
-                    .polling = false;
+                let mut state = self.state.lock().expect("task state mutex poisoned");
+                state.polling = false;
+                state.completed = true;
+                state.waiting_for = None;
+                state.total_poll_time += poll_duration;
+                state.last_poll_finished_at = Some(poll_finished_at);
+                drop(state);
                 self.scheduler.finish_task();
             }
             Ok(Poll::Pending) => {
                 let cancelled = {
                     let mut state = self.state.lock().expect("task state mutex poisoned");
                     state.polling = false;
+                    state.total_poll_time += poll_duration;
+                    state.last_poll_finished_at = Some(poll_finished_at);
+                    if state.waiting_for.is_none() {
+                        state.waiting_for = Some(TaskWait::Unknown);
+                    }
                     if state.cancel_requested {
+                        state.completed = true;
+                        state.waiting_for = None;
                         true
                     } else {
                         state.future = Some(future);
@@ -894,6 +1092,10 @@ impl Task {
                     let mut state = self.state.lock().expect("task state mutex poisoned");
                     state.polling = false;
                     state.future = None;
+                    state.completed = true;
+                    state.waiting_for = None;
+                    state.total_poll_time += poll_duration;
+                    state.last_poll_finished_at = Some(poll_finished_at);
                     state.panic_handler.take()
                 };
 
@@ -912,6 +1114,8 @@ impl Task {
         }
 
         state.queued = true;
+        state.waiting_for = None;
+        state.last_scheduled_at = Some(Instant::now());
         true
     }
 
@@ -929,6 +1133,8 @@ impl Task {
             } else {
                 state.future = None;
                 state.queued = false;
+                state.completed = true;
+                state.waiting_for = None;
                 true
             }
         };
@@ -946,11 +1152,48 @@ impl Task {
         if !state.polling {
             state.future = None;
             state.queued = false;
+            state.completed = true;
+            state.waiting_for = None;
         }
     }
 
     fn clear_queued(&self) {
         self.state.lock().expect("task state mutex poisoned").queued = false;
+    }
+
+    fn set_waiting_for(&self, waiting_for: TaskWait) {
+        let mut state = self.state.lock().expect("task state mutex poisoned");
+        if state.polling && !state.completed {
+            state.waiting_for = Some(waiting_for);
+        }
+    }
+
+    fn snapshot(&self) -> TaskSnapshot {
+        let state = self.state.lock().expect("task state mutex poisoned");
+        let status = if state.completed && state.cancel_requested {
+            TaskStatus::Cancelled
+        } else if state.completed {
+            TaskStatus::Completed
+        } else if state.polling {
+            TaskStatus::Polling
+        } else if state.queued {
+            TaskStatus::Queued
+        } else {
+            TaskStatus::Waiting
+        };
+
+        TaskSnapshot {
+            id: self.id,
+            name: self.name.clone(),
+            status,
+            waiting_for: state.waiting_for,
+            poll_count: state.poll_count,
+            total_poll_time: state.total_poll_time,
+            created_at: self.created_at,
+            last_scheduled_at: state.last_scheduled_at,
+            last_poll_started_at: state.last_poll_started_at,
+            last_poll_finished_at: state.last_poll_finished_at,
+        }
     }
 }
 
@@ -984,6 +1227,7 @@ struct SchedulerState {
     accepting: bool,
     spawner_count: usize,
     task_count: usize,
+    next_task_id: usize,
     next_timer_id: usize,
 }
 
@@ -1050,6 +1294,10 @@ impl InterestSet {
         self.interests.iter().map(|interest| interest.fd).collect()
     }
 
+    fn len(&self) -> usize {
+        self.interests.len()
+    }
+
     fn wake_ready(&mut self, ready_fds: &[RawFd]) -> Vec<Waker> {
         let mut wakers = Vec::new();
         let mut ready_ids = Vec::new();
@@ -1098,11 +1346,19 @@ impl Scheduler {
                 accepting: true,
                 spawner_count: 1,
                 task_count: 0,
+                next_task_id: 0,
                 next_timer_id: 0,
             }),
             #[cfg(unix)]
             waker,
         }
+    }
+
+    fn allocate_task_id(&self) -> TaskId {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        let id = state.next_task_id;
+        state.next_task_id = state.next_task_id.wrapping_add(1);
+        TaskId(id)
     }
 
     fn add_spawner(&self) {
@@ -1209,6 +1465,41 @@ impl Scheduler {
         self.wake_reactor();
     }
 
+    fn snapshot(&self) -> ExecutorSnapshot {
+        let state = self.state.lock().expect("scheduler state mutex poisoned");
+        let accepting = state.accepting;
+        let spawner_count = state.spawner_count;
+        let task_count = state.task_count;
+        let ready_queue_len = state.queue.len();
+        let timer_count = state.timers.len();
+        #[cfg(unix)]
+        let read_interest_count = state.read_interests.len();
+        #[cfg(unix)]
+        let write_interest_count = state.write_interests.len();
+        let tasks = state.tasks.clone();
+        drop(state);
+
+        let mut tasks = tasks
+            .into_iter()
+            .filter_map(|task| task.upgrade())
+            .map(|task| task.snapshot())
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| task.id);
+
+        ExecutorSnapshot {
+            accepting,
+            spawner_count,
+            task_count,
+            ready_queue_len,
+            timer_count,
+            #[cfg(unix)]
+            read_interest_count,
+            #[cfg(unix)]
+            write_interest_count,
+            tasks,
+        }
+    }
+
     fn finish_task(&self) {
         let should_wake = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
@@ -1229,6 +1520,7 @@ impl Scheduler {
     }
 
     fn register_timer(&self, id: usize, deadline: Instant, waker: Waker) {
+        set_current_task_waiting_for(TaskWait::Timer { deadline });
         let should_wake = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
             let previous_next = next_timer_deadline(&state.timers);
@@ -1296,6 +1588,7 @@ impl Scheduler {
 
     #[cfg(unix)]
     fn register_read_interest(&self, id: usize, fd: RawFd, waker: Waker) {
+        set_current_task_waiting_for(TaskWait::Readable { fd });
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
             state.read_interests.register(id, fd, waker);
@@ -1342,6 +1635,7 @@ impl Scheduler {
 
     #[cfg(unix)]
     fn register_write_interest(&self, id: usize, fd: RawFd, waker: Waker) {
+        set_current_task_waiting_for(TaskWait::Writable { fd });
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
             state.write_interests.register(id, fd, waker);
@@ -1394,6 +1688,14 @@ fn current_scheduler() -> Arc<Scheduler> {
     CURRENT_SCHEDULER
         .with(|current| current.borrow().as_ref().cloned())
         .expect("executor futures must be polled by sitas::executor::Executor")
+}
+
+fn set_current_task_waiting_for(waiting_for: TaskWait) {
+    CURRENT_TASK.with(|current| {
+        if let Some(task) = current.borrow().as_ref() {
+            task.set_waiting_for(waiting_for);
+        }
+    });
 }
 
 /// Creates a paired executor and spawner.
