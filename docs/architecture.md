@@ -109,6 +109,21 @@ descriptor registration, kernel timers, or deeper backends such as `kqueue` or
 - `serve_tcp_until_stopped_scoped_timeout` adds a bounded handler shutdown
   deadline and aborts uncooperative handlers if the deadline elapses
 
+`sharded_executor` connects the single-threaded executor to the shard-per-core
+direction:
+
+- `ShardedExecutor::start` starts one executor/reactor on each shard thread
+- `spawn_on` places a future on an explicit `ShardId`
+- `spawn_with_handle_on` places a future and returns an awaitable join handle
+- `current_executor_shard` lets code running on a shard thread observe its
+  current shard identity
+- stopping the runtime drops the owned spawners and joins the executor threads
+
+This is not CPU pinning yet, and it does not implement load balancing or
+scheduling classes. It establishes the first shared-nothing async shape: work is
+owned by a shard thread and remains on that shard unless callers explicitly
+submit different work to a different shard.
+
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than
 `std::sync::mpsc`, so a waiting future can store its task waker directly in the
