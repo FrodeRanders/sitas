@@ -19,17 +19,18 @@ It deliberately does not know about key-value commands or service state.
 
 `os` provides the first non-std runtime backend primitive:
 
-- direct Unix FFI, currently `pipe`, `poll`, `read`, `write`, `fcntl`, and
-  `close`
+- direct Unix FFI, currently `pipe`, `read`, `write`, `fcntl`, `close`, Linux
+  `epoll`, and non-Linux Unix `poll`
 - a non-blocking pipe for cross-thread reactor wakeups
-- read/write-readiness polling for caller-provided file descriptors
+- read/write-readiness waiting for caller-provided file descriptors
 - a cloneable `OsWaker`
 - a blocking `OsReactor::wait` that can be woken by the pipe
 
 This is intentionally smaller than a full reactor. It establishes the FFI
-boundary and a portable macOS/Linux wake mechanism before introducing file
-descriptor registration, timers, network sockets, or platform-specific backends
-such as `epoll`, `kqueue`, or `io_uring`.
+boundary, a portable macOS/Linux wake mechanism, and the first
+platform-specific readiness backend before introducing persistent file
+descriptor registration, kernel timers, or deeper backends such as `kqueue` or
+`io_uring`.
 
 `executor` provides a minimal single-threaded async kernel:
 

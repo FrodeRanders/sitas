@@ -39,8 +39,9 @@ standard library:
   connection handlers, stops accepting when a handler fails, and can bound
   handler shutdown time
 - timeout variants for the async Unix I/O helpers
-- an early Unix runtime backend experiment using direct OS FFI for reactor wakes
-  and descriptor readiness
+- an early Unix runtime backend experiment using direct OS FFI for reactor
+  wakes and descriptor readiness, including Linux `epoll` and a portable Unix
+  `poll` fallback
 - one OS thread per shard
 - one mailbox per shard
 - bounded shard mailboxes

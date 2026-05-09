@@ -1,25 +1,27 @@
 //! Unix runtime backend experiments.
 //!
 //! This module is the first step outside the pure standard-library runtime.
-//! It uses direct Unix FFI for a small reactor wake primitive that works on
-//! Linux and macOS: a non-blocking pipe provides the wake source, and `poll(2)`
-//! waits for readiness.
+//! It uses direct Unix FFI for a small reactor wake primitive and descriptor
+//! readiness waiting. A non-blocking pipe provides the wake source. Linux uses
+//! `epoll(7)` for readiness waits; other Unix targets currently use `poll(2)`.
 
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
-use std::os::raw::{c_int, c_short, c_void};
+#[cfg(not(target_os = "linux"))]
+use std::os::raw::c_short;
+use std::os::raw::{c_int, c_void};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
-type Nfds = std::os::raw::c_ulong;
 #[cfg(not(target_os = "linux"))]
 type Nfds = u32;
 type SockLen = u32;
 
+#[cfg(not(target_os = "linux"))]
 const POLLIN: c_short = 0x0001;
+#[cfg(not(target_os = "linux"))]
 const POLLOUT: c_short = 0x0004;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
@@ -29,6 +31,17 @@ const AF_INET6: c_int = 10;
 #[cfg(not(target_os = "linux"))]
 const AF_INET6: c_int = 30;
 const SOCK_STREAM: c_int = 1;
+
+#[cfg(target_os = "linux")]
+const EPOLLIN: u32 = 0x0001;
+#[cfg(target_os = "linux")]
+const EPOLLOUT: u32 = 0x0004;
+#[cfg(target_os = "linux")]
+const EPOLLERR: u32 = 0x0008;
+#[cfg(target_os = "linux")]
+const EPOLLHUP: u32 = 0x0010;
+#[cfg(target_os = "linux")]
+const EPOLL_CTL_ADD: c_int = 1;
 
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: c_int = 0o4000;
@@ -44,11 +57,20 @@ const EINPROGRESS: c_int = 36;
 #[cfg(not(target_os = "linux"))]
 const EWOULDBLOCK: c_int = 35;
 
+#[cfg(not(target_os = "linux"))]
 #[repr(C)]
 struct PollFd {
     fd: c_int,
     events: c_short,
     revents: c_short,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EpollEvent {
+    events: u32,
+    data: u64,
 }
 
 #[repr(C)]
@@ -101,6 +123,7 @@ struct SockAddrIn {
     sin_zero: [u8; 8],
 }
 
+#[cfg(not(target_os = "linux"))]
 impl PollFd {
     fn readable(fd: RawFd) -> Self {
         Self {
@@ -124,6 +147,7 @@ unsafe extern "C" {
     fn connect(fd: c_int, address: *const c_void, length: SockLen) -> c_int;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
     fn pipe(fds: *mut c_int) -> c_int;
+    #[cfg(not(target_os = "linux"))]
     fn poll(fds: *mut PollFd, nfds: Nfds, timeout: c_int) -> c_int;
     fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
     fn socket(domain: c_int, socket_type: c_int, protocol: c_int) -> c_int;
@@ -133,6 +157,14 @@ unsafe extern "C" {
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn __errno_location() -> *mut c_int;
+    fn epoll_create1(flags: c_int) -> c_int;
+    fn epoll_ctl(epoll_fd: c_int, op: c_int, fd: c_int, event: *mut EpollEvent) -> c_int;
+    fn epoll_wait(
+        epoll_fd: c_int,
+        events: *mut EpollEvent,
+        maxevents: c_int,
+        timeout: c_int,
+    ) -> c_int;
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -200,7 +232,102 @@ impl OsReactor {
         write_fds: &[RawFd],
         timeout: Option<Duration>,
     ) -> io::Result<OsEvent> {
-        let timeout_ms = timeout_to_poll_ms(timeout);
+        self.wait_io_backend(read_fds, write_fds, timeout)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_io_backend(
+        &self,
+        read_fds: &[RawFd],
+        write_fds: &[RawFd],
+        timeout: Option<Duration>,
+    ) -> io::Result<OsEvent> {
+        let timeout_ms = timeout_to_wait_ms(timeout);
+
+        loop {
+            let epoll_fd = create_epoll()?;
+            let interests = EpollInterests::new(self.read_fd.raw(), read_fds, write_fds);
+
+            for (index, interest) in interests.iter().enumerate() {
+                let mut event = EpollEvent {
+                    events: interest.events(),
+                    data: index as u64,
+                };
+
+                // SAFETY: `epoll_fd` is an owned epoll descriptor, `interest.fd`
+                // is borrowed for this wait call, and `event` points to an
+                // initialized event value for the duration of the call.
+                let result =
+                    unsafe { epoll_ctl(epoll_fd.raw(), EPOLL_CTL_ADD, interest.fd, &mut event) };
+                if result < 0 {
+                    return Err(last_os_error());
+                }
+            }
+
+            let max_events = interests.len().max(1);
+            let mut events = vec![EpollEvent { events: 0, data: 0 }; max_events];
+
+            // SAFETY: `events` points to initialized storage for `max_events`
+            // event values, and `epoll_fd` remains open for the call.
+            let result = unsafe {
+                epoll_wait(
+                    epoll_fd.raw(),
+                    events.as_mut_ptr(),
+                    max_events as c_int,
+                    timeout_ms,
+                )
+            };
+            if result > 0 {
+                let mut woke = false;
+                let mut readable = Vec::new();
+                let mut writable = Vec::new();
+
+                for event in events.iter().take(result as usize) {
+                    let interest = interests
+                        .get(event.data as usize)
+                        .expect("epoll returned an unknown interest index");
+                    if interest.is_wake {
+                        woke = event.events & EPOLLIN != 0 && self.drain_wakes()?;
+                        continue;
+                    }
+                    if interest.read && event.events & (EPOLLIN | EPOLLERR | EPOLLHUP) != 0 {
+                        readable.push(interest.fd);
+                    }
+                    if interest.write && event.events & (EPOLLOUT | EPOLLERR | EPOLLHUP) != 0 {
+                        writable.push(interest.fd);
+                    }
+                }
+
+                return Ok(OsEvent {
+                    woke,
+                    readable,
+                    writable,
+                });
+            }
+            if result == 0 {
+                return Ok(OsEvent {
+                    woke: false,
+                    readable: Vec::new(),
+                    writable: Vec::new(),
+                });
+            }
+
+            let error = last_os_error();
+            if error.raw_os_error() == Some(EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn wait_io_backend(
+        &self,
+        read_fds: &[RawFd],
+        write_fds: &[RawFd],
+        timeout: Option<Duration>,
+    ) -> io::Result<OsEvent> {
+        let timeout_ms = timeout_to_wait_ms(timeout);
 
         loop {
             let mut fds = Vec::with_capacity(read_fds.len() + write_fds.len() + 1);
@@ -338,6 +465,87 @@ impl fmt::Debug for OsWaker {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct EpollInterest {
+    fd: RawFd,
+    read: bool,
+    write: bool,
+    is_wake: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl EpollInterest {
+    fn events(&self) -> u32 {
+        let mut events = 0;
+        if self.read {
+            events |= EPOLLIN;
+        }
+        if self.write {
+            events |= EPOLLOUT;
+        }
+        events
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct EpollInterests {
+    interests: Vec<EpollInterest>,
+}
+
+#[cfg(target_os = "linux")]
+impl EpollInterests {
+    fn new(wake_fd: RawFd, read_fds: &[RawFd], write_fds: &[RawFd]) -> Self {
+        let mut interests = Vec::with_capacity(read_fds.len() + write_fds.len() + 1);
+        interests.push(EpollInterest {
+            fd: wake_fd,
+            read: true,
+            write: false,
+            is_wake: true,
+        });
+
+        for fd in read_fds {
+            add_epoll_interest(&mut interests, *fd, true, false);
+        }
+        for fd in write_fds {
+            add_epoll_interest(&mut interests, *fd, false, true);
+        }
+
+        Self { interests }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &EpollInterest> {
+        self.interests.iter()
+    }
+
+    fn get(&self, index: usize) -> Option<&EpollInterest> {
+        self.interests.get(index)
+    }
+
+    fn len(&self) -> usize {
+        self.interests.len()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn add_epoll_interest(interests: &mut Vec<EpollInterest>, fd: RawFd, read: bool, write: bool) {
+    if let Some(interest) = interests
+        .iter_mut()
+        .find(|interest| !interest.is_wake && interest.fd == fd)
+    {
+        interest.read |= read;
+        interest.write |= write;
+    } else {
+        interests.push(EpollInterest {
+            fd,
+            read,
+            write,
+            is_wake: false,
+        });
+    }
+}
+
 /// Result of waiting on an [`OsReactor`].
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,6 +667,18 @@ fn create_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 #[cfg(target_os = "linux")]
+fn create_epoll() -> io::Result<OwnedFd> {
+    // SAFETY: `epoll_create1` is called with no flags and does not borrow
+    // memory from Rust.
+    let fd = unsafe { epoll_create1(0) };
+    if fd < 0 {
+        Err(last_os_error())
+    } else {
+        Ok(OwnedFd::new(fd))
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn socket_addr_v4(address: SocketAddrV4) -> SockAddrIn {
     SockAddrIn {
         sin_family: AF_INET as u16,
@@ -528,7 +748,7 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     }
 }
 
-fn timeout_to_poll_ms(timeout: Option<Duration>) -> c_int {
+fn timeout_to_wait_ms(timeout: Option<Duration>) -> c_int {
     match timeout {
         Some(duration) => {
             let millis = duration.as_millis();
