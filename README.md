@@ -52,6 +52,8 @@ standard library:
   running on the owning shard executor
 - shard-local worker helpers that start one async task per shard with a cloned
   handle to the same shard-owned state
+- named shard-local workers that appear in dependency-free executor snapshots
+  for long-running task observability
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
@@ -226,6 +228,12 @@ Run the shard-local worker example:
 
 ```sh
 cargo run --example shard_local_workers
+```
+
+Run the shard-local worker observability example:
+
+```sh
+cargo run --example shard_local_worker_observability
 ```
 
 Run the executor async accept helper example:

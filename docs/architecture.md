@@ -165,7 +165,9 @@ own local value directly, avoiding a submit-and-reschedule round trip while
 keeping the runtime owner check. `ShardLocal::spawn_workers` and
 `ShardLocal::spawn_named_workers` start one async worker per shard and pass each
 worker a cloned handle to the same shard-owned state, which gives long-running
-shard services a small shared-nothing startup pattern.
+shard services a small shared-nothing startup pattern. Named shard-local
+workers use the existing executor task names, so they appear in shard snapshots
+with status, wait reason, and poll counters like other long-running tasks.
 
 Executor observability is deliberately snapshot-based instead of tracing-based
 for now. `TaskSnapshot` exposes each observable task's id, optional name,

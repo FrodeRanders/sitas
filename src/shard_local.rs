@@ -324,8 +324,9 @@ impl<T> ShardLocalCell<T> {
 mod tests {
     use super::{ShardLocal, ShardLocalAccessError};
     use crate::ShardId;
-    use crate::executor::block_on;
+    use crate::executor::{block_on, sleep};
     use crate::sharded_executor::{ShardedExecutor, join_all_shards};
+    use std::time::Duration;
 
     #[test]
     fn shard_local_values_are_accessed_on_owning_shards() {
@@ -525,6 +526,56 @@ mod tests {
                 (ShardId(1), 101),
                 (ShardId(2), 102),
                 (ShardId(3), 103)
+            ]
+        );
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn named_shard_local_workers_are_observable() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let observer = runtime.observer();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |_| 0usize);
+
+        let handles = local
+            .spawn_named_workers(
+                |shard_id| format!("local-worker-{}", shard_id.0),
+                |_shard_id, task_local| async move {
+                    let output = task_local
+                        .with_current(|current_shard, value| {
+                            *value += 1;
+                            (current_shard, *value)
+                        })
+                        .unwrap();
+                    sleep(Duration::from_millis(50)).await;
+                    output
+                },
+            )
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+        let snapshot = observer.snapshot();
+        let mut task_names = snapshot
+            .shards
+            .iter()
+            .flat_map(|shard| shard.executor.iter())
+            .flat_map(|executor| executor.tasks.iter())
+            .filter_map(|task| task.name.as_deref())
+            .collect::<Vec<_>>();
+        task_names.sort_unstable();
+
+        assert_eq!(task_names, vec!["local-worker-0", "local-worker-1"]);
+
+        let outputs = block_on(join_all_shards(handles)).unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                (ShardId(0), (ShardId(0), (ShardId(0), 1))),
+                (ShardId(1), (ShardId(1), (ShardId(1), 1)))
             ]
         );
 
