@@ -38,6 +38,8 @@ standard library:
   alive
 - cloneable sharded submitters that let work on one shard submit and await work
   on another shard
+- broadcast-style shard submission for running one async task per shard and
+  collecting shard-tagged outputs
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
@@ -176,6 +178,12 @@ Run the cross-shard async submit example:
 
 ```sh
 cargo run --example sharded_submit
+```
+
+Run the shard broadcast example:
+
+```sh
+cargo run --example sharded_broadcast
 ```
 
 Run the executor async accept helper example:

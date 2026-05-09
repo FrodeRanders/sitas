@@ -138,6 +138,13 @@ and the awaiting task resumes on its original shard when the remote work
 completes. Submitters own spawner clones, so they are also explicit lifetime
 capabilities: they must be dropped before the runtime can fully drain.
 
+The submitter also supports broadcast-style submission with
+`submit_with_handle_to_all` and `submit_with_handle_named_to_all`. These submit
+one future per shard and return `ShardedJoinHandle` values that preserve the
+target `ShardId`. `join_all_shards` awaits those handles in order and returns
+shard-tagged outputs, giving the runtime a small dependency-free equivalent of
+"run this on every shard and collect the replies."
+
 Executor observability is deliberately snapshot-based instead of tracing-based
 for now. `TaskSnapshot` exposes each observable task's id, optional name,
 lifecycle state, last known wait interest, poll count, accumulated poll time,

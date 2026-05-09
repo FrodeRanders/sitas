@@ -12,7 +12,8 @@ use std::thread;
 
 use crate::error::ShardError;
 use crate::executor::{
-    ExecutorObserver, ExecutorSnapshot, JoinHandle, SpawnError, Spawner, executor_and_spawner,
+    ExecutorObserver, ExecutorSnapshot, JoinError, JoinHandle, SpawnError, Spawner,
+    executor_and_spawner,
 };
 use crate::runtime::join_all;
 use crate::shard::ShardId;
@@ -308,6 +309,79 @@ impl ShardedSubmitter {
             .map_err(ShardedSpawnError::Spawn)
     }
 
+    /// Submits one task to each shard.
+    pub fn submit_to_all<MakeFuture, Fut>(
+        &self,
+        make_future: MakeFuture,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.submit_with_handle_to_all(make_future).map(|_| ())
+    }
+
+    /// Submits one task to each shard and returns shard-tagged join handles.
+    pub fn submit_with_handle_to_all<MakeFuture, Fut>(
+        &self,
+        mut make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let mut handles = Vec::with_capacity(self.shard_count());
+
+        for shard in &self.shards {
+            let spawner = shard
+                .spawner
+                .as_ref()
+                .ok_or(ShardedSpawnError::Stopped(shard.shard_id))?;
+            let handle = spawner
+                .spawn_with_handle(make_future(shard.shard_id))
+                .map_err(ShardedSpawnError::Spawn)?;
+            handles.push(ShardedJoinHandle {
+                shard_id: shard.shard_id,
+                handle,
+            });
+        }
+
+        Ok(handles)
+    }
+
+    /// Submits one named task to each shard and returns shard-tagged join
+    /// handles.
+    pub fn submit_with_handle_named_to_all<MakeName, MakeFuture, Fut>(
+        &self,
+        mut make_name: MakeName,
+        mut make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let mut handles = Vec::with_capacity(self.shard_count());
+
+        for shard in &self.shards {
+            let spawner = shard
+                .spawner
+                .as_ref()
+                .ok_or(ShardedSpawnError::Stopped(shard.shard_id))?;
+            let handle = spawner
+                .spawn_with_handle_named(make_name(shard.shard_id), make_future(shard.shard_id))
+                .map_err(ShardedSpawnError::Spawn)?;
+            handles.push(ShardedJoinHandle {
+                shard_id: shard.shard_id,
+                handle,
+            });
+        }
+
+        Ok(handles)
+    }
+
     fn spawner_for(&self, shard_id: ShardId) -> Result<&Spawner, ShardedSpawnError> {
         let shard = self
             .shards
@@ -320,6 +394,100 @@ impl ShardedSubmitter {
             .as_ref()
             .ok_or(ShardedSpawnError::Stopped(shard_id))
     }
+}
+
+/// Join handle tagged with the shard on which the task is running.
+#[must_use = "sharded join handles do nothing unless joined"]
+pub struct ShardedJoinHandle<T> {
+    shard_id: ShardId,
+    handle: JoinHandle<T>,
+}
+
+impl<T> ShardedJoinHandle<T> {
+    /// Returns the shard on which this task is running.
+    pub fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
+    /// Waits for this task and returns the shard-tagged output.
+    pub async fn join(self) -> Result<(ShardId, T), ShardedJoinError> {
+        self.handle
+            .await
+            .map(|output| (self.shard_id, output))
+            .map_err(|error| ShardedJoinError {
+                shard_id: self.shard_id,
+                error,
+            })
+    }
+}
+
+impl<T> fmt::Debug for ShardedJoinHandle<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardedJoinHandle")
+            .field("shard_id", &self.shard_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Error returned when a shard-tagged join handle fails.
+pub struct ShardedJoinError {
+    shard_id: ShardId,
+    error: JoinError,
+}
+
+impl ShardedJoinError {
+    /// Returns the shard whose task failed.
+    pub fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
+    /// Returns the underlying join error.
+    pub fn error(&self) -> &JoinError {
+        &self.error
+    }
+
+    /// Consumes this error and returns the underlying join error.
+    pub fn into_error(self) -> JoinError {
+        self.error
+    }
+}
+
+impl fmt::Debug for ShardedJoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardedJoinError")
+            .field("shard_id", &self.shard_id)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl fmt::Display for ShardedJoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "task on shard {} failed: {}",
+            self.shard_id.0, self.error
+        )
+    }
+}
+
+impl std::error::Error for ShardedJoinError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Awaits shard-tagged join handles in input order.
+pub async fn join_all_shards<T>(
+    handles: Vec<ShardedJoinHandle<T>>,
+) -> Result<Vec<(ShardId, T)>, ShardedJoinError> {
+    let mut outputs = Vec::with_capacity(handles.len());
+
+    for handle in handles {
+        outputs.push(handle.join().await?);
+    }
+
+    Ok(outputs)
 }
 
 /// Weak observer handle for a sharded executor runtime.
@@ -604,6 +772,43 @@ mod tests {
             .expect_err("invalid shard should fail");
 
         assert_eq!(error, ShardedSpawnError::InvalidShardId(3));
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn submitter_can_submit_to_all_shards_and_join_outputs() {
+        let runtime = ShardedExecutor::start(4).unwrap();
+        let submitter = runtime.submitter();
+        let task_submitter = submitter.clone();
+
+        let handle = runtime
+            .spawn_with_handle_on(ShardId(0), async move {
+                let handles = task_submitter
+                    .submit_with_handle_named_to_all(
+                        |shard_id| format!("broadcast-{}", shard_id.0),
+                        |shard_id| async move {
+                            assert_eq!(current_executor_shard(), Some(shard_id));
+                            shard_id.0 * 10
+                        },
+                    )
+                    .unwrap();
+
+                super::join_all_shards(handles).await.unwrap()
+            })
+            .unwrap();
+
+        let outputs = block_on(handle).unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                (ShardId(0), 0),
+                (ShardId(1), 10),
+                (ShardId(2), 20),
+                (ShardId(3), 30)
+            ]
+        );
+
         drop(submitter);
         runtime.stop().unwrap();
     }
