@@ -191,6 +191,8 @@ impl OsReactor {
         let (read_fd, write_fd) = create_pipe()?;
         #[cfg(target_os = "linux")]
         let epoll_fd = create_epoll()?;
+        #[cfg(target_os = "linux")]
+        register_epoll_fd(epoll_fd.raw(), read_fd.raw(), EPOLLIN, 0)?;
 
         Ok(Self {
             read_fd,
@@ -251,11 +253,11 @@ impl OsReactor {
         timeout: Option<Duration>,
     ) -> io::Result<OsEvent> {
         let timeout_ms = timeout_to_wait_ms(timeout);
-        let interests = EpollInterests::new(self.read_fd.raw(), read_fds, write_fds);
+        let interests = EpollInterests::new(read_fds, write_fds);
         let _registration = register_epoll_interests(self.epoll_fd.raw(), &interests)?;
 
         loop {
-            let max_events = interests.len().max(1);
+            let max_events = interests.len() + 1;
             let mut events = vec![EpollEvent { events: 0, data: 0 }; max_events];
 
             // SAFETY: `events` points to initialized storage for `max_events`
@@ -275,13 +277,13 @@ impl OsReactor {
                 let mut writable = Vec::new();
 
                 for event in events.iter().take(result as usize) {
-                    let interest = interests
-                        .get(event.data as usize)
-                        .expect("epoll returned an unknown interest index");
-                    if interest.is_wake {
+                    if event.data == 0 {
                         woke = event.events & EPOLLIN != 0 && self.drain_wakes()?;
                         continue;
                     }
+                    let interest = interests
+                        .get((event.data - 1) as usize)
+                        .expect("epoll returned an unknown interest index");
                     if interest.read && event.events & (EPOLLIN | EPOLLERR | EPOLLHUP) != 0 {
                         readable.push(interest.fd);
                     }
@@ -463,7 +465,6 @@ struct EpollInterest {
     fd: RawFd,
     read: bool,
     write: bool,
-    is_wake: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -488,14 +489,8 @@ struct EpollInterests {
 
 #[cfg(target_os = "linux")]
 impl EpollInterests {
-    fn new(wake_fd: RawFd, read_fds: &[RawFd], write_fds: &[RawFd]) -> Self {
-        let mut interests = Vec::with_capacity(read_fds.len() + write_fds.len() + 1);
-        interests.push(EpollInterest {
-            fd: wake_fd,
-            read: true,
-            write: false,
-            is_wake: true,
-        });
+    fn new(read_fds: &[RawFd], write_fds: &[RawFd]) -> Self {
+        let mut interests = Vec::with_capacity(read_fds.len() + write_fds.len());
 
         for fd in read_fds {
             add_epoll_interest(&mut interests, *fd, true, false);
@@ -522,19 +517,11 @@ impl EpollInterests {
 
 #[cfg(target_os = "linux")]
 fn add_epoll_interest(interests: &mut Vec<EpollInterest>, fd: RawFd, read: bool, write: bool) {
-    if let Some(interest) = interests
-        .iter_mut()
-        .find(|interest| !interest.is_wake && interest.fd == fd)
-    {
+    if let Some(interest) = interests.iter_mut().find(|interest| interest.fd == fd) {
         interest.read |= read;
         interest.write |= write;
     } else {
-        interests.push(EpollInterest {
-            fd,
-            read,
-            write,
-            is_wake: false,
-        });
+        interests.push(EpollInterest { fd, read, write });
     }
 }
 
@@ -574,23 +561,26 @@ fn register_epoll_interests(
     };
 
     for (index, interest) in interests.iter().enumerate() {
-        let mut event = EpollEvent {
-            events: interest.events(),
-            data: index as u64,
-        };
-
-        // SAFETY: `epoll_fd` is an open epoll descriptor owned by the reactor,
-        // `interest.fd` is borrowed for this wait call, and `event` points to
-        // an initialized event value for the duration of the call.
-        let result = unsafe { epoll_ctl(epoll_fd, EPOLL_CTL_ADD, interest.fd, &mut event) };
-        if result < 0 {
-            return Err(last_os_error());
-        }
-
+        register_epoll_fd(epoll_fd, interest.fd, interest.events(), (index + 1) as u64)?;
         registration.registered_fds.push(interest.fd);
     }
 
     Ok(registration)
+}
+
+#[cfg(target_os = "linux")]
+fn register_epoll_fd(epoll_fd: RawFd, fd: RawFd, events: u32, data: u64) -> io::Result<()> {
+    let mut event = EpollEvent { events, data };
+
+    // SAFETY: `epoll_fd` is an open epoll descriptor, `fd` is borrowed for
+    // readiness observation, and `event` points to an initialized event value
+    // for the duration of the call.
+    let result = unsafe { epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &mut event) };
+    if result < 0 {
+        Err(last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Result of waiting on an [`OsReactor`].
