@@ -155,7 +155,9 @@ value.
 the sharded submitter and the closure runs synchronously on the owning shard,
 receiving `&mut T`. The implementation uses an internal `UnsafeCell` with a
 runtime shard check rather than a mutex; references to the local value cannot
-escape the closure or cross an `.await`.
+escape the closure or cross an `.await`. `ShardLocal::map_all` and
+`ShardLocal::map_reduce_all` provide the same collect-or-reduce convenience for
+stateful shard-local operations.
 
 Executor observability is deliberately snapshot-based instead of tracing-based
 for now. `TaskSnapshot` exposes each observable task's id, optional name,

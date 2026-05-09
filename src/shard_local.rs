@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use crate::shard::ShardId;
 use crate::sharded_executor::{
-    ShardedJoinHandle, ShardedSpawnError, ShardedSubmitter, current_executor_shard,
+    ShardedJoinHandle, ShardedOperationError, ShardedSpawnError, ShardedSubmitter,
+    current_executor_shard, join_all_shards,
 };
 
 /// One value per shard, accessed only on the owning shard executor.
@@ -118,6 +119,50 @@ where
         Ok(handles)
     }
 
+    /// Runs one operation per shard and collects shard-tagged outputs.
+    pub async fn map_all<R, F>(
+        &self,
+        operation: F,
+    ) -> Result<Vec<(ShardId, R)>, ShardedOperationError>
+    where
+        R: Send + 'static,
+        F: FnMut(ShardId, &mut T) -> R + Send + Clone + 'static,
+    {
+        let handles = self
+            .with_all(operation)
+            .map_err(ShardedOperationError::Submit)?;
+        join_all_shards(handles)
+            .await
+            .map_err(ShardedOperationError::Join)
+    }
+
+    /// Runs one operation per shard and reduces the shard-tagged outputs into
+    /// one value.
+    pub async fn map_reduce_all<R, F, Acc, Reduce>(
+        &self,
+        operation: F,
+        mut initial: Acc,
+        mut reduce: Reduce,
+    ) -> Result<Acc, ShardedOperationError>
+    where
+        R: Send + 'static,
+        F: FnMut(ShardId, &mut T) -> R + Send + Clone + 'static,
+        Reduce: FnMut(Acc, ShardId, R) -> Acc,
+    {
+        let outputs = join_all_shards(
+            self.with_all(operation)
+                .map_err(ShardedOperationError::Submit)?,
+        )
+        .await
+        .map_err(ShardedOperationError::Join)?;
+
+        for (shard_id, output) in outputs {
+            initial = reduce(initial, shard_id, output);
+        }
+
+        Ok(initial)
+    }
+
     fn cell_for(&self, shard_id: ShardId) -> Result<&ShardLocalSlot<T>, ShardedSpawnError> {
         self.shards
             .get(shard_id.0)
@@ -199,6 +244,29 @@ mod tests {
             error,
             crate::sharded_executor::ShardedSpawnError::InvalidShardId(3)
         );
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn shard_local_map_reduce_runs_on_owning_shards() {
+        let runtime = ShardedExecutor::start(4).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |shard_id| shard_id.0);
+
+        let total = block_on(local.map_reduce_all(
+            |shard_id, value| {
+                *value += 1;
+                shard_id.0 + *value
+            },
+            0usize,
+            |sum, _shard_id, value| sum + value,
+        ))
+        .unwrap();
+
+        assert_eq!(total, 16);
 
         drop(local);
         drop(submitter);

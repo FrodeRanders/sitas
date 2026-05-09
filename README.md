@@ -44,6 +44,8 @@ standard library:
   the shard-tagged outputs
 - shard-local state cells that run synchronous mutations on the owning shard
   executor without protecting the state with a mutex
+- shard-local map/reduce helpers for collecting or reducing outputs from
+  shard-owned state
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
