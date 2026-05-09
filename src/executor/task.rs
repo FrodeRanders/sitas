@@ -5,10 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use super::{
-    BoxFuture, CURRENT_SCHEDULER, PanicHandler, Scheduler, TaskId, TaskSnapshot, TaskStatus,
-    TaskWait,
-};
+use super::scheduler::{Scheduler, set_current_scheduler};
+use super::{BoxFuture, PanicHandler, TaskId, TaskSnapshot, TaskStatus, TaskWait};
 
 thread_local! {
     static CURRENT_TASK: RefCell<Option<Arc<Task>>> = const { RefCell::new(None) };
@@ -91,10 +89,7 @@ impl Task {
             future
         };
 
-        let scheduler = Arc::clone(&self.scheduler);
-        CURRENT_SCHEDULER.with(|current| {
-            *current.borrow_mut() = Some(scheduler);
-        });
+        set_current_scheduler(Some(Arc::clone(&self.scheduler)));
         CURRENT_TASK.with(|current| {
             *current.borrow_mut() = Some(Arc::clone(&self));
         });
@@ -105,9 +100,7 @@ impl Task {
         CURRENT_TASK.with(|current| {
             *current.borrow_mut() = None;
         });
-        CURRENT_SCHEDULER.with(|current| {
-            *current.borrow_mut() = None;
-        });
+        set_current_scheduler(None);
 
         let poll_finished_at = Instant::now();
         let poll_duration = poll_finished_at.saturating_duration_since(poll_started_at);
