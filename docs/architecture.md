@@ -151,6 +151,12 @@ the mapped futures on the target shard executors, but they hide the
 submit-and-join plumbing and return either shard-tagged outputs or one reduced
 value.
 
+`shard_local` adds one owned value per executor shard. Access is routed through
+the sharded submitter and the closure runs synchronously on the owning shard,
+receiving `&mut T`. The implementation uses an internal `UnsafeCell` with a
+runtime shard check rather than a mutex; references to the local value cannot
+escape the closure or cross an `.await`.
+
 Executor observability is deliberately snapshot-based instead of tracing-based
 for now. `TaskSnapshot` exposes each observable task's id, optional name,
 lifecycle state, last known wait interest, poll count, accumulated poll time,

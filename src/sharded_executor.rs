@@ -464,6 +464,10 @@ pub struct ShardedJoinHandle<T> {
 }
 
 impl<T> ShardedJoinHandle<T> {
+    pub(crate) fn new(shard_id: ShardId, handle: JoinHandle<T>) -> Self {
+        Self { shard_id, handle }
+    }
+
     /// Returns the shard on which this task is running.
     pub fn shard_id(&self) -> ShardId {
         self.shard_id

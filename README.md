@@ -42,6 +42,8 @@ standard library:
   collecting shard-tagged outputs
 - map/reduce helpers for running one async computation per shard and reducing
   the shard-tagged outputs
+- shard-local state cells that run synchronous mutations on the owning shard
+  executor without protecting the state with a mutex
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
@@ -192,6 +194,12 @@ Run the shard map-reduce example:
 
 ```sh
 cargo run --example sharded_map_reduce
+```
+
+Run the shard-local state example:
+
+```sh
+cargo run --example shard_local
 ```
 
 Run the executor async accept helper example:

@@ -44,6 +44,8 @@ pub mod placement;
 pub mod runtime;
 /// Shard identifiers and shard-level types.
 pub mod shard;
+/// Shard-local async state helpers.
+pub mod shard_local;
 /// Shard-per-thread async executor runtime.
 pub mod sharded_executor;
 
@@ -61,6 +63,7 @@ pub use kv::{
 };
 pub use runtime::{DEFAULT_MAILBOX_CAPACITY, ReplyFuture, RuntimeSnapshot};
 pub use shard::{ShardId, ShardSnapshot};
+pub use shard_local::ShardLocal;
 pub use sharded_executor::{
     ShardedExecutor, ShardedExecutorObserver, ShardedExecutorShardSnapshot,
     ShardedExecutorSnapshot, ShardedJoinError, ShardedJoinHandle, ShardedOperationError,
