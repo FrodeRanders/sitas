@@ -1,7 +1,4 @@
-use sitas::{
-    ShardLocal, ShardedExecutor, TaskSnapshot, TaskStatus, TaskWait, executor::sleep,
-    join_all_shards,
-};
+use sitas::{ShardLocal, ShardedExecutor, TaskSnapshot, TaskStatus, TaskWait, executor::sleep};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let submitter = runtime.submitter();
     let local_counts = ShardLocal::new(submitter.clone(), |_| 0usize);
 
-    let handles = local_counts.spawn_named_workers(
+    let workers = local_counts.spawn_named_workers(
         |shard_id| format!("local-worker-{}", shard_id.0),
         |_shard_id, task_counts| async move {
             for _ in 0..3 {
@@ -57,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    for (shard_id, output) in sitas::executor::block_on(join_all_shards(handles))? {
+    for (shard_id, output) in sitas::executor::block_on(workers.join())? {
         let (_current_shard, value) = output?;
         println!("shard {} final value {}", shard_id.0, value);
     }

@@ -1,11 +1,11 @@
-use sitas::{ShardLocal, ShardedExecutor, join_all_shards};
+use sitas::{ShardLocal, ShardedExecutor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = ShardedExecutor::start(4)?;
     let submitter = runtime.submitter();
     let local_counts = ShardLocal::new(submitter.clone(), |shard_id| shard_id.0);
 
-    let handles = local_counts.spawn_workers(|expected_shard, task_counts| async move {
+    let workers = local_counts.spawn_workers(|expected_shard, task_counts| async move {
         task_counts.with_current(|current_shard, value| {
             assert_eq!(current_shard, expected_shard);
             *value += 10;
@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     })?;
 
-    for (shard_id, result) in sitas::executor::block_on(join_all_shards(handles))? {
+    for (shard_id, result) in sitas::executor::block_on(workers.join())? {
         let (_current_shard, message) = result?;
         println!("{}: {message}", shard_id.0);
     }

@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use crate::shard::ShardId;
 use crate::sharded_executor::{
-    ShardedJoinHandle, ShardedOperationError, ShardedSpawnError, ShardedSubmitter,
-    current_executor_shard, join_all_shards,
+    ShardedJoinError, ShardedJoinHandle, ShardedOperationError, ShardedSpawnError,
+    ShardedSubmitter, current_executor_shard, join_all_shards,
 };
 
 /// One value per shard, accessed only on the owning shard executor.
@@ -166,7 +166,7 @@ where
     pub fn spawn_workers<MakeFuture, Fut>(
         &self,
         make_future: MakeFuture,
-    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    ) -> Result<ShardLocalWorkers<Fut::Output>, ShardedSpawnError>
     where
         MakeFuture: FnMut(ShardId, ShardLocal<T>) -> Fut,
         Fut: Future + Send + 'static,
@@ -183,7 +183,7 @@ where
         &self,
         mut make_name: MakeName,
         mut make_future: MakeFuture,
-    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    ) -> Result<ShardLocalWorkers<Fut::Output>, ShardedSpawnError>
     where
         MakeName: FnMut(ShardId) -> String,
         MakeFuture: FnMut(ShardId, ShardLocal<T>) -> Fut,
@@ -206,7 +206,7 @@ where
             handles.push(handle);
         }
 
-        Ok(handles)
+        Ok(ShardLocalWorkers { handles })
     }
 
     /// Runs one operation per shard and collects shard-tagged outputs.
@@ -267,6 +267,72 @@ where
             .get(shard_id.0)
             .map(|slot| slot.cell.as_ref())
             .ok_or(ShardLocalAccessError::InvalidShardId(shard_id.0))
+    }
+}
+
+/// Join handle set for one shard-local worker per shard.
+#[must_use = "shard-local workers do nothing useful unless joined"]
+pub struct ShardLocalWorkers<T> {
+    handles: Vec<ShardedJoinHandle<T>>,
+}
+
+impl<T> ShardLocalWorkers<T> {
+    /// Returns the number of worker handles.
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Returns true when there are no worker handles.
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    /// Returns the shard ids represented by this worker set.
+    pub fn shard_ids(&self) -> impl Iterator<Item = ShardId> + '_ {
+        self.handles.iter().map(ShardedJoinHandle::shard_id)
+    }
+
+    /// Consumes this worker set and returns the underlying shard-tagged handles.
+    pub fn into_handles(self) -> Vec<ShardedJoinHandle<T>> {
+        self.handles
+    }
+
+    /// Waits for every worker and returns shard-tagged outputs in shard order.
+    pub async fn join(self) -> Result<Vec<(ShardId, T)>, ShardedJoinError> {
+        join_all_shards(self.handles).await
+    }
+
+    /// Waits for every worker and reduces the shard-tagged outputs into one
+    /// value.
+    pub async fn map_reduce<Acc, Reduce>(
+        self,
+        mut initial: Acc,
+        mut reduce: Reduce,
+    ) -> Result<Acc, ShardedJoinError>
+    where
+        Reduce: FnMut(Acc, ShardId, T) -> Acc,
+    {
+        for (shard_id, output) in self.join().await? {
+            initial = reduce(initial, shard_id, output);
+        }
+
+        Ok(initial)
+    }
+}
+
+impl<T> fmt::Debug for ShardLocalWorkers<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardLocalWorkers")
+            .field("len", &self.handles.len())
+            .field(
+                "shard_ids",
+                &self
+                    .handles
+                    .iter()
+                    .map(ShardedJoinHandle::shard_id)
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 
@@ -495,7 +561,7 @@ mod tests {
         let submitter = runtime.submitter();
         let local = ShardLocal::new(submitter.clone(), |shard_id| shard_id.0);
 
-        let handles = local
+        let workers = local
             .spawn_workers(|expected_shard, task_local| async move {
                 task_local
                     .with_current(|current_shard, value| {
@@ -507,7 +573,13 @@ mod tests {
             })
             .unwrap();
 
-        let outputs = block_on(join_all_shards(handles)).unwrap();
+        assert_eq!(workers.len(), 4);
+        assert_eq!(
+            workers.shard_ids().collect::<Vec<_>>(),
+            vec![ShardId(0), ShardId(1), ShardId(2), ShardId(3)]
+        );
+
+        let outputs = block_on(workers.join()).unwrap();
         assert_eq!(
             outputs,
             vec![
@@ -535,13 +607,43 @@ mod tests {
     }
 
     #[test]
+    fn shard_local_workers_can_reduce_outputs() {
+        let runtime = ShardedExecutor::start(3).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |shard_id| shard_id.0 + 1);
+
+        let workers = local
+            .spawn_workers(|_expected_shard, task_local| async move {
+                task_local
+                    .with_current(|_current_shard, value| {
+                        *value *= 10;
+                        *value
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+
+        let total = block_on(workers.map_reduce(0usize, |sum, _shard_id, output| {
+            let (_current_shard, value) = output;
+            sum + value
+        }))
+        .unwrap();
+
+        assert_eq!(total, 60);
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn named_shard_local_workers_are_observable() {
         let runtime = ShardedExecutor::start(2).unwrap();
         let observer = runtime.observer();
         let submitter = runtime.submitter();
         let local = ShardLocal::new(submitter.clone(), |_| 0usize);
 
-        let handles = local
+        let workers = local
             .spawn_named_workers(
                 |shard_id| format!("local-worker-{}", shard_id.0),
                 |_shard_id, task_local| async move {
@@ -570,7 +672,7 @@ mod tests {
 
         assert_eq!(task_names, vec!["local-worker-0", "local-worker-1"]);
 
-        let outputs = block_on(join_all_shards(handles)).unwrap();
+        let outputs = block_on(workers.join()).unwrap();
         assert_eq!(
             outputs,
             vec![

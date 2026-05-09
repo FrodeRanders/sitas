@@ -52,6 +52,7 @@ standard library:
   running on the owning shard executor
 - shard-local worker helpers that start one async task per shard with a cloned
   handle to the same shard-owned state
+- shard-local worker join sets that collect or reduce per-shard worker outputs
 - named shard-local workers that appear in dependency-free executor snapshots
   for long-running task observability
 - an idle-timeout async TCP server helper for cancellable accept loops
