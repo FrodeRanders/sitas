@@ -36,6 +36,8 @@ standard library:
   queue depth, timers, and I/O interests across shards
 - weak observer handles for monitoring shard executors without keeping them
   alive
+- cloneable sharded submitters that let work on one shard submit and await work
+  on another shard
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
@@ -168,6 +170,12 @@ Run the shard-per-thread observability example:
 
 ```sh
 cargo run --example sharded_observability
+```
+
+Run the cross-shard async submit example:
+
+```sh
+cargo run --example sharded_submit
 ```
 
 Run the executor async accept helper example:

@@ -87,6 +87,24 @@ impl ShardedExecutor {
         self.shards.len()
     }
 
+    /// Returns a cloneable handle for submitting work to executor shards.
+    ///
+    /// The returned handle owns spawner clones, so it keeps submission open
+    /// while it exists. This mirrors an explicit cross-shard capability: drop
+    /// all submitters when the runtime should drain and shut down.
+    pub fn submitter(&self) -> ShardedSubmitter {
+        ShardedSubmitter {
+            shards: self
+                .shards
+                .iter()
+                .map(|shard| ShardSubmitter {
+                    shard_id: shard.shard_id,
+                    spawner: shard.spawner.clone(),
+                })
+                .collect(),
+        }
+    }
+
     /// Spawns a task onto a specific executor shard.
     pub fn spawn_on<F>(&self, shard_id: ShardId, future: F) -> Result<(), ShardedSpawnError>
     where
@@ -192,6 +210,102 @@ impl ShardedExecutor {
         }
 
         join_all(self.joins.drain(..).collect())
+    }
+
+    fn spawner_for(&self, shard_id: ShardId) -> Result<&Spawner, ShardedSpawnError> {
+        let shard = self
+            .shards
+            .get(shard_id.0)
+            .ok_or(ShardedSpawnError::InvalidShardId(shard_id.0))?;
+
+        debug_assert_eq!(shard.shard_id, shard_id);
+        shard
+            .spawner
+            .as_ref()
+            .ok_or(ShardedSpawnError::Stopped(shard_id))
+    }
+}
+
+/// Cloneable handle for submitting work to a [`ShardedExecutor`].
+///
+/// A submitter is intentionally separate from the runtime owner. It can be
+/// moved into tasks so one shard can submit work to another shard and await the
+/// returned [`JoinHandle`]. Cloning a submitter clones the underlying shard
+/// spawners, so submitters keep shard executors accepting work until dropped.
+#[must_use = "dropping the submitter releases its shard spawners"]
+#[derive(Debug, Clone)]
+pub struct ShardedSubmitter {
+    shards: Vec<ShardSubmitter>,
+}
+
+#[derive(Debug, Clone)]
+struct ShardSubmitter {
+    shard_id: ShardId,
+    spawner: Option<Spawner>,
+}
+
+impl ShardedSubmitter {
+    /// Returns the number of shards this submitter can address.
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Submits a task to a specific shard.
+    pub fn submit_to<F>(&self, shard_id: ShardId, future: F) -> Result<(), ShardedSpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawner_for(shard_id)?
+            .spawn(future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
+    /// Submits a named task to a specific shard.
+    pub fn submit_named_to<F>(
+        &self,
+        shard_id: ShardId,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawner_for(shard_id)?
+            .spawn_named(name, future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
+    /// Submits a task to a specific shard and returns an awaitable handle for
+    /// its output.
+    pub fn submit_with_handle_to<F>(
+        &self,
+        shard_id: ShardId,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, ShardedSpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawner_for(shard_id)?
+            .spawn_with_handle(future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
+    /// Submits a named task to a specific shard and returns an awaitable handle
+    /// for its output.
+    pub fn submit_with_handle_named_to<F>(
+        &self,
+        shard_id: ShardId,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, ShardedSpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawner_for(shard_id)?
+            .spawn_with_handle_named(name, future)
+            .map_err(ShardedSpawnError::Spawn)
     }
 
     fn spawner_for(&self, shard_id: ShardId) -> Result<&Spawner, ShardedSpawnError> {
@@ -453,5 +567,44 @@ mod tests {
         let snapshot = observer.snapshot();
         assert!(!snapshot.running);
         assert!(snapshot.shards[0].executor.is_none());
+    }
+
+    #[test]
+    fn shard_task_can_submit_to_another_shard_and_await_result() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+        let task_submitter = submitter.clone();
+
+        let handle = runtime
+            .spawn_with_handle_on(ShardId(0), async move {
+                assert_eq!(current_executor_shard(), Some(ShardId(0)));
+
+                let remote = task_submitter
+                    .submit_with_handle_named_to(ShardId(1), "remote-work", async {
+                        current_executor_shard().unwrap()
+                    })
+                    .unwrap();
+                let remote_shard = remote.await.unwrap();
+
+                (current_executor_shard().unwrap(), remote_shard)
+            })
+            .unwrap();
+
+        assert_eq!(block_on(handle).unwrap(), (ShardId(0), ShardId(1)));
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn submitter_rejects_invalid_shard() {
+        let runtime = ShardedExecutor::start(1).unwrap();
+        let submitter = runtime.submitter();
+        let error = submitter
+            .submit_to(ShardId(3), async {})
+            .expect_err("invalid shard should fail");
+
+        assert_eq!(error, ShardedSpawnError::InvalidShardId(3));
+        drop(submitter);
+        runtime.stop().unwrap();
     }
 }

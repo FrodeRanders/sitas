@@ -122,12 +122,21 @@ direction:
   task count, timer count, I/O interest counts, and named task states
 - `observer` returns a weak monitoring handle that can snapshot the runtime
   without keeping shard threads alive
+- `submitter` returns a cloneable cross-shard submission handle so shard-local
+  tasks can submit work to another shard and await the result
 - stopping the runtime drops the owned spawners and joins the executor threads
 
 This is not CPU pinning yet, and it does not implement load balancing or
 scheduling classes. It establishes the first shared-nothing async shape: work is
 owned by a shard thread and remains on that shard unless callers explicitly
 submit different work to a different shard.
+
+`ShardedSubmitter` is the first explicit cross-shard async mechanism. A task on
+one shard can call `submit_with_handle_to` for another `ShardId`, then await the
+returned join handle. The remote future is polled by the target shard executor,
+and the awaiting task resumes on its original shard when the remote work
+completes. Submitters own spawner clones, so they are also explicit lifetime
+capabilities: they must be dropped before the runtime can fully drain.
 
 Executor observability is deliberately snapshot-based instead of tracing-based
 for now. `TaskSnapshot` exposes each observable task's id, optional name,

@@ -63,5 +63,5 @@ pub use runtime::{DEFAULT_MAILBOX_CAPACITY, ReplyFuture, RuntimeSnapshot};
 pub use shard::{ShardId, ShardSnapshot};
 pub use sharded_executor::{
     ShardedExecutor, ShardedExecutorObserver, ShardedExecutorShardSnapshot,
-    ShardedExecutorSnapshot, ShardedSpawnError, current_executor_shard,
+    ShardedExecutorSnapshot, ShardedSpawnError, ShardedSubmitter, current_executor_shard,
 };
