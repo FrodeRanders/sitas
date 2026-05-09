@@ -34,6 +34,8 @@ standard library:
   shard thread and places tasks explicitly by `ShardId`
 - dependency-free executor snapshots for named tasks, task states, poll counts,
   queue depth, timers, and I/O interests across shards
+- weak observer handles for monitoring shard executors without keeping them
+  alive
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers

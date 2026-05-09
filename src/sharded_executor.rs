@@ -11,7 +11,9 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::error::ShardError;
-use crate::executor::{ExecutorSnapshot, JoinHandle, SpawnError, Spawner, executor_and_spawner};
+use crate::executor::{
+    ExecutorObserver, ExecutorSnapshot, JoinHandle, SpawnError, Spawner, executor_and_spawner,
+};
 use crate::runtime::join_all;
 use crate::shard::ShardId;
 
@@ -159,6 +161,24 @@ impl ShardedExecutor {
         }
     }
 
+    /// Returns a weak observer handle for this sharded executor.
+    ///
+    /// The returned handle can be moved to monitoring code without keeping the
+    /// shard executors alive or counting as a live spawner.
+    pub fn observer(&self) -> ShardedExecutorObserver {
+        ShardedExecutorObserver {
+            shard_count: self.shard_count(),
+            shards: self
+                .shards
+                .iter()
+                .map(|shard| ShardedExecutorShardObserver {
+                    shard_id: shard.shard_id,
+                    executor: shard.spawner.as_ref().map(Spawner::observer),
+                })
+                .collect(),
+        }
+    }
+
     /// Stops all owned shard executors and joins their threads.
     pub fn stop(mut self) -> Result<(), ShardError> {
         self.shutdown()
@@ -185,6 +205,50 @@ impl ShardedExecutor {
             .spawner
             .as_ref()
             .ok_or(ShardedSpawnError::Stopped(shard_id))
+    }
+}
+
+/// Weak observer handle for a sharded executor runtime.
+///
+/// This handle is cloneable, can be moved to a monitoring thread, and does not
+/// prevent shard executors from shutting down.
+#[must_use]
+#[derive(Debug, Clone)]
+pub struct ShardedExecutorObserver {
+    shard_count: usize,
+    shards: Vec<ShardedExecutorShardObserver>,
+}
+
+#[derive(Debug, Clone)]
+struct ShardedExecutorShardObserver {
+    shard_id: ShardId,
+    executor: Option<ExecutorObserver>,
+}
+
+impl ShardedExecutorObserver {
+    /// Returns an owned point-in-time snapshot of all observable executor
+    /// shards.
+    pub fn snapshot(&self) -> ShardedExecutorSnapshot {
+        let mut running = false;
+        let shards = self
+            .shards
+            .iter()
+            .map(|shard| {
+                let executor = shard.executor.as_ref().and_then(ExecutorObserver::snapshot);
+                running |= executor.is_some();
+
+                ShardedExecutorShardSnapshot {
+                    shard_id: shard.shard_id,
+                    executor,
+                }
+            })
+            .collect();
+
+        ShardedExecutorSnapshot {
+            shard_count: self.shard_count,
+            running,
+            shards,
+        }
     }
 }
 
@@ -373,5 +437,21 @@ mod tests {
         assert_eq!(executor.timer_count, 1);
 
         runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn observer_snapshots_do_not_keep_shards_alive() {
+        let runtime = ShardedExecutor::start(1).unwrap();
+        let observer = runtime.observer();
+
+        let snapshot = observer.snapshot();
+        assert!(snapshot.running);
+        assert!(snapshot.shards[0].executor.is_some());
+
+        runtime.stop().unwrap();
+
+        let snapshot = observer.snapshot();
+        assert!(!snapshot.running);
+        assert!(snapshot.shards[0].executor.is_none());
     }
 }

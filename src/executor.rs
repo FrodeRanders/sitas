@@ -135,6 +135,25 @@ pub struct ExecutorSnapshot {
     pub tasks: Vec<TaskSnapshot>,
 }
 
+/// Weak observer handle for an executor.
+///
+/// Unlike [`Spawner`], this handle does not keep the executor alive and does
+/// not count as a live spawner. It is intended for monitoring code that should
+/// observe runtime state without affecting shutdown.
+#[derive(Debug, Clone)]
+pub struct ExecutorObserver {
+    scheduler: Weak<Scheduler>,
+}
+
+impl ExecutorObserver {
+    /// Returns an executor snapshot if the executor is still alive.
+    pub fn snapshot(&self) -> Option<ExecutorSnapshot> {
+        self.scheduler
+            .upgrade()
+            .map(|scheduler| scheduler.snapshot())
+    }
+}
+
 /// Error returned when a task cannot be submitted to an executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnError;
@@ -493,6 +512,13 @@ impl Spawner {
     pub fn snapshot(&self) -> ExecutorSnapshot {
         self.scheduler.snapshot()
     }
+
+    /// Returns a weak observer handle for this spawner's executor.
+    pub fn observer(&self) -> ExecutorObserver {
+        ExecutorObserver {
+            scheduler: Arc::downgrade(&self.scheduler),
+        }
+    }
 }
 
 /// Future returned by [`Spawner::spawn_with_handle`].
@@ -801,6 +827,13 @@ impl Executor {
     /// Returns an owned snapshot of this executor's scheduler and tasks.
     pub fn snapshot(&self) -> ExecutorSnapshot {
         self.scheduler.snapshot()
+    }
+
+    /// Returns a weak observer handle for this executor.
+    pub fn observer(&self) -> ExecutorObserver {
+        ExecutorObserver {
+            scheduler: Arc::downgrade(&self.scheduler),
+        }
     }
 
     /// Runs tasks until all spawners and runnable tasks are gone.

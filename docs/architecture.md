@@ -120,6 +120,8 @@ direction:
   current shard identity
 - `snapshot` returns owned per-shard executor snapshots with ready queue depth,
   task count, timer count, I/O interest counts, and named task states
+- `observer` returns a weak monitoring handle that can snapshot the runtime
+  without keeping shard threads alive
 - stopping the runtime drops the owned spawners and joins the executor threads
 
 This is not CPU pinning yet, and it does not implement load balancing or

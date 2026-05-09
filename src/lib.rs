@@ -52,7 +52,9 @@ pub use counter::{
     ShardedCounter, ShardedCounterConfig,
 };
 pub use error::ShardError;
-pub use executor::{ExecutorSnapshot, TaskId, TaskSnapshot, TaskStatus, TaskWait};
+pub use executor::{
+    ExecutorObserver, ExecutorSnapshot, TaskId, TaskSnapshot, TaskStatus, TaskWait,
+};
 pub use kv::{
     KvAllKeysReply, KvDeleteManyReply, KvGetManyReply, KvReply, KvShardSnapshotsReply,
     KvTotalLenReply, ShardedKv, ShardedKvConfig,
@@ -60,6 +62,6 @@ pub use kv::{
 pub use runtime::{DEFAULT_MAILBOX_CAPACITY, ReplyFuture, RuntimeSnapshot};
 pub use shard::{ShardId, ShardSnapshot};
 pub use sharded_executor::{
-    ShardedExecutor, ShardedExecutorShardSnapshot, ShardedExecutorSnapshot, ShardedSpawnError,
-    current_executor_shard,
+    ShardedExecutor, ShardedExecutorObserver, ShardedExecutorShardSnapshot,
+    ShardedExecutorSnapshot, ShardedSpawnError, current_executor_shard,
 };

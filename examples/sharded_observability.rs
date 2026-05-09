@@ -5,6 +5,7 @@ use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = ShardedExecutor::start(2)?;
+    let observer = runtime.observer();
 
     for task_idx in 0..4 {
         let shard_id = sitas::ShardId(task_idx % runtime.shard_count());
@@ -18,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for sample_idx in 0..5 {
         std::thread::sleep(Duration::from_millis(20));
-        let snapshot = runtime.snapshot();
+        let snapshot = observer.snapshot();
 
         println!("sample {sample_idx}: running={}", snapshot.running);
         for shard in &snapshot.shards {
