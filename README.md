@@ -40,6 +40,8 @@ standard library:
   on another shard
 - broadcast-style shard submission for running one async task per shard and
   collecting shard-tagged outputs
+- map/reduce helpers for running one async computation per shard and reducing
+  the shard-tagged outputs
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
@@ -184,6 +186,12 @@ Run the shard broadcast example:
 
 ```sh
 cargo run --example sharded_broadcast
+```
+
+Run the shard map-reduce example:
+
+```sh
+cargo run --example sharded_map_reduce
 ```
 
 Run the executor async accept helper example:

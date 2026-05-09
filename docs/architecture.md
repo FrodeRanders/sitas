@@ -145,6 +145,12 @@ target `ShardId`. `join_all_shards` awaits those handles in order and returns
 shard-tagged outputs, giving the runtime a small dependency-free equivalent of
 "run this on every shard and collect the replies."
 
+For callers that do not need direct handle ownership, `map_all`,
+`map_named_all`, and `map_reduce_all` provide the next layer up. They still run
+the mapped futures on the target shard executors, but they hide the
+submit-and-join plumbing and return either shard-tagged outputs or one reduced
+value.
+
 Executor observability is deliberately snapshot-based instead of tracing-based
 for now. `TaskSnapshot` exposes each observable task's id, optional name,
 lifecycle state, last known wait interest, poll count, accumulated poll time,

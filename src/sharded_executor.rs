@@ -382,6 +382,66 @@ impl ShardedSubmitter {
         Ok(handles)
     }
 
+    /// Runs one async computation per shard and collects shard-tagged outputs.
+    pub async fn map_all<MakeFuture, Fut>(
+        &self,
+        make_future: MakeFuture,
+    ) -> Result<Vec<(ShardId, Fut::Output)>, ShardedOperationError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let handles = self
+            .submit_with_handle_to_all(make_future)
+            .map_err(ShardedOperationError::Submit)?;
+        join_all_shards(handles)
+            .await
+            .map_err(ShardedOperationError::Join)
+    }
+
+    /// Runs one named async computation per shard and collects shard-tagged
+    /// outputs.
+    pub async fn map_named_all<MakeName, MakeFuture, Fut>(
+        &self,
+        make_name: MakeName,
+        make_future: MakeFuture,
+    ) -> Result<Vec<(ShardId, Fut::Output)>, ShardedOperationError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let handles = self
+            .submit_with_handle_named_to_all(make_name, make_future)
+            .map_err(ShardedOperationError::Submit)?;
+        join_all_shards(handles)
+            .await
+            .map_err(ShardedOperationError::Join)
+    }
+
+    /// Runs one async computation per shard and reduces the shard-tagged
+    /// outputs into one value.
+    pub async fn map_reduce_all<MakeFuture, Fut, Acc, Reduce>(
+        &self,
+        make_future: MakeFuture,
+        mut initial: Acc,
+        mut reduce: Reduce,
+    ) -> Result<Acc, ShardedOperationError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+        Reduce: FnMut(Acc, ShardId, Fut::Output) -> Acc,
+    {
+        for (shard_id, output) in self.map_all(make_future).await? {
+            initial = reduce(initial, shard_id, output);
+        }
+
+        Ok(initial)
+    }
+
     fn spawner_for(&self, shard_id: ShardId) -> Result<&Spawner, ShardedSpawnError> {
         let shard = self
             .shards
@@ -474,6 +534,33 @@ impl fmt::Display for ShardedJoinError {
 impl std::error::Error for ShardedJoinError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
+    }
+}
+
+/// Error returned by higher-level sharded operations.
+#[derive(Debug)]
+pub enum ShardedOperationError {
+    /// Failed while submitting work to a shard.
+    Submit(ShardedSpawnError),
+    /// Failed while joining shard work.
+    Join(ShardedJoinError),
+}
+
+impl fmt::Display for ShardedOperationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShardedOperationError::Submit(error) => write!(f, "{error}"),
+            ShardedOperationError::Join(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ShardedOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ShardedOperationError::Submit(error) => Some(error),
+            ShardedOperationError::Join(error) => Some(error),
+        }
     }
 }
 
@@ -808,6 +895,34 @@ mod tests {
                 (ShardId(3), 30)
             ]
         );
+
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn submitter_can_map_reduce_across_shards() {
+        let runtime = ShardedExecutor::start(4).unwrap();
+        let submitter = runtime.submitter();
+        let task_submitter = submitter.clone();
+
+        let handle = runtime
+            .spawn_with_handle_on(ShardId(0), async move {
+                task_submitter
+                    .map_reduce_all(
+                        |shard_id| async move {
+                            assert_eq!(current_executor_shard(), Some(shard_id));
+                            shard_id.0 + 1
+                        },
+                        0usize,
+                        |sum, _shard_id, value| sum + value,
+                    )
+                    .await
+                    .unwrap()
+            })
+            .unwrap();
+
+        assert_eq!(block_on(handle).unwrap(), 10);
 
         drop(submitter);
         runtime.stop().unwrap();

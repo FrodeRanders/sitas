@@ -21,6 +21,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example sharded_observability
         cargo run --example sharded_submit
         cargo run --example sharded_broadcast
+        cargo run --example sharded_map_reduce
         cargo run --example async_accept
         cargo run --example async_connect
         cargo run --example async_tcp_echo
