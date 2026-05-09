@@ -16,15 +16,37 @@ use crate::sharded_executor::{
 };
 
 /// One value per shard, accessed only on the owning shard executor.
+///
+/// Cloning this handle does not clone the underlying values. It creates another
+/// handle to the same per-shard cells and keeps the runtime accepting
+/// submissions through a cloned [`ShardedSubmitter`].
 #[must_use]
 pub struct ShardLocal<T> {
     shards: Vec<ShardLocalSlot<T>>,
     submitter: ShardedSubmitter,
 }
 
+impl<T> Clone for ShardLocal<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shards: self.shards.clone(),
+            submitter: self.submitter.clone(),
+        }
+    }
+}
+
 struct ShardLocalSlot<T> {
     shard_id: ShardId,
     cell: Arc<ShardLocalCell<T>>,
+}
+
+impl<T> Clone for ShardLocalSlot<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shard_id: self.shard_id,
+            cell: Arc::clone(&self.cell),
+        }
+    }
 }
 
 struct ShardLocalCell<T> {
@@ -267,6 +289,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(total, 16);
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn cloned_shard_local_handle_shares_shard_values() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |_| 0usize);
+        let task_local = local.clone();
+
+        let remote_total = block_on(
+            submitter
+                .submit_with_handle_to(ShardId(0), async move {
+                    task_local
+                        .map_reduce_all(
+                            |_shard_id, value| {
+                                *value += 5;
+                                *value
+                            },
+                            0usize,
+                            |sum, _shard_id, value| sum + value,
+                        )
+                        .await
+                        .unwrap()
+                })
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(remote_total, 10);
+
+        let values = block_on(local.map_all(|_shard_id, value| *value)).unwrap();
+        assert_eq!(values, vec![(ShardId(0), 5), (ShardId(1), 5)]);
 
         drop(local);
         drop(submitter);

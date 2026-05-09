@@ -46,6 +46,8 @@ standard library:
   executor without protecting the state with a mutex
 - shard-local map/reduce helpers for collecting or reducing outputs from
   shard-owned state
+- cloneable shard-local service handles that can be moved into async shard
+  tasks while sharing the same per-shard state
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
@@ -202,6 +204,12 @@ Run the shard-local state example:
 
 ```sh
 cargo run --example shard_local
+```
+
+Run the cloneable shard-local handle example:
+
+```sh
+cargo run --example shard_local_handle
 ```
 
 Run the executor async accept helper example:
