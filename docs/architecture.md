@@ -162,7 +162,10 @@ handle to the same shard-owned values, so a service handle can be moved into
 long-running shard tasks without cloning the state itself. Code that is already
 running on a shard executor can call `ShardLocal::with_current` to access its
 own local value directly, avoiding a submit-and-reschedule round trip while
-keeping the runtime owner check.
+keeping the runtime owner check. `ShardLocal::spawn_workers` and
+`ShardLocal::spawn_named_workers` start one async worker per shard and pass each
+worker a cloned handle to the same shard-owned state, which gives long-running
+shard services a small shared-nothing startup pattern.
 
 Executor observability is deliberately snapshot-based instead of tracing-based
 for now. `TaskSnapshot` exposes each observable task's id, optional name,

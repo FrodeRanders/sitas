@@ -7,6 +7,7 @@
 
 use std::cell::UnsafeCell;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 
 use crate::shard::ShardId;
@@ -148,6 +149,58 @@ where
                     shard_id,
                     format!("shard-local-{}", shard_id.0),
                     async move { cell.with_mut(|value| operation(shard_id, value)) },
+                )
+                .map(|handle| ShardedJoinHandle::new(shard_id, handle))?;
+            handles.push(handle);
+        }
+
+        Ok(handles)
+    }
+
+    /// Starts one async worker on each shard.
+    ///
+    /// Each worker receives its [`ShardId`] and a clone of this handle. Worker
+    /// futures can call [`ShardLocal::with_current`] for direct access to their
+    /// own shard-local value, or use the regular submission helpers when they
+    /// need to work with other shards.
+    pub fn spawn_workers<MakeFuture, Fut>(
+        &self,
+        make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId, ShardLocal<T>) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        self.spawn_named_workers(
+            |shard_id| format!("shard-local-worker-{}", shard_id.0),
+            make_future,
+        )
+    }
+
+    /// Starts one named async worker on each shard.
+    pub fn spawn_named_workers<MakeName, MakeFuture, Fut>(
+        &self,
+        mut make_name: MakeName,
+        mut make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId, ShardLocal<T>) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let mut handles = Vec::with_capacity(self.shard_count());
+
+        for slot in &self.shards {
+            let shard_id = slot.shard_id;
+            let local = ShardLocal::clone(self);
+            let handle = self
+                .submitter
+                .submit_with_handle_named_to(
+                    shard_id,
+                    make_name(shard_id),
+                    make_future(shard_id, local),
                 )
                 .map(|handle| ShardedJoinHandle::new(shard_id, handle))?;
             handles.push(handle);
@@ -429,6 +482,51 @@ mod tests {
             .expect_err("non-shard caller should fail");
 
         assert_eq!(error, ShardLocalAccessError::NotOnShard);
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn shard_local_workers_run_on_each_owning_shard() {
+        let runtime = ShardedExecutor::start(4).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |shard_id| shard_id.0);
+
+        let handles = local
+            .spawn_workers(|expected_shard, task_local| async move {
+                task_local
+                    .with_current(|current_shard, value| {
+                        assert_eq!(current_shard, expected_shard);
+                        *value += 100;
+                        *value
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+
+        let outputs = block_on(join_all_shards(handles)).unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                (ShardId(0), (ShardId(0), 100)),
+                (ShardId(1), (ShardId(1), 101)),
+                (ShardId(2), (ShardId(2), 102)),
+                (ShardId(3), (ShardId(3), 103))
+            ]
+        );
+
+        let values = block_on(local.map_all(|_shard_id, value| *value)).unwrap();
+        assert_eq!(
+            values,
+            vec![
+                (ShardId(0), 100),
+                (ShardId(1), 101),
+                (ShardId(2), 102),
+                (ShardId(3), 103)
+            ]
+        );
 
         drop(local);
         drop(submitter);

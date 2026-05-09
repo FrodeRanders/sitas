@@ -50,6 +50,8 @@ standard library:
   tasks while sharing the same per-shard state
 - direct current-shard access for shard-local state when a task is already
   running on the owning shard executor
+- shard-local worker helpers that start one async task per shard with a cloned
+  handle to the same shard-owned state
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
@@ -218,6 +220,12 @@ Run the direct current-shard shard-local access example:
 
 ```sh
 cargo run --example shard_local_current
+```
+
+Run the shard-local worker example:
+
+```sh
+cargo run --example shard_local_workers
 ```
 
 Run the executor async accept helper example:
