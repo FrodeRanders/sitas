@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use crate::os::OsReactor;
 
 mod future;
+mod join;
 mod scheduler;
+mod scope;
 mod sync;
 mod task;
 #[cfg(unix)]
@@ -32,7 +34,10 @@ mod unix_io;
 pub use future::{
     Race, RaceOutput, Sleep, Timeout, TimeoutError, YieldNow, race, sleep, timeout, yield_now,
 };
+pub use join::{JoinError, JoinHandle};
+use join::{JoinState, complete_join};
 use scheduler::{Scheduler, set_current_scheduler};
+pub use scope::{TaskScope, TaskScopeError};
 pub use sync::{Notified, Notify, StopSource, StopToken, stop_pair};
 use task::Task;
 #[cfg(unix)]
@@ -51,7 +56,6 @@ pub use unix_io::{
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
 type PanicHandler = Box<dyn FnOnce(PanicPayload) + Send + 'static>;
-type JoinResult<T> = Result<T, JoinError>;
 
 const READY_POLL_BUDGET: usize = 64;
 
@@ -278,7 +282,7 @@ impl Spawner {
             })),
         )?;
 
-        Ok(JoinHandle { shared, task })
+        Ok(JoinHandle::new(shared, task))
     }
 
     fn spawn_with_panic_handler<F>(
@@ -313,300 +317,6 @@ impl Spawner {
         ExecutorObserver {
             scheduler: Arc::downgrade(&self.scheduler),
         }
-    }
-}
-
-/// Future returned by [`Spawner::spawn_with_handle`].
-#[must_use = "join handles do nothing unless polled or awaited"]
-pub struct JoinHandle<T> {
-    shared: Arc<Mutex<JoinState<T>>>,
-    task: Arc<Task>,
-}
-
-struct JoinState<T> {
-    result: Option<JoinResult<T>>,
-    waker: Option<Waker>,
-}
-
-/// Error returned by a [`JoinHandle`] when a spawned task did not produce a
-/// value.
-pub enum JoinError {
-    /// The task was aborted before it completed.
-    Cancelled,
-    /// The task panicked while it was being polled.
-    Panic(PanicPayload),
-}
-
-impl JoinError {
-    /// Returns true if the task was aborted before completion.
-    pub fn is_cancelled(&self) -> bool {
-        matches!(self, JoinError::Cancelled)
-    }
-
-    /// Returns true if the task panicked while it was being polled.
-    pub fn is_panic(&self) -> bool {
-        matches!(self, JoinError::Panic(_))
-    }
-
-    /// Consumes the error and returns the panic payload if the task panicked.
-    pub fn into_panic(self) -> Option<PanicPayload> {
-        match self {
-            JoinError::Cancelled => None,
-            JoinError::Panic(payload) => Some(payload),
-        }
-    }
-}
-
-impl fmt::Debug for JoinError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            JoinError::Cancelled => f.write_str("Cancelled"),
-            JoinError::Panic(_) => f.write_str("Panic(..)"),
-        }
-    }
-}
-
-impl fmt::Display for JoinError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            JoinError::Cancelled => write!(f, "task was cancelled"),
-            JoinError::Panic(_) => write!(f, "task panicked"),
-        }
-    }
-}
-
-impl Error for JoinError {}
-
-/// Error returned when a task scope cannot shut down cleanly.
-pub enum TaskScopeError {
-    /// A child task failed while the scope was waiting for shutdown.
-    Join(JoinError),
-    /// The shutdown deadline elapsed before all child tasks completed.
-    TimedOut,
-}
-
-impl TaskScopeError {
-    /// Returns true if shutdown timed out.
-    pub fn is_timed_out(&self) -> bool {
-        matches!(self, TaskScopeError::TimedOut)
-    }
-
-    /// Returns true if a child task failed while shutting down.
-    pub fn is_join_error(&self) -> bool {
-        matches!(self, TaskScopeError::Join(_))
-    }
-}
-
-impl From<JoinError> for TaskScopeError {
-    fn from(error: JoinError) -> Self {
-        TaskScopeError::Join(error)
-    }
-}
-
-impl fmt::Debug for TaskScopeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TaskScopeError::Join(error) => f.debug_tuple("Join").field(error).finish(),
-            TaskScopeError::TimedOut => f.write_str("TimedOut"),
-        }
-    }
-}
-
-impl fmt::Display for TaskScopeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TaskScopeError::Join(error) => write!(f, "task scope child failed: {error}"),
-            TaskScopeError::TimedOut => write!(f, "task scope shutdown timed out"),
-        }
-    }
-}
-
-impl Error for TaskScopeError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            TaskScopeError::Join(error) => Some(error),
-            TaskScopeError::TimedOut => None,
-        }
-    }
-}
-
-impl<T> fmt::Debug for JoinHandle<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JoinHandle").finish_non_exhaustive()
-    }
-}
-
-impl<T> JoinHandle<T> {
-    /// Aborts the task if it has not completed yet.
-    ///
-    /// Awaiting this handle after a successful abort returns
-    /// [`JoinError::Cancelled`].
-    pub fn abort(&self) -> bool {
-        if !self.task.cancel() {
-            return false;
-        }
-
-        complete_join(&self.shared, Err(JoinError::Cancelled));
-        true
-    }
-}
-
-impl<T> Future for JoinHandle<T> {
-    type Output = JoinResult<T>;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self
-            .shared
-            .lock()
-            .expect("join handle state mutex poisoned");
-
-        match state.result.take() {
-            Some(result) => Poll::Ready(result),
-            None => {
-                state.waker = Some(context.waker().clone());
-                Poll::Pending
-            }
-        }
-    }
-}
-
-fn complete_join<T>(shared: &Arc<Mutex<JoinState<T>>>, result: JoinResult<T>) {
-    let waker = {
-        let mut state = shared.lock().expect("join handle state mutex poisoned");
-        if state.result.is_some() {
-            None
-        } else {
-            state.result = Some(result);
-            state.waker.take()
-        }
-    };
-
-    if let Some(waker) = waker {
-        waker.wake();
-    }
-}
-
-/// Owns a group of spawned tasks and a shared cooperative stop signal.
-///
-/// Dropping a scope requests stop and aborts any children that are still owned
-/// by the scope. Use [`TaskScope::shutdown`] when children should observe the
-/// stop token and finish cooperatively.
-#[must_use = "task scopes abort their children when dropped"]
-pub struct TaskScope {
-    spawner: Spawner,
-    stop_source: StopSource,
-    stop_token: StopToken,
-    handles: Vec<JoinHandle<()>>,
-}
-
-impl TaskScope {
-    /// Creates a new scope that spawns tasks on `spawner`.
-    pub fn new(spawner: Spawner) -> Self {
-        let (stop_source, stop_token) = stop_pair();
-
-        Self {
-            spawner,
-            stop_source,
-            stop_token,
-            handles: Vec::new(),
-        }
-    }
-
-    /// Returns a clone of the scope's stop token.
-    pub fn stop_token(&self) -> StopToken {
-        self.stop_token.clone()
-    }
-
-    /// Returns true if this scope has already been asked to stop.
-    pub fn is_stopped(&self) -> bool {
-        self.stop_source.is_stopped()
-    }
-
-    /// Requests cooperative stop for tasks in this scope.
-    pub fn stop(&self) -> bool {
-        self.stop_source.stop()
-    }
-
-    /// Spawns a child task owned by this scope.
-    pub fn spawn<F>(&mut self, future: F) -> Result<(), SpawnError>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.handles.push(self.spawner.spawn_with_handle(future)?);
-        Ok(())
-    }
-
-    /// Spawns a child task that receives this scope's stop token.
-    pub fn spawn_with_stop<F, Fut>(&mut self, make_future: F) -> Result<(), SpawnError>
-    where
-        F: FnOnce(StopToken) -> Fut,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.spawn(make_future(self.stop_token()))
-    }
-
-    /// Aborts all child tasks still owned by this scope.
-    pub fn abort_all(&self) -> usize {
-        self.handles.iter().filter(|handle| handle.abort()).count()
-    }
-
-    /// Waits for all child tasks to finish.
-    pub async fn wait(mut self) -> Result<(), JoinError> {
-        for handle in self.handles.drain(..) {
-            handle.await?;
-        }
-
-        Ok(())
-    }
-
-    /// Requests cooperative stop and waits for all child tasks to finish.
-    pub async fn shutdown(self) -> Result<(), JoinError> {
-        self.stop();
-        self.wait().await
-    }
-
-    /// Requests cooperative stop and waits up to `duration` for children to
-    /// finish before aborting the still-owned tasks.
-    pub async fn shutdown_timeout(mut self, duration: Duration) -> Result<(), TaskScopeError> {
-        self.stop();
-        let deadline = Instant::now() + duration;
-
-        while let Some(mut handle) = self.handles.pop() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                handle.abort();
-                self.abort_all();
-                return Err(TaskScopeError::TimedOut);
-            }
-
-            match timeout(remaining, &mut handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(TaskScopeError::Join(error)),
-                Err(TimeoutError) => {
-                    handle.abort();
-                    self.abort_all();
-                    return Err(TaskScopeError::TimedOut);
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl fmt::Debug for TaskScope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TaskScope")
-            .field("stopped", &self.is_stopped())
-            .field("children", &self.handles.len())
-            .finish()
-    }
-}
-
-impl Drop for TaskScope {
-    fn drop(&mut self) {
-        self.stop();
-        self.abort_all();
     }
 }
 
