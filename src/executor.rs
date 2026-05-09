@@ -1688,27 +1688,20 @@ pub async fn serve_tcp_n<H, F>(
     listener: TcpListener,
     spawner: Spawner,
     connection_count: usize,
-    mut handler: H,
+    handler: H,
 ) -> io::Result<()>
 where
     H: FnMut(TcpStream, SocketAddr) -> F,
     F: Future<Output = io::Result<()>> + Send + 'static,
 {
-    listener.set_nonblocking(true)?;
-    let mut handlers = Vec::with_capacity(connection_count);
-
-    for _ in 0..connection_count {
-        let (stream, peer) = accept_async(&listener).await?;
-        handlers.push(
-            spawner
-                .spawn_with_handle(handler(stream, peer))
-                .map_err(spawn_error_to_io)?,
-        );
-    }
-
-    join_tcp_handlers(handlers).await?;
-
-    Ok(())
+    serve_tcp_n_with(
+        listener,
+        spawner,
+        connection_count,
+        TcpHandlerShutdown::Wait,
+        handler,
+    )
+    .await
 }
 
 /// Accepts `connection_count` TCP connections, then gives handler tasks up to
@@ -1722,25 +1715,20 @@ pub async fn serve_tcp_n_timeout<H, F>(
     spawner: Spawner,
     connection_count: usize,
     shutdown_timeout: Duration,
-    mut handler: H,
+    handler: H,
 ) -> io::Result<()>
 where
     H: FnMut(TcpStream, SocketAddr) -> F,
     F: Future<Output = io::Result<()>> + Send + 'static,
 {
-    listener.set_nonblocking(true)?;
-    let mut handlers = Vec::with_capacity(connection_count);
-
-    for _ in 0..connection_count {
-        let (stream, peer) = accept_async(&listener).await?;
-        handlers.push(
-            spawner
-                .spawn_with_handle(handler(stream, peer))
-                .map_err(spawn_error_to_io)?,
-        );
-    }
-
-    join_tcp_handlers_timeout(handlers, shutdown_timeout).await
+    serve_tcp_n_with(
+        listener,
+        spawner,
+        connection_count,
+        TcpHandlerShutdown::Timeout(shutdown_timeout),
+        handler,
+    )
+    .await
 }
 
 /// Accepts TCP connections until `idle_timeout` elapses without a new
@@ -1754,33 +1742,20 @@ pub async fn serve_tcp_until_idle<H, F>(
     listener: TcpListener,
     spawner: Spawner,
     idle_timeout: Duration,
-    mut handler: H,
+    handler: H,
 ) -> io::Result<usize>
 where
     H: FnMut(TcpStream, SocketAddr) -> F,
     F: Future<Output = io::Result<()>> + Send + 'static,
 {
-    listener.set_nonblocking(true)?;
-    let mut handlers = Vec::new();
-
-    loop {
-        match accept_timeout_async(&listener, idle_timeout).await {
-            Ok((stream, peer)) => {
-                handlers.push(
-                    spawner
-                        .spawn_with_handle(handler(stream, peer))
-                        .map_err(spawn_error_to_io)?,
-                );
-            }
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
-            Err(error) => return Err(error),
-        }
-    }
-
-    let accepted = handlers.len();
-    join_tcp_handlers(handlers).await?;
-
-    Ok(accepted)
+    serve_tcp_until_idle_with(
+        listener,
+        spawner,
+        idle_timeout,
+        TcpHandlerShutdown::Wait,
+        handler,
+    )
+    .await
 }
 
 /// Accepts TCP connections until `idle_timeout` elapses without a new
@@ -1794,33 +1769,20 @@ pub async fn serve_tcp_until_idle_timeout<H, F>(
     spawner: Spawner,
     idle_timeout: Duration,
     shutdown_timeout: Duration,
-    mut handler: H,
+    handler: H,
 ) -> io::Result<usize>
 where
     H: FnMut(TcpStream, SocketAddr) -> F,
     F: Future<Output = io::Result<()>> + Send + 'static,
 {
-    listener.set_nonblocking(true)?;
-    let mut handlers = Vec::new();
-
-    loop {
-        match accept_timeout_async(&listener, idle_timeout).await {
-            Ok((stream, peer)) => {
-                handlers.push(
-                    spawner
-                        .spawn_with_handle(handler(stream, peer))
-                        .map_err(spawn_error_to_io)?,
-                );
-            }
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
-            Err(error) => return Err(error),
-        }
-    }
-
-    let accepted = handlers.len();
-    join_tcp_handlers_timeout(handlers, shutdown_timeout).await?;
-
-    Ok(accepted)
+    serve_tcp_until_idle_with(
+        listener,
+        spawner,
+        idle_timeout,
+        TcpHandlerShutdown::Timeout(shutdown_timeout),
+        handler,
+    )
+    .await
 }
 
 /// Accepts TCP connections until `stop` completes, spawning one handler task
@@ -1834,33 +1796,13 @@ pub async fn serve_tcp_until_stopped<H, F>(
     listener: TcpListener,
     spawner: Spawner,
     stop: StopToken,
-    mut handler: H,
+    handler: H,
 ) -> io::Result<usize>
 where
     H: FnMut(TcpStream, SocketAddr) -> F,
     F: Future<Output = io::Result<()>> + Send + 'static,
 {
-    listener.set_nonblocking(true)?;
-    let mut handlers = Vec::new();
-
-    loop {
-        match race(accept_async(&listener), stop.clone()).await {
-            RaceOutput::First(Ok((stream, peer))) => {
-                handlers.push(
-                    spawner
-                        .spawn_with_handle(handler(stream, peer))
-                        .map_err(spawn_error_to_io)?,
-                );
-            }
-            RaceOutput::First(Err(error)) => return Err(error),
-            RaceOutput::Second(()) => break,
-        }
-    }
-
-    let accepted = handlers.len();
-    join_tcp_handlers(handlers).await?;
-
-    Ok(accepted)
+    serve_tcp_until_stopped_with(listener, spawner, stop, TcpHandlerShutdown::Wait, handler).await
 }
 
 /// Accepts TCP connections until `stop` completes, then gives handler tasks up
@@ -1877,6 +1819,97 @@ pub async fn serve_tcp_until_stopped_timeout<H, F>(
     spawner: Spawner,
     stop: StopToken,
     shutdown_timeout: Duration,
+    handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_until_stopped_with(
+        listener,
+        spawner,
+        stop,
+        TcpHandlerShutdown::Timeout(shutdown_timeout),
+        handler,
+    )
+    .await
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum TcpHandlerShutdown {
+    Wait,
+    Timeout(Duration),
+}
+
+#[cfg(unix)]
+async fn serve_tcp_n_with<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    connection_count: usize,
+    shutdown: TcpHandlerShutdown,
+    mut handler: H,
+) -> io::Result<()>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    let mut handlers = Vec::with_capacity(connection_count);
+
+    for _ in 0..connection_count {
+        let (stream, peer) = accept_async(&listener).await?;
+        handlers.push(
+            spawner
+                .spawn_with_handle(handler(stream, peer))
+                .map_err(spawn_error_to_io)?,
+        );
+    }
+
+    join_tcp_handlers_with(handlers, shutdown).await
+}
+
+#[cfg(unix)]
+async fn serve_tcp_until_idle_with<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    idle_timeout: Duration,
+    shutdown: TcpHandlerShutdown,
+    mut handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    listener.set_nonblocking(true)?;
+    let mut handlers = Vec::new();
+
+    loop {
+        match accept_timeout_async(&listener, idle_timeout).await {
+            Ok((stream, peer)) => {
+                handlers.push(
+                    spawner
+                        .spawn_with_handle(handler(stream, peer))
+                        .map_err(spawn_error_to_io)?,
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
+            Err(error) => return Err(error),
+        }
+    }
+
+    let accepted = handlers.len();
+    join_tcp_handlers_with(handlers, shutdown).await?;
+
+    Ok(accepted)
+}
+
+#[cfg(unix)]
+async fn serve_tcp_until_stopped_with<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    stop: StopToken,
+    shutdown: TcpHandlerShutdown,
     mut handler: H,
 ) -> io::Result<usize>
 where
@@ -1901,7 +1934,7 @@ where
     }
 
     let accepted = handlers.len();
-    join_tcp_handlers_timeout(handlers, shutdown_timeout).await?;
+    join_tcp_handlers_with(handlers, shutdown).await?;
 
     Ok(accepted)
 }
@@ -2034,10 +2067,24 @@ where
 }
 
 #[cfg(unix)]
-async fn join_tcp_handlers(handlers: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
+async fn join_tcp_handlers_with(
+    handlers: Vec<JoinHandle<io::Result<()>>>,
+    shutdown: TcpHandlerShutdown,
+) -> io::Result<()> {
+    match shutdown {
+        TcpHandlerShutdown::Wait => join_tcp_handlers_unbounded(handlers).await,
+        TcpHandlerShutdown::Timeout(duration) => {
+            join_tcp_handlers_timeout(handlers, duration).await
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn join_tcp_handlers_unbounded(handlers: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
     for handler in handlers {
         handler.await.map_err(join_error_to_io)??;
     }
+
     Ok(())
 }
 
