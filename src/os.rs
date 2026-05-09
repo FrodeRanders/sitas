@@ -5,6 +5,8 @@
 //! readiness waiting. A non-blocking pipe provides the wake source. Linux uses
 //! `epoll(7)` for readiness waits; other Unix targets currently use `poll(2)`.
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
@@ -13,6 +15,8 @@ use std::os::raw::c_short;
 use std::os::raw::{c_int, c_void};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[cfg(not(target_os = "linux"))]
@@ -183,6 +187,8 @@ pub struct OsReactor {
     write_fd: Arc<OwnedFd>,
     #[cfg(target_os = "linux")]
     epoll_fd: OwnedFd,
+    #[cfg(target_os = "linux")]
+    epoll_registry: Mutex<EpollRegistry>,
 }
 
 impl OsReactor {
@@ -192,13 +198,22 @@ impl OsReactor {
         #[cfg(target_os = "linux")]
         let epoll_fd = create_epoll()?;
         #[cfg(target_os = "linux")]
+        let epoll_registry = Mutex::new(EpollRegistry::new());
+        #[cfg(target_os = "linux")]
         register_epoll_fd(epoll_fd.raw(), read_fd.raw(), EPOLLIN, 0)?;
+        #[cfg(target_os = "linux")]
+        epoll_registry
+            .lock()
+            .expect("epoll registry mutex poisoned")
+            .insert_wake(read_fd.raw());
 
         Ok(Self {
             read_fd,
             write_fd: Arc::new(write_fd),
             #[cfg(target_os = "linux")]
             epoll_fd,
+            #[cfg(target_os = "linux")]
+            epoll_registry,
         })
     }
 
@@ -254,7 +269,8 @@ impl OsReactor {
     ) -> io::Result<OsEvent> {
         let timeout_ms = timeout_to_wait_ms(timeout);
         let interests = EpollInterests::new(read_fds, write_fds);
-        let _registration = register_epoll_interests(self.epoll_fd.raw(), &interests)?;
+        let registration =
+            register_epoll_interests(self.epoll_fd.raw(), &self.epoll_registry, &interests)?;
 
         loop {
             let max_events = interests.len() + 1;
@@ -281,8 +297,8 @@ impl OsReactor {
                         woke = event.events & EPOLLIN != 0 && self.drain_wakes()?;
                         continue;
                     }
-                    let interest = interests
-                        .get((event.data - 1) as usize)
+                    let interest = registration
+                        .interest(event.data)
                         .expect("epoll returned an unknown interest index");
                     if interest.read && event.events & (EPOLLIN | EPOLLERR | EPOLLHUP) != 0 {
                         readable.push(interest.fd);
@@ -460,7 +476,7 @@ impl fmt::Debug for OsWaker {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct EpollInterest {
     fd: RawFd,
     read: bool,
@@ -506,10 +522,6 @@ impl EpollInterests {
         self.interests.iter()
     }
 
-    fn get(&self, index: usize) -> Option<&EpollInterest> {
-        self.interests.get(index)
-    }
-
     fn len(&self) -> usize {
         self.interests.len()
     }
@@ -526,15 +538,64 @@ fn add_epoll_interest(interests: &mut Vec<EpollInterest>, fd: RawFd, read: bool,
 }
 
 #[cfg(target_os = "linux")]
-struct EpollRegistration {
-    epoll_fd: RawFd,
-    registered_fds: Vec<RawFd>,
+#[derive(Debug)]
+struct EpollRegistry {
+    next_token: u64,
+    interests: HashMap<u64, EpollInterest>,
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for EpollRegistration {
+impl EpollRegistry {
+    fn new() -> Self {
+        Self {
+            next_token: 1,
+            interests: HashMap::new(),
+        }
+    }
+
+    fn insert_wake(&mut self, fd: RawFd) {
+        self.interests.insert(
+            0,
+            EpollInterest {
+                fd,
+                read: true,
+                write: false,
+            },
+        );
+    }
+
+    fn insert_temporary(&mut self, interest: EpollInterest) -> u64 {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.interests.insert(token, interest);
+        token
+    }
+
+    fn remove(&mut self, token: u64) -> Option<EpollInterest> {
+        self.interests.remove(&token)
+    }
+
+    fn get(&self, token: u64) -> Option<EpollInterest> {
+        self.interests.get(&token).copied()
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct EpollRegistration<'a> {
+    epoll_fd: RawFd,
+    registry: &'a Mutex<EpollRegistry>,
+    tokens: Vec<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for EpollRegistration<'_> {
     fn drop(&mut self) {
-        for fd in self.registered_fds.drain(..) {
+        let mut registry = self.registry.lock().expect("epoll registry mutex poisoned");
+
+        for token in self.tokens.drain(..) {
+            let Some(interest) = registry.remove(token) else {
+                continue;
+            };
             // SAFETY: `epoll_fd` is owned by the reactor and `fd` was
             // previously registered by this guard. The event pointer is unused
             // for `EPOLL_CTL_DEL` on Linux.
@@ -542,7 +603,7 @@ impl Drop for EpollRegistration {
                 epoll_ctl(
                     self.epoll_fd,
                     EPOLL_CTL_DEL,
-                    fd,
+                    interest.fd,
                     std::ptr::null_mut::<EpollEvent>(),
                 )
             };
@@ -551,18 +612,42 @@ impl Drop for EpollRegistration {
 }
 
 #[cfg(target_os = "linux")]
-fn register_epoll_interests(
+impl EpollRegistration<'_> {
+    fn interest(&self, token: u64) -> Option<EpollInterest> {
+        self.registry
+            .lock()
+            .expect("epoll registry mutex poisoned")
+            .get(token)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn register_epoll_interests<'a>(
     epoll_fd: RawFd,
+    registry: &'a Mutex<EpollRegistry>,
     interests: &EpollInterests,
-) -> io::Result<EpollRegistration> {
+) -> io::Result<EpollRegistration<'a>> {
     let mut registration = EpollRegistration {
         epoll_fd,
-        registered_fds: Vec::with_capacity(interests.len()),
+        registry,
+        tokens: Vec::with_capacity(interests.len()),
     };
 
-    for (index, interest) in interests.iter().enumerate() {
-        register_epoll_fd(epoll_fd, interest.fd, interest.events(), (index + 1) as u64)?;
-        registration.registered_fds.push(interest.fd);
+    for interest in interests.iter().copied() {
+        let token = {
+            let mut registry = registry.lock().expect("epoll registry mutex poisoned");
+            registry.insert_temporary(interest)
+        };
+
+        if let Err(error) = register_epoll_fd(epoll_fd, interest.fd, interest.events(), token) {
+            registry
+                .lock()
+                .expect("epoll registry mutex poisoned")
+                .remove(token);
+            return Err(error);
+        }
+
+        registration.tokens.push(token);
     }
 
     Ok(registration)
