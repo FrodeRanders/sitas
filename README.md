@@ -53,6 +53,8 @@ standard library:
 - shard-local worker helpers that start one async task per shard with a cloned
   handle to the same shard-owned state
 - shard-local worker join sets that collect or reduce per-shard worker outputs
+- stoppable shard-local workers that share a cooperative stop token across
+  shards
 - named shard-local workers that appear in dependency-free executor snapshots
   for long-running task observability
 - an idle-timeout async TCP server helper for cancellable accept loops
@@ -229,6 +231,12 @@ Run the shard-local worker example:
 
 ```sh
 cargo run --example shard_local_workers
+```
+
+Run the stoppable shard-local worker example:
+
+```sh
+cargo run --example shard_local_stoppable_workers
 ```
 
 Run the shard-local worker observability example:

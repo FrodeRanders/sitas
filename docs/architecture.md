@@ -167,9 +167,12 @@ keeping the runtime owner check. `ShardLocal::spawn_workers` and
 worker a cloned handle to the same shard-owned state, which gives long-running
 shard services a small shared-nothing startup pattern. They return
 `ShardLocalWorkers`, a small join set that can either collect shard-tagged
-worker outputs or reduce them into one value. Named shard-local workers use the
-existing executor task names, so they appear in shard snapshots with status,
-wait reason, and poll counters like other long-running tasks.
+worker outputs or reduce them into one value. `ShardLocal::spawn_stoppable_workers`
+and `ShardLocal::spawn_named_stoppable_workers` add one shared cooperative stop
+token across those per-shard workers and return `StoppableShardLocalWorkers`,
+which can request stop before joining or reducing outputs. Named shard-local
+workers use the existing executor task names, so they appear in shard snapshots
+with status, wait reason, and poll counters like other long-running tasks.
 
 Executor observability is deliberately snapshot-based instead of tracing-based
 for now. `TaskSnapshot` exposes each observable task's id, optional name,

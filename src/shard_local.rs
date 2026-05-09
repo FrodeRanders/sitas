@@ -10,6 +10,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::executor::{StopSource, StopToken, stop_pair};
 use crate::shard::ShardId;
 use crate::sharded_executor::{
     ShardedJoinError, ShardedJoinHandle, ShardedOperationError, ShardedSpawnError,
@@ -209,6 +210,61 @@ where
         Ok(ShardLocalWorkers { handles })
     }
 
+    /// Starts one stoppable async worker on each shard.
+    ///
+    /// Every worker receives the same cooperative stop token. Calling
+    /// [`StoppableShardLocalWorkers::stop`] wakes workers waiting on that token.
+    pub fn spawn_stoppable_workers<MakeFuture, Fut>(
+        &self,
+        make_future: MakeFuture,
+    ) -> Result<StoppableShardLocalWorkers<Fut::Output>, ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId, ShardLocal<T>, StopToken) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        self.spawn_named_stoppable_workers(
+            |shard_id| format!("shard-local-worker-{}", shard_id.0),
+            make_future,
+        )
+    }
+
+    /// Starts one named stoppable async worker on each shard.
+    pub fn spawn_named_stoppable_workers<MakeName, MakeFuture, Fut>(
+        &self,
+        mut make_name: MakeName,
+        mut make_future: MakeFuture,
+    ) -> Result<StoppableShardLocalWorkers<Fut::Output>, ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId, ShardLocal<T>, StopToken) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let (stop_source, stop_token) = stop_pair();
+        let mut handles = Vec::with_capacity(self.shard_count());
+
+        for slot in &self.shards {
+            let shard_id = slot.shard_id;
+            let local = ShardLocal::clone(self);
+            let token = stop_token.clone();
+            let handle = self
+                .submitter
+                .submit_with_handle_named_to(
+                    shard_id,
+                    make_name(shard_id),
+                    make_future(shard_id, local, token),
+                )
+                .map(|handle| ShardedJoinHandle::new(shard_id, handle))?;
+            handles.push(handle);
+        }
+
+        Ok(StoppableShardLocalWorkers {
+            stop_source,
+            workers: ShardLocalWorkers { handles },
+        })
+    }
+
     /// Runs one operation per shard and collects shard-tagged outputs.
     pub async fn map_all<R, F>(
         &self,
@@ -332,6 +388,91 @@ impl<T> fmt::Debug for ShardLocalWorkers<T> {
                     .map(ShardedJoinHandle::shard_id)
                     .collect::<Vec<_>>(),
             )
+            .finish()
+    }
+}
+
+/// Stoppable join handle set for one shard-local worker per shard.
+#[must_use = "stoppable shard-local workers do nothing useful unless stopped or joined"]
+pub struct StoppableShardLocalWorkers<T> {
+    stop_source: StopSource,
+    workers: ShardLocalWorkers<T>,
+}
+
+impl<T> StoppableShardLocalWorkers<T> {
+    /// Returns the number of worker handles.
+    pub fn len(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Returns true when there are no worker handles.
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
+    /// Returns true if cooperative stop has already been requested.
+    pub fn is_stopped(&self) -> bool {
+        self.stop_source.is_stopped()
+    }
+
+    /// Requests cooperative stop for all workers.
+    pub fn stop(&self) -> bool {
+        self.stop_source.stop()
+    }
+
+    /// Returns the shard ids represented by this worker set.
+    pub fn shard_ids(&self) -> impl Iterator<Item = ShardId> + '_ {
+        self.workers.shard_ids()
+    }
+
+    /// Consumes this value and returns the non-stoppable worker join set.
+    pub fn into_workers(self) -> ShardLocalWorkers<T> {
+        self.workers
+    }
+
+    /// Waits for every worker and returns shard-tagged outputs in shard order.
+    pub async fn join(self) -> Result<Vec<(ShardId, T)>, ShardedJoinError> {
+        self.workers.join().await
+    }
+
+    /// Requests cooperative stop, then waits for every worker.
+    pub async fn stop_and_join(self) -> Result<Vec<(ShardId, T)>, ShardedJoinError> {
+        self.stop();
+        self.join().await
+    }
+
+    /// Waits for every worker and reduces the shard-tagged outputs into one
+    /// value.
+    pub async fn map_reduce<Acc, Reduce>(
+        self,
+        initial: Acc,
+        reduce: Reduce,
+    ) -> Result<Acc, ShardedJoinError>
+    where
+        Reduce: FnMut(Acc, ShardId, T) -> Acc,
+    {
+        self.workers.map_reduce(initial, reduce).await
+    }
+
+    /// Requests cooperative stop, then reduces all worker outputs.
+    pub async fn stop_and_map_reduce<Acc, Reduce>(
+        self,
+        initial: Acc,
+        reduce: Reduce,
+    ) -> Result<Acc, ShardedJoinError>
+    where
+        Reduce: FnMut(Acc, ShardId, T) -> Acc,
+    {
+        self.stop();
+        self.map_reduce(initial, reduce).await
+    }
+}
+
+impl<T> fmt::Debug for StoppableShardLocalWorkers<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoppableShardLocalWorkers")
+            .field("stopped", &self.is_stopped())
+            .field("workers", &self.workers)
             .finish()
     }
 }
@@ -630,6 +771,72 @@ mod tests {
         .unwrap();
 
         assert_eq!(total, 60);
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn stoppable_shard_local_workers_stop_and_join() {
+        let runtime = ShardedExecutor::start(3).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |_| 0usize);
+
+        let workers = local
+            .spawn_stoppable_workers(|_expected_shard, task_local, stop| async move {
+                let (_current_shard, value) = task_local
+                    .with_current(|_current_shard, value| {
+                        *value += 1;
+                        *value
+                    })
+                    .unwrap();
+                stop.await;
+                value
+            })
+            .unwrap();
+
+        assert_eq!(workers.len(), 3);
+        assert!(!workers.is_stopped());
+        assert!(workers.stop());
+        assert!(!workers.stop());
+        assert!(workers.is_stopped());
+
+        let outputs = block_on(workers.join()).unwrap();
+        assert_eq!(
+            outputs,
+            vec![(ShardId(0), 1), (ShardId(1), 1), (ShardId(2), 1)]
+        );
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn stoppable_shard_local_workers_can_stop_and_reduce() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |_| 0usize);
+
+        let workers = local
+            .spawn_stoppable_workers(|_expected_shard, task_local, stop| async move {
+                let (_current_shard, value) = task_local
+                    .with_current(|_current_shard, value| {
+                        *value += 5;
+                        *value
+                    })
+                    .unwrap();
+                stop.await;
+                value
+            })
+            .unwrap();
+
+        let total =
+            block_on(workers.stop_and_map_reduce(0usize, |sum, _shard_id, value| sum + value))
+                .unwrap();
+
+        assert_eq!(total, 10);
 
         drop(local);
         drop(submitter);
