@@ -159,7 +159,10 @@ escape the closure or cross an `.await`. `ShardLocal::map_all` and
 `ShardLocal::map_reduce_all` provide the same collect-or-reduce convenience for
 stateful shard-local operations. Cloning a `ShardLocal<T>` creates another
 handle to the same shard-owned values, so a service handle can be moved into
-long-running shard tasks without cloning the state itself.
+long-running shard tasks without cloning the state itself. Code that is already
+running on a shard executor can call `ShardLocal::with_current` to access its
+own local value directly, avoiding a submit-and-reschedule round trip while
+keeping the runtime owner check.
 
 Executor observability is deliberately snapshot-based instead of tracing-based
 for now. `TaskSnapshot` exposes each observable task's id, optional name,

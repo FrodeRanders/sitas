@@ -91,6 +91,21 @@ where
         self.shards.len()
     }
 
+    /// Runs `operation` directly against the value owned by the current shard.
+    ///
+    /// This is the fast path for code that is already being polled by a
+    /// [`ShardedExecutor`](crate::ShardedExecutor) shard thread. The closure is
+    /// synchronous, so the borrowed local value cannot cross an `.await`.
+    pub fn with_current<R, F>(&self, operation: F) -> Result<(ShardId, R), ShardLocalAccessError>
+    where
+        F: FnOnce(ShardId, &mut T) -> R,
+    {
+        let shard_id = current_executor_shard().ok_or(ShardLocalAccessError::NotOnShard)?;
+        let cell = self.cell_for_current(shard_id)?;
+
+        Ok((shard_id, cell.with_mut(|value| operation(shard_id, value))))
+    }
+
     /// Runs `operation` against the value owned by `shard_id`.
     pub fn with_on<R, F>(
         &self,
@@ -190,6 +205,16 @@ where
             .get(shard_id.0)
             .ok_or(ShardedSpawnError::InvalidShardId(shard_id.0))
     }
+
+    fn cell_for_current(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<&ShardLocalCell<T>, ShardLocalAccessError> {
+        self.shards
+            .get(shard_id.0)
+            .map(|slot| slot.cell.as_ref())
+            .ok_or(ShardLocalAccessError::InvalidShardId(shard_id.0))
+    }
 }
 
 impl<T> fmt::Debug for ShardLocal<T> {
@@ -199,6 +224,31 @@ impl<T> fmt::Debug for ShardLocal<T> {
             .finish_non_exhaustive()
     }
 }
+
+/// Error returned when shard-local state cannot be accessed directly from the
+/// current thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardLocalAccessError {
+    /// The caller is not currently running on a sharded executor thread.
+    NotOnShard,
+    /// The current shard id is outside this shard-local handle's shard set.
+    InvalidShardId(usize),
+}
+
+impl fmt::Display for ShardLocalAccessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShardLocalAccessError::NotOnShard => {
+                write!(f, "not running on a sharded executor thread")
+            }
+            ShardLocalAccessError::InvalidShardId(shard_id) => {
+                write!(f, "invalid shard id: {shard_id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ShardLocalAccessError {}
 
 impl<T> ShardLocalCell<T> {
     fn with_mut<R, F>(&self, operation: F) -> R
@@ -219,7 +269,7 @@ impl<T> ShardLocalCell<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::ShardLocal;
+    use super::{ShardLocal, ShardLocalAccessError};
     use crate::ShardId;
     use crate::executor::block_on;
     use crate::sharded_executor::{ShardedExecutor, join_all_shards};
@@ -325,6 +375,60 @@ mod tests {
 
         let values = block_on(local.map_all(|_shard_id, value| *value)).unwrap();
         assert_eq!(values, vec![(ShardId(0), 5), (ShardId(1), 5)]);
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn with_current_accesses_current_shard_without_submission() {
+        let runtime = ShardedExecutor::start(3).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |_| 0usize);
+        let task_local = local.clone();
+
+        let output = block_on(
+            submitter
+                .submit_with_handle_to(ShardId(2), async move {
+                    task_local
+                        .with_current(|shard_id, value| {
+                            *value += 11;
+                            (shard_id, *value)
+                        })
+                        .unwrap()
+                })
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(output, (ShardId(2), (ShardId(2), 11)));
+
+        let values = block_on(local.map_all(|_shard_id, value| *value)).unwrap();
+        assert_eq!(
+            values,
+            vec![(ShardId(0), 0), (ShardId(1), 0), (ShardId(2), 11)]
+        );
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn with_current_rejects_non_shard_thread() {
+        let runtime = ShardedExecutor::start(1).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |_| 0usize);
+
+        let error = local
+            .with_current(|_shard_id, value| {
+                *value += 1;
+                *value
+            })
+            .expect_err("non-shard caller should fail");
+
+        assert_eq!(error, ShardLocalAccessError::NotOnShard);
 
         drop(local);
         drop(submitter);

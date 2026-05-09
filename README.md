@@ -48,6 +48,8 @@ standard library:
   shard-owned state
 - cloneable shard-local service handles that can be moved into async shard
   tasks while sharing the same per-shard state
+- direct current-shard access for shard-local state when a task is already
+  running on the owning shard executor
 - an idle-timeout async TCP server helper for cancellable accept loops
 - bounded handler-join variants for fixed-count, idle-timeout, and stoppable
   TCP server helpers
@@ -210,6 +212,12 @@ Run the cloneable shard-local handle example:
 
 ```sh
 cargo run --example shard_local_handle
+```
+
+Run the direct current-shard shard-local access example:
+
+```sh
+cargo run --example shard_local_current
 ```
 
 Run the executor async accept helper example:
