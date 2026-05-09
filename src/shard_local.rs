@@ -9,12 +9,13 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::executor::{StopSource, StopToken, stop_pair};
 use crate::shard::ShardId;
 use crate::sharded_executor::{
-    ShardedJoinError, ShardedJoinHandle, ShardedOperationError, ShardedSpawnError,
-    ShardedSubmitter, current_executor_shard, join_all_shards,
+    ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
+    ShardedSpawnError, ShardedSubmitter, current_executor_shard, join_all_shards,
 };
 
 /// One value per shard, accessed only on the owning shard executor.
@@ -353,9 +354,52 @@ impl<T> ShardLocalWorkers<T> {
         self.handles
     }
 
+    /// Aborts all still-owned workers and returns how many were newly aborted.
+    pub fn abort_all(&self) -> usize {
+        self.handles.iter().filter(|handle| handle.abort()).count()
+    }
+
     /// Waits for every worker and returns shard-tagged outputs in shard order.
     pub async fn join(self) -> Result<Vec<(ShardId, T)>, ShardedJoinError> {
         join_all_shards(self.handles).await
+    }
+
+    /// Waits up to `duration` for all workers to finish, aborting still-owned
+    /// workers if the deadline elapses.
+    pub async fn join_timeout(
+        mut self,
+        duration: Duration,
+    ) -> Result<Vec<(ShardId, T)>, ShardLocalWorkerTimeoutError> {
+        let deadline = Instant::now() + duration;
+        let mut outputs = Vec::with_capacity(self.handles.len());
+
+        while let Some(handle) = self.handles.pop() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let shard_id = handle.shard_id();
+                handle.abort();
+                self.abort_all();
+                return Err(ShardLocalWorkerTimeoutError::TimedOut { shard_id });
+            }
+
+            match handle.join_timeout(remaining).await {
+                Ok(output) => outputs.push(output),
+                Err(error) if error.is_timed_out() => {
+                    self.abort_all();
+                    return Err(ShardLocalWorkerTimeoutError::TimedOut {
+                        shard_id: error.shard_id(),
+                    });
+                }
+                Err(ShardedJoinTimeoutError::Join(error)) => {
+                    self.abort_all();
+                    return Err(ShardLocalWorkerTimeoutError::Join(error));
+                }
+                Err(ShardedJoinTimeoutError::TimedOut { .. }) => unreachable!(),
+            }
+        }
+
+        outputs.reverse();
+        Ok(outputs)
     }
 
     /// Waits for every worker and reduces the shard-tagged outputs into one
@@ -369,6 +413,24 @@ impl<T> ShardLocalWorkers<T> {
         Reduce: FnMut(Acc, ShardId, T) -> Acc,
     {
         for (shard_id, output) in self.join().await? {
+            initial = reduce(initial, shard_id, output);
+        }
+
+        Ok(initial)
+    }
+
+    /// Waits up to `duration` for every worker and reduces the shard-tagged
+    /// outputs into one value.
+    pub async fn map_reduce_timeout<Acc, Reduce>(
+        self,
+        duration: Duration,
+        mut initial: Acc,
+        mut reduce: Reduce,
+    ) -> Result<Acc, ShardLocalWorkerTimeoutError>
+    where
+        Reduce: FnMut(Acc, ShardId, T) -> Acc,
+    {
+        for (shard_id, output) in self.join_timeout(duration).await? {
             initial = reduce(initial, shard_id, output);
         }
 
@@ -389,6 +451,58 @@ impl<T> fmt::Debug for ShardLocalWorkers<T> {
                     .collect::<Vec<_>>(),
             )
             .finish()
+    }
+}
+
+/// Error returned when a shard-local worker set fails or times out.
+#[derive(Debug)]
+pub enum ShardLocalWorkerTimeoutError {
+    /// A worker failed while being joined.
+    Join(ShardedJoinError),
+    /// The timeout elapsed and still-owned workers were aborted.
+    TimedOut {
+        /// Shard whose worker timed out.
+        shard_id: ShardId,
+    },
+}
+
+impl ShardLocalWorkerTimeoutError {
+    /// Returns the shard whose worker failed or timed out.
+    pub fn shard_id(&self) -> ShardId {
+        match self {
+            ShardLocalWorkerTimeoutError::Join(error) => error.shard_id(),
+            ShardLocalWorkerTimeoutError::TimedOut { shard_id } => *shard_id,
+        }
+    }
+
+    /// Returns true if shutdown timed out.
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, ShardLocalWorkerTimeoutError::TimedOut { .. })
+    }
+
+    /// Returns true if a worker failed while being joined.
+    pub fn is_join_error(&self) -> bool {
+        matches!(self, ShardLocalWorkerTimeoutError::Join(_))
+    }
+}
+
+impl fmt::Display for ShardLocalWorkerTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShardLocalWorkerTimeoutError::Join(error) => write!(f, "{error}"),
+            ShardLocalWorkerTimeoutError::TimedOut { shard_id } => {
+                write!(f, "shard-local worker on shard {} timed out", shard_id.0)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ShardLocalWorkerTimeoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ShardLocalWorkerTimeoutError::Join(error) => Some(error),
+            ShardLocalWorkerTimeoutError::TimedOut { .. } => None,
+        }
     }
 }
 
@@ -441,6 +555,15 @@ impl<T> StoppableShardLocalWorkers<T> {
         self.join().await
     }
 
+    /// Requests cooperative stop, then waits up to `duration` for every worker.
+    pub async fn stop_and_join_timeout(
+        self,
+        duration: Duration,
+    ) -> Result<Vec<(ShardId, T)>, ShardLocalWorkerTimeoutError> {
+        self.stop();
+        self.workers.join_timeout(duration).await
+    }
+
     /// Waits for every worker and reduces the shard-tagged outputs into one
     /// value.
     pub async fn map_reduce<Acc, Reduce>(
@@ -465,6 +588,23 @@ impl<T> StoppableShardLocalWorkers<T> {
     {
         self.stop();
         self.map_reduce(initial, reduce).await
+    }
+
+    /// Requests cooperative stop, then waits up to `duration` and reduces all
+    /// worker outputs.
+    pub async fn stop_and_map_reduce_timeout<Acc, Reduce>(
+        self,
+        duration: Duration,
+        initial: Acc,
+        reduce: Reduce,
+    ) -> Result<Acc, ShardLocalWorkerTimeoutError>
+    where
+        Reduce: FnMut(Acc, ShardId, T) -> Acc,
+    {
+        self.stop();
+        self.workers
+            .map_reduce_timeout(duration, initial, reduce)
+            .await
     }
 }
 
@@ -837,6 +977,58 @@ mod tests {
                 .unwrap();
 
         assert_eq!(total, 10);
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn stoppable_shard_local_workers_can_stop_and_join_with_timeout() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |_| 0usize);
+
+        let workers = local
+            .spawn_stoppable_workers(|_expected_shard, task_local, stop| async move {
+                let (_current_shard, value) = task_local
+                    .with_current(|_current_shard, value| {
+                        *value += 2;
+                        *value
+                    })
+                    .unwrap();
+                stop.await;
+                value
+            })
+            .unwrap();
+
+        let outputs = block_on(workers.stop_and_join_timeout(Duration::from_secs(1))).unwrap();
+        assert_eq!(outputs, vec![(ShardId(0), 2), (ShardId(1), 2)]);
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn stoppable_shard_local_worker_timeout_aborts_uncooperative_workers() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |_| 0usize);
+
+        let workers = local
+            .spawn_stoppable_workers(|_expected_shard, _task_local, _stop| async move {
+                loop {
+                    sleep(Duration::from_secs(1)).await;
+                }
+            })
+            .unwrap();
+
+        let error = block_on(workers.stop_and_join_timeout(Duration::from_millis(5)))
+            .expect_err("uncooperative workers should time out");
+
+        assert!(error.is_timed_out());
+        assert!(matches!(error.shard_id(), ShardId(0) | ShardId(1)));
 
         drop(local);
         drop(submitter);

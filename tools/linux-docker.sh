@@ -27,6 +27,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example shard_local_current
         cargo run --example shard_local_workers
         cargo run --example shard_local_stoppable_workers
+        cargo run --example shard_local_stoppable_workers_timeout
         cargo run --example shard_local_worker_observability
         cargo run --example async_accept
         cargo run --example async_connect

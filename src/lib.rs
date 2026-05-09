@@ -64,10 +64,12 @@ pub use kv::{
 pub use runtime::{DEFAULT_MAILBOX_CAPACITY, ReplyFuture, RuntimeSnapshot};
 pub use shard::{ShardId, ShardSnapshot};
 pub use shard_local::{
-    ShardLocal, ShardLocalAccessError, ShardLocalWorkers, StoppableShardLocalWorkers,
+    ShardLocal, ShardLocalAccessError, ShardLocalWorkerTimeoutError, ShardLocalWorkers,
+    StoppableShardLocalWorkers,
 };
 pub use sharded_executor::{
     ShardedExecutor, ShardedExecutorObserver, ShardedExecutorShardSnapshot,
-    ShardedExecutorSnapshot, ShardedJoinError, ShardedJoinHandle, ShardedOperationError,
-    ShardedSpawnError, ShardedSubmitter, current_executor_shard, join_all_shards,
+    ShardedExecutorSnapshot, ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError,
+    ShardedOperationError, ShardedSpawnError, ShardedSubmitter, current_executor_shard,
+    join_all_shards,
 };

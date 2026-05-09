@@ -55,6 +55,8 @@ standard library:
 - shard-local worker join sets that collect or reduce per-shard worker outputs
 - stoppable shard-local workers that share a cooperative stop token across
   shards
+- bounded stoppable worker shutdown that aborts still-running shard workers
+  when the deadline elapses
 - named shard-local workers that appear in dependency-free executor snapshots
   for long-running task observability
 - an idle-timeout async TCP server helper for cancellable accept loops
@@ -237,6 +239,12 @@ Run the stoppable shard-local worker example:
 
 ```sh
 cargo run --example shard_local_stoppable_workers
+```
+
+Run the bounded stoppable shard-local worker shutdown example:
+
+```sh
+cargo run --example shard_local_stoppable_workers_timeout
 ```
 
 Run the shard-local worker observability example:

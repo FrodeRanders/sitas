@@ -9,11 +9,12 @@ use std::fmt;
 use std::future::Future;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use crate::error::ShardError;
 use crate::executor::{
-    ExecutorObserver, ExecutorSnapshot, JoinError, JoinHandle, SpawnError, Spawner,
-    executor_and_spawner,
+    ExecutorObserver, ExecutorSnapshot, JoinError, JoinHandle, SpawnError, Spawner, TimeoutError,
+    executor_and_spawner, timeout,
 };
 use crate::runtime::join_all;
 use crate::shard::ShardId;
@@ -473,6 +474,11 @@ impl<T> ShardedJoinHandle<T> {
         self.shard_id
     }
 
+    /// Aborts the task if it has not completed yet.
+    pub fn abort(&self) -> bool {
+        self.handle.abort()
+    }
+
     /// Waits for this task and returns the shard-tagged output.
     pub async fn join(self) -> Result<(ShardId, T), ShardedJoinError> {
         self.handle
@@ -482,6 +488,27 @@ impl<T> ShardedJoinHandle<T> {
                 shard_id: self.shard_id,
                 error,
             })
+    }
+
+    /// Waits up to `duration` for this task and aborts it if the timeout
+    /// elapses.
+    pub async fn join_timeout(
+        mut self,
+        duration: Duration,
+    ) -> Result<(ShardId, T), ShardedJoinTimeoutError> {
+        match timeout(duration, &mut self.handle).await {
+            Ok(Ok(output)) => Ok((self.shard_id, output)),
+            Ok(Err(error)) => Err(ShardedJoinTimeoutError::Join(ShardedJoinError {
+                shard_id: self.shard_id,
+                error,
+            })),
+            Err(TimeoutError) => {
+                self.handle.abort();
+                Err(ShardedJoinTimeoutError::TimedOut {
+                    shard_id: self.shard_id,
+                })
+            }
+        }
     }
 }
 
@@ -538,6 +565,58 @@ impl fmt::Display for ShardedJoinError {
 impl std::error::Error for ShardedJoinError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
+    }
+}
+
+/// Error returned when a shard-tagged join handle fails or times out.
+#[derive(Debug)]
+pub enum ShardedJoinTimeoutError {
+    /// The task failed while being joined.
+    Join(ShardedJoinError),
+    /// The timeout elapsed and the task was aborted.
+    TimedOut {
+        /// Shard whose task timed out.
+        shard_id: ShardId,
+    },
+}
+
+impl ShardedJoinTimeoutError {
+    /// Returns the shard whose task failed or timed out.
+    pub fn shard_id(&self) -> ShardId {
+        match self {
+            ShardedJoinTimeoutError::Join(error) => error.shard_id(),
+            ShardedJoinTimeoutError::TimedOut { shard_id } => *shard_id,
+        }
+    }
+
+    /// Returns true if the join timed out.
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, ShardedJoinTimeoutError::TimedOut { .. })
+    }
+
+    /// Returns true if the task failed while being joined.
+    pub fn is_join_error(&self) -> bool {
+        matches!(self, ShardedJoinTimeoutError::Join(_))
+    }
+}
+
+impl fmt::Display for ShardedJoinTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShardedJoinTimeoutError::Join(error) => write!(f, "{error}"),
+            ShardedJoinTimeoutError::TimedOut { shard_id } => {
+                write!(f, "task on shard {} timed out", shard_id.0)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ShardedJoinTimeoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ShardedJoinTimeoutError::Join(error) => Some(error),
+            ShardedJoinTimeoutError::TimedOut { .. } => None,
+        }
     }
 }
 
