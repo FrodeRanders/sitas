@@ -53,6 +53,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example basic_counter
         cargo run --example os_reactor
         cargo run --example os_readable
+        cargo run --example os_uring
     '
 fi
 
