@@ -4,6 +4,9 @@ set -eu
 IMAGE="${SITAS_LINUX_IMAGE:-rust:latest}"
 PROJECT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 TARGET_DIR="${SITAS_LINUX_TARGET_DIR:-/tmp/sitas-target}"
+DOCKER_IO_URING="${SITAS_DOCKER_IO_URING:-0}"
+DOCKER_PRIVILEGED="${SITAS_DOCKER_PRIVILEGED:-0}"
+REQUIRE_IO_URING="${SITAS_REQUIRE_IO_URING:-$DOCKER_IO_URING}"
 
 if [ "$#" -eq 0 ]; then
     set -- sh -lc '
@@ -58,9 +61,32 @@ if [ "$#" -eq 0 ]; then
     '
 fi
 
+if [ "$DOCKER_PRIVILEGED" = "1" ]; then
+    exec docker run --rm \
+        --privileged \
+        -v "$PROJECT_DIR:/work" \
+        -w /work \
+        -e "CARGO_TARGET_DIR=$TARGET_DIR" \
+        -e "SITAS_REQUIRE_IO_URING=$REQUIRE_IO_URING" \
+        "$IMAGE" \
+        "$@"
+fi
+
+if [ "$DOCKER_IO_URING" = "1" ]; then
+    exec docker run --rm \
+        --security-opt seccomp=unconfined \
+        -v "$PROJECT_DIR:/work" \
+        -w /work \
+        -e "CARGO_TARGET_DIR=$TARGET_DIR" \
+        -e "SITAS_REQUIRE_IO_URING=$REQUIRE_IO_URING" \
+        "$IMAGE" \
+        "$@"
+fi
+
 exec docker run --rm \
     -v "$PROJECT_DIR:/work" \
     -w /work \
     -e "CARGO_TARGET_DIR=$TARGET_DIR" \
+    -e "SITAS_REQUIRE_IO_URING=$REQUIRE_IO_URING" \
     "$IMAGE" \
     "$@"

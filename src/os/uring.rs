@@ -679,7 +679,7 @@ impl IoUring {
         let sqe = self.prepare_sqe()?;
         write_u8(sqe, IORING_OP_TIMEOUT);
         write_u64(unsafe { sqe.add(SQE_ADDR_OFFSET) }, timeout_addr);
-        write_u32(unsafe { sqe.add(SQE_LEN_OFFSET).cast::<u32>() }, 0);
+        write_u32(unsafe { sqe.add(SQE_LEN_OFFSET).cast::<u32>() }, 1);
         write_u32(
             unsafe { sqe.add(SQE_TIMEOUT_FLAGS_OFFSET).cast::<u32>() },
             0,
@@ -1558,6 +1558,7 @@ mod tests {
         IoUring, IoUringDispatcher, IoUringOperationFuture, IoUringOperationKind,
         IoUringReadFuture, IoUringWriteFuture, block_on_io_uring, block_on_io_uring_all,
     };
+    use std::env;
     use std::future::Future;
     use std::os::raw::c_void;
     use std::os::unix::io::RawFd;
@@ -1570,6 +1571,7 @@ mod tests {
 
     const ETIME: i32 = 62;
     const ECANCELED: i32 = 125;
+    const REQUIRE_IO_URING_ENV: &str = "SITAS_REQUIRE_IO_URING";
 
     #[test]
     fn nop_completion_round_trip() {
@@ -1941,7 +1943,7 @@ mod tests {
             Pin::new(&mut cancel_future).poll(&mut context),
             Poll::Pending
         ));
-        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        assert!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap() >= 1);
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
         let Poll::Ready(cancel_completion) = Pin::new(&mut cancel_future).poll(&mut context) else {
@@ -1954,11 +1956,16 @@ mod tests {
         );
         assert_eq!(cancel_completion.result, 0);
 
-        let timeout_completion = dispatcher
-            .borrow_mut()
-            .ring_mut()
-            .wait_operation_completion(timeout)
-            .unwrap();
+        let timeout_completion = {
+            let completion = dispatcher.borrow_mut().take_completion(timeout);
+            completion.unwrap_or_else(|| {
+                dispatcher
+                    .borrow_mut()
+                    .ring_mut()
+                    .wait_operation_completion(timeout)
+                    .unwrap()
+            })
+        };
         assert_eq!(timeout_completion.kind, IoUringOperationKind::Timeout);
         assert_eq!(timeout_completion.result, -ECANCELED);
     }
@@ -2350,10 +2357,28 @@ mod tests {
                     Some(1) | Some(22) | Some(38) | Some(95)
                 ) =>
             {
+                if require_io_uring() {
+                    panic!(
+                        "io_uring unavailable while {REQUIRE_IO_URING_ENV}=1: {error} \
+                         (raw_os_error={:?})",
+                        error.raw_os_error()
+                    );
+                }
+                eprintln!(
+                    "skipping io_uring test: unavailable ({error}, raw_os_error={:?})",
+                    error.raw_os_error()
+                );
                 None
             }
             Err(error) => panic!("failed to create io_uring: {error}"),
         }
+    }
+
+    fn require_io_uring() -> bool {
+        matches!(
+            env::var(REQUIRE_IO_URING_ENV).as_deref(),
+            Ok("1" | "true" | "yes" | "on")
+        )
     }
 
     fn write_bytes(fd: RawFd, bytes: &[u8]) {
