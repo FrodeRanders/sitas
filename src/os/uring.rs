@@ -449,6 +449,8 @@ impl IoUring {
     /// Raw completions produced by untracked `queue_*` or `submit_*` calls are
     /// retained for [`IoUring::try_completion`] and [`IoUring::wait_completion`].
     pub fn try_operation_completion(&mut self) -> Option<IoUringOperationCompletion> {
+        self.drain_completions();
+
         if let Some(index) = self.completions.iter().position(|completion| {
             self.operations
                 .contains_key(&IoUringOperationId(completion.user_data))
@@ -459,13 +461,21 @@ impl IoUring {
                 .ok();
         }
 
-        let completion = self.pop_ring_completion()?;
-        let operation = IoUringOperationId(completion.user_data);
-        if self.operations.contains_key(&operation) {
-            return self.complete_operation(operation, completion).ok();
-        }
-        self.completions.push_back(completion);
         None
+    }
+
+    /// Drains all currently available kernel completions into the local queue.
+    ///
+    /// This does not block and does not submit pending SQEs. It is useful for
+    /// executor loops that want to harvest a batch of completions after a wait
+    /// has returned.
+    pub fn drain_completions(&mut self) -> usize {
+        let mut drained = 0;
+        while let Some(completion) = self.pop_ring_completion() {
+            self.completions.push_back(completion);
+            drained += 1;
+        }
+        drained
     }
 
     fn queue_buffer_operation(
@@ -828,6 +838,27 @@ mod tests {
     }
 
     #[test]
+    fn drain_completions_harvests_available_cqes() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        ring.queue_nop(0x51_7a_5_b).unwrap();
+        ring.queue_nop(0x51_7a_5_c).unwrap();
+        assert_eq!(ring.submit_pending().unwrap(), 2);
+
+        let first = ring.wait_completion().unwrap();
+        let drained = ring.drain_completions();
+        let second = ring.wait_completion().unwrap();
+
+        assert_eq!(first.user_data, 0x51_7a_5_b);
+        assert_eq!(first.result, 0);
+        assert_eq!(drained, 1);
+        assert_eq!(second.user_data, 0x51_7a_5_c);
+        assert_eq!(second.result, 0);
+    }
+
+    #[test]
     fn wait_completion_submits_queued_operations() {
         let Some(mut ring) = available_ring() else {
             return;
@@ -877,6 +908,26 @@ mod tests {
         assert_eq!(tracked.kind, IoUringOperationKind::Nop);
         assert_eq!(raw.user_data, 0x51_7a_5_a);
         assert_eq!(raw.result, 0);
+    }
+
+    #[test]
+    fn try_operation_completion_scans_past_raw_cqes() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        ring.queue_nop(0x51_7a_5_d).unwrap();
+        let operation = ring.queue_nop_operation().unwrap();
+        assert_eq!(ring.submit_pending().unwrap(), 2);
+
+        let raw = ring.wait_for_completion(0x51_7a_5_d).unwrap();
+        let tracked = ring.try_operation_completion().unwrap();
+
+        assert_eq!(raw.user_data, 0x51_7a_5_d);
+        assert_eq!(raw.result, 0);
+        assert_eq!(tracked.operation, operation);
+        assert_eq!(tracked.kind, IoUringOperationKind::Nop);
+        assert_eq!(tracked.result, 0);
     }
 
     #[test]
