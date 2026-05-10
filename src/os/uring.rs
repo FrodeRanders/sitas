@@ -8,7 +8,7 @@ use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
 use super::{OwnedFd, last_os_error};
@@ -998,6 +998,30 @@ impl fmt::Debug for IoUringDispatcher {
 /// Single-thread shared ownership for an [`IoUringDispatcher`].
 pub type SharedIoUringDispatcher = Rc<RefCell<IoUringDispatcher>>;
 
+/// Drives a future by polling it and waiting for completions through an
+/// `io_uring` dispatcher between pending polls.
+///
+/// This is a deliberately small bridge for experimenting with the Linux
+/// backend. The future is expected to make progress from completions dispatched
+/// by the provided dispatcher; otherwise this function may block indefinitely.
+pub fn block_on_io_uring<F>(dispatcher: SharedIoUringDispatcher, future: F) -> io::Result<F::Output>
+where
+    F: Future,
+{
+    let mut future = Box::pin(future);
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
+
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return Ok(output),
+            Poll::Pending => {
+                dispatcher.borrow_mut().wait_and_dispatch(1)?;
+            }
+        }
+    }
+}
+
 /// Future that completes when a tracked `io_uring` operation is dispatched.
 ///
 /// The future registers the current task waker with the shared dispatcher when
@@ -1465,11 +1489,29 @@ fn read_cqe(ptr: *mut IoUringCqe) -> IoUringCqe {
     unsafe { ptr.read_volatile() }
 }
 
+fn noop_waker() -> Waker {
+    // SAFETY: the vtable functions ignore the null data pointer and do not
+    // dereference or free anything.
+    unsafe { Waker::from_raw(noop_raw_waker()) }
+}
+
+fn noop_raw_waker() -> RawWaker {
+    RawWaker::new(ptr::null(), &NOOP_WAKER_VTABLE)
+}
+
+unsafe fn noop_clone(_: *const ()) -> RawWaker {
+    noop_raw_waker()
+}
+
+unsafe fn noop(_: *const ()) {}
+
+static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+
 #[cfg(test)]
 mod tests {
     use super::{
         IoUring, IoUringDispatcher, IoUringOperationFuture, IoUringOperationKind,
-        IoUringReadFuture, IoUringWriteFuture,
+        IoUringReadFuture, IoUringWriteFuture, block_on_io_uring,
     };
     use std::future::Future;
     use std::os::raw::c_void;
@@ -1754,6 +1796,24 @@ mod tests {
         assert_eq!(completion.operation, operation);
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn block_on_io_uring_drives_operation_future() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let future = IoUringOperationFuture::queue_nop(Rc::clone(&dispatcher)).unwrap();
+        let operation = future.operation();
+
+        let completion = block_on_io_uring(Rc::clone(&dispatcher), future).unwrap();
+
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.kind, IoUringOperationKind::Nop);
+        assert_eq!(completion.result, 0);
+        assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
+        assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
     }
 
     #[test]
