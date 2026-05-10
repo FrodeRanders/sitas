@@ -507,6 +507,41 @@ impl IoUring {
         self.pending_submissions
     }
 
+    /// Returns the number of completions already drained into the local queue.
+    ///
+    /// This does not inspect the kernel completion queue. Call
+    /// [`IoUring::drain_completions`] first when a fresh non-blocking sample is
+    /// needed.
+    pub fn pending_completions(&self) -> usize {
+        self.completions.len()
+    }
+
+    /// Returns the number of tracked operations whose completions have not yet
+    /// been consumed.
+    pub fn tracked_operations(&self) -> usize {
+        self.operations.len()
+    }
+
+    /// Returns a read-only snapshot of locally tracked ring state.
+    ///
+    /// The snapshot is intentionally local: it reports queued submissions,
+    /// locally buffered completions, and tracked operation metadata owned by
+    /// this `IoUring` value. It does not make a syscall or mutate the kernel
+    /// completion queue.
+    pub fn snapshot(&self) -> IoUringSnapshot {
+        let mut operation_kinds = IoUringOperationKindCounts::default();
+        for state in self.operations.values() {
+            operation_kinds.add(state.kind);
+        }
+
+        IoUringSnapshot {
+            pending_submissions: self.pending_submissions,
+            pending_completions: self.completions.len(),
+            tracked_operations: self.operations.len(),
+            operation_kinds,
+        }
+    }
+
     /// Submits all currently queued SQEs to the kernel.
     pub fn submit_pending(&mut self) -> io::Result<u32> {
         let mut submitted = 0;
@@ -872,6 +907,48 @@ pub enum IoUringOperationKind {
     },
 }
 
+/// Counts of tracked operations by kind in an [`IoUringSnapshot`].
+#[must_use]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IoUringOperationKindCounts {
+    /// Number of tracked no-op operations.
+    pub nops: usize,
+    /// Number of tracked read operations.
+    pub reads: usize,
+    /// Number of tracked write operations.
+    pub writes: usize,
+    /// Number of tracked timeout operations.
+    pub timeouts: usize,
+    /// Number of tracked cancellation operations.
+    pub cancellations: usize,
+}
+
+impl IoUringOperationKindCounts {
+    fn add(&mut self, kind: IoUringOperationKind) {
+        match kind {
+            IoUringOperationKind::Nop => self.nops += 1,
+            IoUringOperationKind::Read => self.reads += 1,
+            IoUringOperationKind::Write => self.writes += 1,
+            IoUringOperationKind::Timeout => self.timeouts += 1,
+            IoUringOperationKind::Cancel { .. } => self.cancellations += 1,
+        }
+    }
+}
+
+/// Read-only locally observable state for an [`IoUring`] instance.
+#[must_use]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IoUringSnapshot {
+    /// SQEs queued locally but not yet submitted to the kernel.
+    pub pending_submissions: u32,
+    /// CQEs drained into the local completion queue but not yet consumed.
+    pub pending_completions: usize,
+    /// Tracked operations whose completions have not yet been consumed.
+    pub tracked_operations: usize,
+    /// Tracked operations grouped by operation kind.
+    pub operation_kinds: IoUringOperationKindCounts,
+}
+
 /// Completion for a tracked `io_uring` operation.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1013,6 +1090,35 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_reports_local_operation_state() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        let timeout = ring
+            .queue_timeout_operation(Duration::from_secs(1))
+            .unwrap();
+        let cancel = ring.queue_cancel_operation(timeout).unwrap();
+
+        let snapshot = ring.snapshot();
+        assert_eq!(ring.pending_submissions(), 2);
+        assert_eq!(ring.pending_completions(), 0);
+        assert_eq!(ring.tracked_operations(), 2);
+        assert_eq!(snapshot.pending_submissions, 2);
+        assert_eq!(snapshot.pending_completions, 0);
+        assert_eq!(snapshot.tracked_operations, 2);
+        assert_eq!(snapshot.operation_kinds.timeouts, 1);
+        assert_eq!(snapshot.operation_kinds.cancellations, 1);
+
+        let cancel_completion = ring.wait_operation_completion(cancel).unwrap();
+        let timeout_completion = ring.wait_operation_completion(timeout).unwrap();
+
+        assert_eq!(cancel_completion.result, 0);
+        assert_eq!(timeout_completion.result, -ECANCELED);
+        assert_eq!(ring.snapshot().tracked_operations, 0);
+    }
+
+    #[test]
     fn drain_completions_harvests_available_cqes() {
         let Some(mut ring) = available_ring() else {
             return;
@@ -1045,6 +1151,8 @@ mod tests {
 
         assert_eq!(ring.wait_completions(2).unwrap(), 2);
         assert_eq!(ring.pending_submissions(), 0);
+        assert_eq!(ring.pending_completions(), 2);
+        assert_eq!(ring.snapshot().pending_completions, 2);
 
         let first = ring.wait_completion().unwrap();
         let second = ring.wait_completion().unwrap();
