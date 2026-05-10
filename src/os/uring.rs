@@ -105,6 +105,7 @@ pub struct IoUring {
     _cq_ring: Mapping,
     sqes: Mapping,
     completions: VecDeque<IoUringCompletion>,
+    pending_submissions: u32,
     sq_head: *mut u32,
     sq_tail: *mut u32,
     sq_ring_mask: *mut u32,
@@ -174,6 +175,7 @@ impl IoUring {
         Ok(Self {
             fd,
             completions: VecDeque::new(),
+            pending_submissions: 0,
             sq_head: offset_ptr(sq_base, params.sq_off.head),
             sq_tail: offset_ptr(sq_base, params.sq_off.tail),
             sq_ring_mask: offset_ptr(sq_base, params.sq_off.ring_mask),
@@ -190,10 +192,19 @@ impl IoUring {
 
     /// Submits a no-op operation tagged with `user_data`.
     pub fn submit_nop(&mut self, user_data: u64) -> io::Result<()> {
+        self.queue_nop(user_data)?;
+        self.submit_pending().map(|_| ())
+    }
+
+    /// Queues a no-op operation tagged with `user_data`.
+    ///
+    /// Queued operations are not visible to the kernel until
+    /// [`IoUring::submit_pending`] is called.
+    pub fn queue_nop(&mut self, user_data: u64) -> io::Result<()> {
         let sqe = self.prepare_sqe()?;
         write_u8(sqe, IORING_OP_NOP);
         write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
-        self.submit_one()
+        self.finish_sqe()
     }
 
     /// Submits one read operation tagged with `user_data`.
@@ -211,7 +222,31 @@ impl IoUring {
         offset: u64,
         user_data: u64,
     ) -> io::Result<()> {
-        self.submit_buffer_operation(
+        // SAFETY: the caller upholds the same buffer lifetime requirements for
+        // queuing as for submitting.
+        unsafe {
+            self.queue_read(fd, buffer, offset, user_data)?;
+        }
+        self.submit_pending().map(|_| ())
+    }
+
+    /// Queues one read operation tagged with `user_data`.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must remain valid and uniquely writable until the completion
+    /// for `user_data` has been observed. Dropping or mutating the buffer
+    /// before the completion arrives may let the kernel write through an
+    /// invalid or aliased pointer. The operation must also eventually be
+    /// submitted with [`IoUring::submit_pending`].
+    pub unsafe fn queue_read(
+        &mut self,
+        fd: RawFd,
+        buffer: &mut [u8],
+        offset: u64,
+        user_data: u64,
+    ) -> io::Result<()> {
+        self.queue_buffer_operation(
             IORING_OP_READ,
             fd,
             buffer.as_mut_ptr() as u64,
@@ -237,7 +272,31 @@ impl IoUring {
         offset: u64,
         user_data: u64,
     ) -> io::Result<()> {
-        self.submit_buffer_operation(
+        // SAFETY: the caller upholds the same buffer lifetime requirements for
+        // queuing as for submitting.
+        unsafe {
+            self.queue_write(fd, buffer, offset, user_data)?;
+        }
+        self.submit_pending().map(|_| ())
+    }
+
+    /// Queues one write operation tagged with `user_data`.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must remain valid and immutable until the completion for
+    /// `user_data` has been observed. Dropping or mutating the buffer before
+    /// the completion arrives may let the kernel read invalid or changing
+    /// memory. The operation must also eventually be submitted with
+    /// [`IoUring::submit_pending`].
+    pub unsafe fn queue_write(
+        &mut self,
+        fd: RawFd,
+        buffer: &[u8],
+        offset: u64,
+        user_data: u64,
+    ) -> io::Result<()> {
+        self.queue_buffer_operation(
             IORING_OP_WRITE,
             fd,
             buffer.as_ptr() as u64,
@@ -288,7 +347,32 @@ impl IoUring {
         self.wait_for_completion(user_data)
     }
 
-    fn submit_buffer_operation(
+    /// Returns the number of SQEs queued but not yet submitted to the kernel.
+    pub fn pending_submissions(&self) -> u32 {
+        self.pending_submissions
+    }
+
+    /// Submits all currently queued SQEs to the kernel.
+    pub fn submit_pending(&mut self) -> io::Result<u32> {
+        let mut submitted = 0;
+        while self.pending_submissions > 0 {
+            let requested = self.pending_submissions;
+            let result = self.enter(requested, 0, 0)?;
+            if result == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "io_uring accepted no pending submissions",
+                ));
+            }
+
+            let accepted = result.min(requested);
+            self.pending_submissions -= accepted;
+            submitted += accepted;
+        }
+        Ok(submitted)
+    }
+
+    fn queue_buffer_operation(
         &mut self,
         opcode: u8,
         fd: RawFd,
@@ -312,7 +396,7 @@ impl IoUring {
         write_u64(unsafe { sqe.add(SQE_ADDR_OFFSET) }, buffer_addr);
         write_u32(unsafe { sqe.add(SQE_LEN_OFFSET).cast::<u32>() }, len);
         write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
-        self.submit_one()
+        self.finish_sqe()
     }
 
     fn prepare_sqe(&mut self) -> io::Result<*mut u8> {
@@ -334,15 +418,23 @@ impl IoUring {
         Ok(sqe)
     }
 
-    fn submit_one(&self) -> io::Result<()> {
+    fn finish_sqe(&mut self) -> io::Result<()> {
+        self.pending_submissions = self
+            .pending_submissions
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("io_uring pending submission count overflow"))?;
+        Ok(())
+    }
+
+    fn enter(&self, to_submit: u32, min_complete: u32, flags: c_uint) -> io::Result<u32> {
         // SAFETY: the ring fd is owned by `self`; no signal mask is supplied.
         let result = unsafe {
             syscall(
                 SYS_IO_URING_ENTER,
                 self.fd.raw(),
-                1u32,
-                0u32,
-                0u32,
+                to_submit,
+                min_complete,
+                flags,
                 ptr::null::<c_void>(),
                 0usize,
             )
@@ -350,37 +442,16 @@ impl IoUring {
         if result < 0 {
             Err(last_os_error())
         } else {
-            Ok(())
+            Ok(result as u32)
         }
     }
 
     /// Waits for one completion queue entry.
     pub fn wait_completion(&mut self) -> io::Result<IoUringCompletion> {
-        loop {
-            if let Some(completion) = self.try_completion() {
-                return Ok(completion);
-            }
-
-            // SAFETY: the ring fd is owned by `self`; no signal mask is supplied.
-            let result = unsafe {
-                syscall(
-                    SYS_IO_URING_ENTER,
-                    self.fd.raw(),
-                    0u32,
-                    1u32,
-                    IORING_ENTER_GETEVENTS,
-                    ptr::null::<c_void>(),
-                    0usize,
-                )
-            };
-            if result < 0 {
-                let error = last_os_error();
-                if error.raw_os_error() == Some(super::EINTR) {
-                    continue;
-                }
-                return Err(error);
-            }
+        if let Some(completion) = self.try_completion() {
+            return Ok(completion);
         }
+        self.wait_ring_completion()
     }
 
     /// Waits for the completion tagged with `user_data`.
@@ -418,24 +489,13 @@ impl IoUring {
                 return Ok(completion);
             }
 
-            // SAFETY: the ring fd is owned by `self`; no signal mask is supplied.
-            let result = unsafe {
-                syscall(
-                    SYS_IO_URING_ENTER,
-                    self.fd.raw(),
-                    0u32,
-                    1u32,
-                    IORING_ENTER_GETEVENTS,
-                    ptr::null::<c_void>(),
-                    0usize,
-                )
-            };
-            if result < 0 {
-                let error = last_os_error();
-                if error.raw_os_error() == Some(super::EINTR) {
-                    continue;
+            let to_submit = self.pending_submissions;
+            match self.enter(to_submit, 1, IORING_ENTER_GETEVENTS) {
+                Ok(submitted) => {
+                    self.pending_submissions = self.pending_submissions.saturating_sub(submitted);
                 }
-                return Err(error);
+                Err(error) if error.raw_os_error() == Some(super::EINTR) => continue,
+                Err(error) => return Err(error),
             }
         }
     }
@@ -573,6 +633,47 @@ mod tests {
 
         assert_eq!(completion.user_data, 0x51_7a_5);
         assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn queued_nops_submit_as_batch() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        ring.queue_nop(0x51_7a_5_7).unwrap();
+        ring.queue_nop(0x51_7a_5_8).unwrap();
+
+        assert_eq!(ring.pending_submissions(), 2);
+        assert!(ring.try_completion().is_none());
+        assert_eq!(ring.submit_pending().unwrap(), 2);
+        assert_eq!(ring.pending_submissions(), 0);
+
+        let first = ring.wait_completion().unwrap();
+        let second = ring.wait_completion().unwrap();
+
+        assert_eq!(first.result, 0);
+        assert_eq!(second.result, 0);
+        assert_eq!(
+            [first.user_data, second.user_data],
+            [0x51_7a_5_7, 0x51_7a_5_8]
+        );
+    }
+
+    #[test]
+    fn wait_completion_submits_queued_operations() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        ring.queue_nop(0x51_7a_5_9).unwrap();
+        assert_eq!(ring.pending_submissions(), 1);
+
+        let completion = ring.wait_completion().unwrap();
+
+        assert_eq!(completion.user_data, 0x51_7a_5_9);
+        assert_eq!(completion.result, 0);
+        assert_eq!(ring.pending_submissions(), 0);
     }
 
     #[test]
