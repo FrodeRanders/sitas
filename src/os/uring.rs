@@ -1022,6 +1022,51 @@ where
     }
 }
 
+/// Drives a batch of futures with one `io_uring` dispatcher.
+///
+/// The futures are polled in input order on the current thread. Outputs are
+/// returned in the same order once every future has completed.
+pub fn block_on_io_uring_all<I, F>(
+    dispatcher: SharedIoUringDispatcher,
+    futures: I,
+) -> io::Result<Vec<F::Output>>
+where
+    I: IntoIterator<Item = F>,
+    F: Future,
+{
+    let mut futures: Vec<Option<Pin<Box<F>>>> = futures
+        .into_iter()
+        .map(|future| Some(Box::pin(future)))
+        .collect();
+    let mut outputs: Vec<Option<F::Output>> = (0..futures.len()).map(|_| None).collect();
+    let mut remaining = futures.len();
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
+
+    while remaining > 0 {
+        for (index, slot) in futures.iter_mut().enumerate() {
+            let Some(future) = slot.as_mut() else {
+                continue;
+            };
+
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                outputs[index] = Some(output);
+                *slot = None;
+                remaining -= 1;
+            }
+        }
+
+        if remaining > 0 {
+            dispatcher.borrow_mut().wait_and_dispatch(1)?;
+        }
+    }
+
+    Ok(outputs
+        .into_iter()
+        .map(|output| output.expect("completed future has output"))
+        .collect())
+}
+
 /// Future that completes when a tracked `io_uring` operation is dispatched.
 ///
 /// The future registers the current task waker with the shared dispatcher when
@@ -1511,7 +1556,7 @@ static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop,
 mod tests {
     use super::{
         IoUring, IoUringDispatcher, IoUringOperationFuture, IoUringOperationKind,
-        IoUringReadFuture, IoUringWriteFuture, block_on_io_uring,
+        IoUringReadFuture, IoUringWriteFuture, block_on_io_uring, block_on_io_uring_all,
     };
     use std::future::Future;
     use std::os::raw::c_void;
@@ -1812,6 +1857,30 @@ mod tests {
         assert_eq!(completion.operation, operation);
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(completion.result, 0);
+        assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
+        assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
+    }
+
+    #[test]
+    fn block_on_io_uring_all_drives_operation_futures() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let first = IoUringOperationFuture::queue_nop(Rc::clone(&dispatcher)).unwrap();
+        let first_operation = first.operation();
+        let second = IoUringOperationFuture::queue_nop(Rc::clone(&dispatcher)).unwrap();
+        let second_operation = second.operation();
+
+        let completions = block_on_io_uring_all(Rc::clone(&dispatcher), [first, second]).unwrap();
+
+        assert_eq!(completions.len(), 2);
+        assert_eq!(completions[0].operation, first_operation);
+        assert_eq!(completions[0].kind, IoUringOperationKind::Nop);
+        assert_eq!(completions[0].result, 0);
+        assert_eq!(completions[1].operation, second_operation);
+        assert_eq!(completions[1].kind, IoUringOperationKind::Nop);
+        assert_eq!(completions[1].result, 0);
         assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
         assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
     }

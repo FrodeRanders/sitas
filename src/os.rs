@@ -26,6 +26,7 @@ pub use uring::{
     IoUringOperationCompletion, IoUringOperationFuture, IoUringOperationId, IoUringOperationKind,
     IoUringOperationKindCounts, IoUringReadCompletion, IoUringReadFuture, IoUringSnapshot,
     IoUringWriteCompletion, IoUringWriteFuture, SharedIoUringDispatcher, block_on_io_uring,
+    block_on_io_uring_all,
 };
 
 #[cfg(not(target_os = "linux"))]
