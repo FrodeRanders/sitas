@@ -997,6 +997,26 @@ impl IoUringOperationFuture {
         }
     }
 
+    /// Queues a tracked no-op operation and returns a future for its
+    /// completion.
+    pub fn queue_nop(dispatcher: SharedIoUringDispatcher) -> io::Result<Self> {
+        let operation = dispatcher.borrow_mut().ring_mut().queue_nop_operation()?;
+        Ok(Self::new(dispatcher, operation))
+    }
+
+    /// Queues a tracked relative timeout and returns a future for its
+    /// completion.
+    pub fn queue_timeout(
+        dispatcher: SharedIoUringDispatcher,
+        duration: Duration,
+    ) -> io::Result<Self> {
+        let operation = dispatcher
+            .borrow_mut()
+            .ring_mut()
+            .queue_timeout_operation(duration)?;
+        Ok(Self::new(dispatcher, operation))
+    }
+
     /// Returns the operation id this future waits for.
     pub fn operation(&self) -> IoUringOperationId {
         self.operation
@@ -1486,6 +1506,62 @@ mod tests {
         assert_eq!(completion.operation, operation);
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn operation_future_can_queue_tracked_nop() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let mut future = IoUringOperationFuture::queue_nop(Rc::clone(&dispatcher)).unwrap();
+        let operation = future.operation();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        let Poll::Ready(completion) = Pin::new(&mut future).poll(&mut context) else {
+            panic!("queued nop future should be ready after dispatch");
+        };
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.kind, IoUringOperationKind::Nop);
+        assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn operation_future_can_queue_tracked_timeout() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let mut future =
+            IoUringOperationFuture::queue_timeout(Rc::clone(&dispatcher), Duration::from_millis(1))
+                .unwrap();
+        let operation = future.operation();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        let Poll::Ready(completion) = Pin::new(&mut future).poll(&mut context) else {
+            panic!("queued timeout future should be ready after dispatch");
+        };
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.kind, IoUringOperationKind::Timeout);
+        assert_eq!(completion.result, -ETIME);
     }
 
     #[test]
