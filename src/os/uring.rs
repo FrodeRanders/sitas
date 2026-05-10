@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::os::raw::{c_int, c_long, c_uint, c_void};
@@ -103,6 +104,7 @@ pub struct IoUring {
     _sq_ring: Mapping,
     _cq_ring: Mapping,
     sqes: Mapping,
+    completions: VecDeque<IoUringCompletion>,
     sq_head: *mut u32,
     sq_tail: *mut u32,
     sq_ring_mask: *mut u32,
@@ -171,6 +173,7 @@ impl IoUring {
 
         Ok(Self {
             fd,
+            completions: VecDeque::new(),
             sq_head: offset_ptr(sq_base, params.sq_off.head),
             sq_tail: offset_ptr(sq_base, params.sq_off.tail),
             sq_ring_mask: offset_ptr(sq_base, params.sq_off.ring_mask),
@@ -262,12 +265,7 @@ impl IoUring {
             self.submit_read(fd, buffer, u64::MAX, user_data)?;
         }
 
-        loop {
-            let completion = self.wait_completion()?;
-            if completion.user_data == user_data {
-                return Ok(completion);
-            }
-        }
+        self.wait_for_completion(user_data)
     }
 
     /// Writes once through `io_uring` and waits for the matching completion.
@@ -287,12 +285,7 @@ impl IoUring {
             self.submit_write(fd, buffer, u64::MAX, user_data)?;
         }
 
-        loop {
-            let completion = self.wait_completion()?;
-            if completion.user_data == user_data {
-                return Ok(completion);
-            }
-        }
+        self.wait_for_completion(user_data)
     }
 
     fn submit_buffer_operation(
@@ -364,7 +357,7 @@ impl IoUring {
     /// Waits for one completion queue entry.
     pub fn wait_completion(&mut self) -> io::Result<IoUringCompletion> {
         loop {
-            if let Some(completion) = self.pop_completion() {
+            if let Some(completion) = self.try_completion() {
                 return Ok(completion);
             }
 
@@ -390,7 +383,64 @@ impl IoUring {
         }
     }
 
-    fn pop_completion(&mut self) -> Option<IoUringCompletion> {
+    /// Waits for the completion tagged with `user_data`.
+    ///
+    /// Completions for other operations are retained and will be returned by a
+    /// later [`IoUring::try_completion`] or [`IoUring::wait_completion`] call.
+    pub fn wait_for_completion(&mut self, user_data: u64) -> io::Result<IoUringCompletion> {
+        if let Some(index) = self
+            .completions
+            .iter()
+            .position(|completion| completion.user_data == user_data)
+        {
+            return Ok(self.completions.remove(index).expect("completion exists"));
+        }
+
+        loop {
+            let completion = self.wait_ring_completion()?;
+            if completion.user_data == user_data {
+                return Ok(completion);
+            }
+            self.completions.push_back(completion);
+        }
+    }
+
+    /// Returns one already available completion, if any, without blocking.
+    pub fn try_completion(&mut self) -> Option<IoUringCompletion> {
+        self.completions
+            .pop_front()
+            .or_else(|| self.pop_ring_completion())
+    }
+
+    fn wait_ring_completion(&mut self) -> io::Result<IoUringCompletion> {
+        loop {
+            if let Some(completion) = self.pop_ring_completion() {
+                return Ok(completion);
+            }
+
+            // SAFETY: the ring fd is owned by `self`; no signal mask is supplied.
+            let result = unsafe {
+                syscall(
+                    SYS_IO_URING_ENTER,
+                    self.fd.raw(),
+                    0u32,
+                    1u32,
+                    IORING_ENTER_GETEVENTS,
+                    ptr::null::<c_void>(),
+                    0usize,
+                )
+            };
+            if result < 0 {
+                let error = last_os_error();
+                if error.raw_os_error() == Some(super::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    fn pop_ring_completion(&mut self) -> Option<IoUringCompletion> {
         let head = read_u32(self.cq_head);
         let tail = read_u32(self.cq_tail);
         if head == tail {
@@ -523,6 +573,43 @@ mod tests {
 
         assert_eq!(completion.user_data, 0x51_7a_5);
         assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn wait_for_completion_preserves_other_completions() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        ring.submit_nop(0x51_7a_5_4).unwrap();
+        ring.submit_nop(0x51_7a_5_5).unwrap();
+
+        let matched = ring.wait_for_completion(0x51_7a_5_5).unwrap();
+        let preserved = ring.wait_completion().unwrap();
+
+        assert_eq!(matched.user_data, 0x51_7a_5_5);
+        assert_eq!(matched.result, 0);
+        assert_eq!(preserved.user_data, 0x51_7a_5_4);
+        assert_eq!(preserved.result, 0);
+    }
+
+    #[test]
+    fn try_completion_returns_available_completion_without_blocking() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        assert!(ring.try_completion().is_none());
+
+        ring.submit_nop(0x51_7a_5_6).unwrap();
+        let completion = ring.wait_completion().unwrap();
+        ring.completions.push_back(completion);
+
+        assert_eq!(
+            ring.try_completion().map(|completion| completion.user_data),
+            Some(0x51_7a_5_6)
+        );
+        assert!(ring.try_completion().is_none());
     }
 
     #[test]
