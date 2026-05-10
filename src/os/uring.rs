@@ -15,7 +15,12 @@ const IORING_OFF_SQES: i64 = 0x1000_0000;
 const IORING_ENTER_GETEVENTS: c_uint = 1;
 
 const IORING_OP_NOP: u8 = 0;
+const IORING_OP_READ: u8 = 22;
 const SQE_SIZE: usize = 64;
+const SQE_FD_OFFSET: usize = 4;
+const SQE_OFF_OFFSET: usize = 8;
+const SQE_ADDR_OFFSET: usize = 16;
+const SQE_LEN_OFFSET: usize = 24;
 const SQE_USER_DATA_OFFSET: usize = 32;
 
 const PROT_READ: c_int = 0x1;
@@ -181,6 +186,73 @@ impl IoUring {
 
     /// Submits a no-op operation tagged with `user_data`.
     pub fn submit_nop(&mut self, user_data: u64) -> io::Result<()> {
+        let sqe = self.prepare_sqe()?;
+        write_u8(sqe, IORING_OP_NOP);
+        write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
+        self.submit_one()
+    }
+
+    /// Submits one read operation tagged with `user_data`.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must remain valid and uniquely writable until the completion
+    /// for `user_data` has been observed. Dropping or mutating the buffer
+    /// before the completion arrives may let the kernel write through an
+    /// invalid or aliased pointer.
+    pub unsafe fn submit_read(
+        &mut self,
+        fd: RawFd,
+        buffer: &mut [u8],
+        offset: u64,
+        user_data: u64,
+    ) -> io::Result<()> {
+        let len = u32::try_from(buffer.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "io_uring read buffer length exceeds u32::MAX",
+            )
+        })?;
+
+        let sqe = self.prepare_sqe()?;
+        write_u8(sqe, IORING_OP_READ);
+        write_i32(unsafe { sqe.add(SQE_FD_OFFSET) }, fd);
+        write_u64(unsafe { sqe.add(SQE_OFF_OFFSET) }, offset);
+        write_u64(
+            unsafe { sqe.add(SQE_ADDR_OFFSET) },
+            buffer.as_mut_ptr() as u64,
+        );
+        write_u32(unsafe { sqe.add(SQE_LEN_OFFSET).cast::<u32>() }, len);
+        write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
+        self.submit_one()
+    }
+
+    /// Reads once through `io_uring` and waits for the matching completion.
+    ///
+    /// This is a safe convenience wrapper around [`IoUring::submit_read`]
+    /// because it does not return until the kernel has completed the operation.
+    pub fn read_once(
+        &mut self,
+        fd: RawFd,
+        buffer: &mut [u8],
+        user_data: u64,
+    ) -> io::Result<IoUringCompletion> {
+        // SAFETY: this method waits for the completion before returning, so
+        // the borrowed buffer remains live and uniquely borrowed for the whole
+        // submitted operation.
+        unsafe {
+            self.submit_read(fd, buffer, u64::MAX, user_data)?;
+        }
+
+        loop {
+            let completion = self.wait_completion()?;
+            if completion.user_data == user_data {
+                return Ok(completion);
+            }
+        }
+    }
+
+    fn prepare_sqe(&mut self) -> io::Result<*mut u8> {
         let tail = read_u32(self.sq_tail);
         let head = read_u32(self.sq_head);
         let mask = read_u32(self.sq_ring_mask);
@@ -194,11 +266,12 @@ impl IoUring {
         let index = tail & mask;
         let sqe = unsafe { self.sqes.as_u8_ptr().add(index as usize * SQE_SIZE) };
         clear_sqe(sqe);
-        write_u8(sqe, IORING_OP_NOP);
-        write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
         write_u32(unsafe { self.sq_array.add(index as usize) }, index);
         write_u32(self.sq_tail, tail.wrapping_add(1));
+        Ok(sqe)
+    }
 
+    fn submit_one(&self) -> io::Result<()> {
         // SAFETY: the ring fd is owned by `self`; no signal mask is supplied.
         let result = unsafe {
             syscall(
@@ -348,6 +421,11 @@ fn write_u8(ptr: *mut u8, value: u8) {
     unsafe { ptr.write_volatile(value) };
 }
 
+fn write_i32(ptr: *mut u8, value: i32) {
+    // SAFETY: `ptr` points to an aligned i32 field inside an SQE.
+    unsafe { ptr.cast::<i32>().write_volatile(value) };
+}
+
 fn write_u64(ptr: *mut u8, value: u64) {
     // SAFETY: `ptr` points to the aligned `user_data` field inside an SQE.
     unsafe { ptr.cast::<u64>().write_volatile(value) };
@@ -361,20 +439,13 @@ fn read_cqe(ptr: *mut IoUringCqe) -> IoUringCqe {
 #[cfg(test)]
 mod tests {
     use super::IoUring;
+    use std::os::raw::c_void;
+    use std::os::unix::io::RawFd;
 
     #[test]
     fn nop_completion_round_trip() {
-        let mut ring = match IoUring::new(8) {
-            Ok(ring) => ring,
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(1) | Some(22) | Some(38) | Some(95)
-                ) =>
-            {
-                return;
-            }
-            Err(error) => panic!("failed to create io_uring: {error}"),
+        let Some(mut ring) = available_ring() else {
+            return;
         };
 
         ring.submit_nop(0x51_7a_5).unwrap();
@@ -382,5 +453,46 @@ mod tests {
 
         assert_eq!(completion.user_data, 0x51_7a_5);
         assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn read_once_reads_from_pipe() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+        write_bytes(write_fd.raw(), b"uring");
+
+        let mut buffer = [0u8; 5];
+        let completion = ring
+            .read_once(read_fd.raw(), &mut buffer, 0x51_7a_5_2)
+            .unwrap();
+
+        assert_eq!(completion.user_data, 0x51_7a_5_2);
+        assert_eq!(completion.result, 5);
+        assert_eq!(&buffer, b"uring");
+    }
+
+    fn available_ring() -> Option<IoUring> {
+        match IoUring::new(8) {
+            Ok(ring) => Some(ring),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(1) | Some(22) | Some(38) | Some(95)
+                ) =>
+            {
+                None
+            }
+            Err(error) => panic!("failed to create io_uring: {error}"),
+        }
+    }
+
+    fn write_bytes(fd: RawFd, bytes: &[u8]) {
+        // SAFETY: `bytes` is valid readable memory for `bytes.len()` bytes,
+        // and tests pass an open non-blocking pipe write descriptor.
+        let result =
+            unsafe { super::super::write(fd, bytes.as_ptr().cast::<c_void>(), bytes.len()) };
+        assert_eq!(result, bytes.len() as isize);
     }
 }
