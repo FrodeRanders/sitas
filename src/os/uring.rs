@@ -1868,6 +1868,41 @@ mod tests {
     }
 
     #[test]
+    fn dropping_pending_owned_read_defers_buffer_until_completion() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+        write_bytes(write_fd.raw(), b"uring");
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(wake_count);
+        let mut context = Context::from_waker(&waker);
+
+        {
+            let mut future = IoUringReadFuture::queue(
+                Rc::clone(&dispatcher),
+                read_fd.raw(),
+                vec![0; 5],
+                u64::MAX,
+            )
+            .unwrap();
+            assert!(matches!(
+                Pin::new(&mut future).poll(&mut context),
+                Poll::Pending
+            ));
+            assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 1);
+        }
+
+        assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
+        assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 1);
+
+        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
+        assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
+    }
+
+    #[test]
     fn owned_write_future_returns_written_buffer() {
         let Some(ring) = available_ring() else {
             return;
