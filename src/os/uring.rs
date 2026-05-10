@@ -18,6 +18,7 @@ const IORING_ENTER_GETEVENTS: c_uint = 1;
 
 const IORING_OP_NOP: u8 = 0;
 const IORING_OP_TIMEOUT: u8 = 11;
+const IORING_OP_ASYNC_CANCEL: u8 = 14;
 const IORING_OP_READ: u8 = 22;
 const IORING_OP_WRITE: u8 = 23;
 const SQE_SIZE: usize = 64;
@@ -267,6 +268,40 @@ impl IoUring {
         let operation = self.allocate_operation(IoUringOperationKind::Timeout, Some(timeout))?;
 
         if let Err(error) = self.queue_timeout(timeout_addr, operation.raw()) {
+            self.operations.remove(&operation);
+            return Err(error);
+        }
+        Ok(operation)
+    }
+
+    /// Submits a cancellation request for a tracked operation.
+    ///
+    /// The returned operation id identifies the cancellation request itself.
+    /// The target operation still produces its own completion, commonly with a
+    /// negative cancelled result if the kernel accepted the cancellation.
+    pub fn cancel_operation(
+        &mut self,
+        target: IoUringOperationId,
+    ) -> io::Result<IoUringOperationId> {
+        let operation = self.queue_cancel_operation(target)?;
+        if let Err(error) = self.submit_pending() {
+            self.operations.remove(&operation);
+            return Err(error);
+        }
+        Ok(operation)
+    }
+
+    /// Queues a cancellation request for a tracked operation.
+    ///
+    /// The returned operation id identifies the cancellation request itself.
+    /// The target operation remains tracked until its own completion is
+    /// observed.
+    pub fn queue_cancel_operation(
+        &mut self,
+        target: IoUringOperationId,
+    ) -> io::Result<IoUringOperationId> {
+        let operation = self.allocate_operation(IoUringOperationKind::Cancel { target }, None)?;
+        if let Err(error) = self.queue_cancel(target.raw(), operation.raw()) {
             self.operations.remove(&operation);
             return Err(error);
         }
@@ -613,6 +648,19 @@ impl IoUring {
         self.finish_sqe()
     }
 
+    fn queue_cancel(&mut self, target_user_data: u64, user_data: u64) -> io::Result<()> {
+        let sqe = self.prepare_sqe()?;
+        write_u8(sqe, IORING_OP_ASYNC_CANCEL);
+        write_i32(unsafe { sqe.add(SQE_FD_OFFSET) }, -1);
+        write_u64(unsafe { sqe.add(SQE_ADDR_OFFSET) }, target_user_data);
+        write_u32(
+            unsafe { sqe.add(SQE_TIMEOUT_FLAGS_OFFSET).cast::<u32>() },
+            0,
+        );
+        write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
+        self.finish_sqe()
+    }
+
     fn prepare_sqe(&mut self) -> io::Result<*mut u8> {
         let tail = read_u32(self.sq_tail);
         let head = read_u32(self.sq_head);
@@ -817,6 +865,11 @@ pub enum IoUringOperationKind {
     Write,
     /// Relative timeout operation.
     Timeout,
+    /// Cancellation request for another tracked operation.
+    Cancel {
+        /// Target operation requested for cancellation.
+        target: IoUringOperationId,
+    },
 }
 
 /// Completion for a tracked `io_uring` operation.
@@ -919,6 +972,7 @@ mod tests {
     use std::time::Duration;
 
     const ETIME: i32 = 62;
+    const ECANCELED: i32 = 125;
 
     #[test]
     fn nop_completion_round_trip() {
@@ -1081,6 +1135,29 @@ mod tests {
 
         assert_eq!(completion.kind, IoUringOperationKind::Timeout);
         assert_eq!(completion.result, -ETIME);
+    }
+
+    #[test]
+    fn tracked_timeout_can_be_cancelled() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        let timeout = ring
+            .queue_timeout_operation(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(ring.submit_pending().unwrap(), 1);
+
+        let cancel = ring.cancel_operation(timeout).unwrap();
+        let first = ring.wait_operation_completion(cancel).unwrap();
+        let second = ring.wait_operation_completion(timeout).unwrap();
+
+        assert_eq!(first.operation, cancel);
+        assert_eq!(first.kind, IoUringOperationKind::Cancel { target: timeout });
+        assert_eq!(first.result, 0);
+        assert_eq!(second.operation, timeout);
+        assert_eq!(second.kind, IoUringOperationKind::Timeout);
+        assert_eq!(second.result, -ECANCELED);
     }
 
     #[test]
