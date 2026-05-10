@@ -54,6 +54,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example os_reactor
         cargo run --example os_readable
         cargo run --example os_uring
+        cargo run --example os_uring_batch
     '
 fi
 
