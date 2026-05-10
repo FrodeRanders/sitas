@@ -3,7 +3,6 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::mem;
 use std::os::raw::{c_int, c_long, c_uint, c_void};
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
@@ -880,6 +879,7 @@ pub struct IoUringDispatcher {
     ring: IoUring,
     waiters: HashMap<IoUringOperationId, Waker>,
     completions: HashMap<IoUringOperationId, IoUringOperationCompletion>,
+    deferred_buffers: HashMap<IoUringOperationId, Vec<u8>>,
 }
 
 impl IoUringDispatcher {
@@ -889,6 +889,7 @@ impl IoUringDispatcher {
             ring,
             waiters: HashMap::new(),
             completions: HashMap::new(),
+            deferred_buffers: HashMap::new(),
         }
     }
 
@@ -934,6 +935,19 @@ impl IoUringDispatcher {
         self.completions.remove(&operation)
     }
 
+    /// Keeps an abandoned owned I/O buffer alive until its kernel operation
+    /// completes.
+    ///
+    /// If the completion has already been dispatched, both the completion and
+    /// buffer are discarded immediately because no future remains to consume
+    /// them.
+    pub fn defer_buffer_drop(&mut self, operation: IoUringOperationId, buffer: Vec<u8>) {
+        self.clear_waker(operation);
+        if self.completions.remove(&operation).is_none() {
+            self.deferred_buffers.insert(operation, buffer);
+        }
+    }
+
     /// Dispatches all locally available tracked completions.
     ///
     /// Matching registered wakers are removed and woken. The completions remain
@@ -942,6 +956,11 @@ impl IoUringDispatcher {
         let mut dispatched = 0;
         while let Some(completion) = self.ring.try_operation_completion() {
             let operation = completion.operation;
+            if self.deferred_buffers.remove(&operation).is_some() {
+                dispatched += 1;
+                continue;
+            }
+
             self.completions.insert(operation, completion);
             if let Some(waker) = self.waiters.remove(&operation) {
                 waker.wake();
@@ -963,6 +982,7 @@ impl IoUringDispatcher {
             ring: self.ring.snapshot(),
             registered_wakers: self.waiters.len(),
             completed_operations: self.completions.len(),
+            deferred_buffers: self.deferred_buffers.len(),
         }
     }
 }
@@ -1085,8 +1105,8 @@ pub struct IoUringReadCompletion {
 /// Future for a tracked read operation that owns its buffer.
 ///
 /// The future keeps the buffer allocation alive until the kernel completion is
-/// observed. Dropping it while pending intentionally leaks the buffer rather
-/// than freeing memory that the kernel may still write through.
+/// observed. Dropping it while pending transfers the buffer to the dispatcher,
+/// which releases it after the matching completion is dispatched.
 pub struct IoUringReadFuture {
     operation: IoUringOperationFuture,
     buffer: Option<Vec<u8>>,
@@ -1145,7 +1165,11 @@ impl Future for IoUringReadFuture {
 impl Drop for IoUringReadFuture {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            mem::forget(buffer);
+            let operation = self.operation();
+            self.operation
+                .dispatcher
+                .borrow_mut()
+                .defer_buffer_drop(operation, buffer);
         }
     }
 }
@@ -1172,8 +1196,8 @@ pub struct IoUringWriteCompletion {
 /// Future for a tracked write operation that owns its buffer.
 ///
 /// The future keeps the buffer allocation alive until the kernel completion is
-/// observed. Dropping it while pending intentionally leaks the buffer rather
-/// than freeing memory that the kernel may still read through.
+/// observed. Dropping it while pending transfers the buffer to the dispatcher,
+/// which releases it after the matching completion is dispatched.
 pub struct IoUringWriteFuture {
     operation: IoUringOperationFuture,
     buffer: Option<Vec<u8>>,
@@ -1232,7 +1256,11 @@ impl Future for IoUringWriteFuture {
 impl Drop for IoUringWriteFuture {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            mem::forget(buffer);
+            let operation = self.operation();
+            self.operation
+                .dispatcher
+                .borrow_mut()
+                .defer_buffer_drop(operation, buffer);
         }
     }
 }
@@ -1256,6 +1284,8 @@ pub struct IoUringDispatcherSnapshot {
     pub registered_wakers: usize,
     /// Number of completed tracked operations buffered for consumption.
     pub completed_operations: usize,
+    /// Number of abandoned owned buffers waiting for kernel completion.
+    pub deferred_buffers: usize,
 }
 
 /// One `io_uring` completion queue entry.
@@ -1874,6 +1904,44 @@ mod tests {
         assert_eq!(write.completion.kind, IoUringOperationKind::Write);
         assert_eq!(write.completion.result, 5);
         assert_eq!(&write.buffer, b"uring");
+        assert_eq!(&buffer, b"uring");
+    }
+
+    #[test]
+    fn dropping_pending_owned_write_defers_buffer_until_completion() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(wake_count);
+        let mut context = Context::from_waker(&waker);
+
+        {
+            let mut future = IoUringWriteFuture::queue(
+                Rc::clone(&dispatcher),
+                write_fd.raw(),
+                b"uring".to_vec(),
+                u64::MAX,
+            )
+            .unwrap();
+            assert!(matches!(
+                Pin::new(&mut future).poll(&mut context),
+                Poll::Pending
+            ));
+            assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 1);
+        }
+
+        assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
+        assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 1);
+
+        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
+        assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
+
+        let mut buffer = [0u8; 5];
+        read_bytes(read_fd.raw(), &mut buffer);
         assert_eq!(&buffer, b"uring");
     }
 
