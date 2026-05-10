@@ -22,8 +22,9 @@ mod uring;
 
 #[cfg(target_os = "linux")]
 pub use uring::{
-    IoUring, IoUringCompletion, IoUringOperationCompletion, IoUringOperationId,
-    IoUringOperationKind, IoUringOperationKindCounts, IoUringSnapshot,
+    IoUring, IoUringCompletion, IoUringDispatcher, IoUringDispatcherSnapshot,
+    IoUringOperationCompletion, IoUringOperationId, IoUringOperationKind,
+    IoUringOperationKindCounts, IoUringSnapshot,
 };
 
 #[cfg(not(target_os = "linux"))]

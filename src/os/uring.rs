@@ -4,6 +4,7 @@ use std::io;
 use std::os::raw::{c_int, c_long, c_uint, c_void};
 use std::os::unix::io::RawFd;
 use std::ptr;
+use std::task::Waker;
 use std::time::Duration;
 
 use super::{OwnedFd, last_os_error};
@@ -864,6 +865,118 @@ impl fmt::Debug for IoUring {
     }
 }
 
+/// Dispatches tracked `io_uring` completions to registered task wakers.
+///
+/// This is the first bridge from the raw completion queue to async scheduling.
+/// It owns an [`IoUring`], lets callers register interest in tracked
+/// operation ids, and stores completed operations until the future or executor
+/// consumes them.
+pub struct IoUringDispatcher {
+    ring: IoUring,
+    waiters: HashMap<IoUringOperationId, Waker>,
+    completions: HashMap<IoUringOperationId, IoUringOperationCompletion>,
+}
+
+impl IoUringDispatcher {
+    /// Creates a dispatcher around an existing ring.
+    pub fn new(ring: IoUring) -> Self {
+        Self {
+            ring,
+            waiters: HashMap::new(),
+            completions: HashMap::new(),
+        }
+    }
+
+    /// Returns shared access to the owned ring.
+    pub fn ring(&self) -> &IoUring {
+        &self.ring
+    }
+
+    /// Returns mutable access to the owned ring for queuing operations.
+    pub fn ring_mut(&mut self) -> &mut IoUring {
+        &mut self.ring
+    }
+
+    /// Registers or replaces the waker for a tracked operation.
+    ///
+    /// Returns `true` if the operation has already completed locally. In that
+    /// case the waker is not stored and the caller can consume the completion
+    /// immediately with [`IoUringDispatcher::take_completion`].
+    pub fn register_waker(&mut self, operation: IoUringOperationId, waker: &Waker) -> bool {
+        if self.completions.contains_key(&operation) {
+            return true;
+        }
+
+        self.waiters.insert(operation, waker.clone());
+        false
+    }
+
+    /// Removes any registered waker for an operation.
+    pub fn clear_waker(&mut self, operation: IoUringOperationId) -> Option<Waker> {
+        self.waiters.remove(&operation)
+    }
+
+    /// Returns and removes a completed tracked operation, if available.
+    pub fn take_completion(
+        &mut self,
+        operation: IoUringOperationId,
+    ) -> Option<IoUringOperationCompletion> {
+        self.completions.remove(&operation)
+    }
+
+    /// Dispatches all locally available tracked completions.
+    ///
+    /// Matching registered wakers are removed and woken. The completions remain
+    /// available through [`IoUringDispatcher::take_completion`].
+    pub fn dispatch_available(&mut self) -> usize {
+        let mut dispatched = 0;
+        while let Some(completion) = self.ring.try_operation_completion() {
+            let operation = completion.operation;
+            self.completions.insert(operation, completion);
+            if let Some(waker) = self.waiters.remove(&operation) {
+                waker.wake();
+            }
+            dispatched += 1;
+        }
+        dispatched
+    }
+
+    /// Waits for completions through the ring and dispatches tracked ones.
+    pub fn wait_and_dispatch(&mut self, min_complete: usize) -> io::Result<usize> {
+        self.ring.wait_completions(min_complete)?;
+        Ok(self.dispatch_available())
+    }
+
+    /// Returns a local dispatcher snapshot.
+    pub fn snapshot(&self) -> IoUringDispatcherSnapshot {
+        IoUringDispatcherSnapshot {
+            ring: self.ring.snapshot(),
+            registered_wakers: self.waiters.len(),
+            completed_operations: self.completions.len(),
+        }
+    }
+}
+
+impl fmt::Debug for IoUringDispatcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IoUringDispatcher")
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
+}
+
+/// Read-only locally observable state for an [`IoUringDispatcher`].
+#[must_use]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IoUringDispatcherSnapshot {
+    /// Snapshot of the owned raw ring.
+    pub ring: IoUringSnapshot,
+    /// Number of operations with registered task wakers.
+    pub registered_wakers: usize,
+    /// Number of completed tracked operations buffered for consumption.
+    pub completed_operations: usize,
+}
+
 /// One `io_uring` completion queue entry.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1043,9 +1156,12 @@ fn read_cqe(ptr: *mut IoUringCqe) -> IoUringCqe {
 
 #[cfg(test)]
 mod tests {
-    use super::{IoUring, IoUringOperationKind};
+    use super::{IoUring, IoUringDispatcher, IoUringOperationKind};
     use std::os::raw::c_void;
     use std::os::unix::io::RawFd;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
     use std::time::Duration;
 
     const ETIME: i32 = 62;
@@ -1215,6 +1331,52 @@ mod tests {
         assert_eq!(completion.operation, operation);
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn dispatcher_wakes_registered_operation() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let mut dispatcher = IoUringDispatcher::new(ring);
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_count));
+
+        let operation = dispatcher.ring_mut().queue_nop_operation().unwrap();
+        assert!(!dispatcher.register_waker(operation, &waker));
+        assert_eq!(dispatcher.snapshot().registered_wakers, 1);
+
+        assert_eq!(dispatcher.wait_and_dispatch(1).unwrap(), 1);
+
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        let completion = dispatcher.take_completion(operation).unwrap();
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.kind, IoUringOperationKind::Nop);
+        assert_eq!(completion.result, 0);
+        assert_eq!(dispatcher.snapshot().registered_wakers, 0);
+        assert_eq!(dispatcher.snapshot().completed_operations, 0);
+    }
+
+    #[test]
+    fn dispatcher_reports_already_completed_operation() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let mut dispatcher = IoUringDispatcher::new(ring);
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_count));
+
+        let operation = dispatcher.ring_mut().queue_nop_operation().unwrap();
+        assert_eq!(dispatcher.wait_and_dispatch(1).unwrap(), 1);
+
+        assert!(dispatcher.register_waker(operation, &waker));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatcher.snapshot().registered_wakers, 0);
+        assert_eq!(dispatcher.snapshot().completed_operations, 1);
+
+        let completion = dispatcher.take_completion(operation).unwrap();
+        assert_eq!(completion.kind, IoUringOperationKind::Nop);
+        assert_eq!(dispatcher.snapshot().completed_operations, 0);
     }
 
     #[test]
@@ -1452,5 +1614,23 @@ mod tests {
         let result =
             unsafe { super::super::read(fd, bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) };
         assert_eq!(result, bytes.len() as isize);
+    }
+
+    fn counting_waker(counter: Arc<AtomicUsize>) -> Waker {
+        Waker::from(Arc::new(CountingWake { counter }))
+    }
+
+    struct CountingWake {
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
