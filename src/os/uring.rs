@@ -478,6 +478,44 @@ impl IoUring {
         drained
     }
 
+    /// Waits until at least `min_complete` completions are locally available.
+    ///
+    /// Pending SQEs are submitted as part of the wait. Any available kernel
+    /// completions are drained into the local completion queue and can then be
+    /// consumed through [`IoUring::try_completion`],
+    /// [`IoUring::wait_completion`], or [`IoUring::try_operation_completion`].
+    pub fn wait_completions(&mut self, min_complete: usize) -> io::Result<usize> {
+        let target = min_complete;
+        u32::try_from(target).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "io_uring completion wait count exceeds u32::MAX",
+            )
+        })?;
+
+        self.drain_completions();
+        if self.completions.len() >= target {
+            return Ok(self.completions.len());
+        }
+
+        loop {
+            let needed = target - self.completions.len();
+            let min_complete = u32::try_from(needed).expect("completion wait count fits u32");
+            let to_submit = self.pending_submissions;
+            match self.enter(to_submit, min_complete, IORING_ENTER_GETEVENTS) {
+                Ok(submitted) => {
+                    self.pending_submissions = self.pending_submissions.saturating_sub(submitted);
+                    self.drain_completions();
+                    if self.completions.len() >= target {
+                        return Ok(self.completions.len());
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(super::EINTR) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn queue_buffer_operation(
         &mut self,
         opcode: u8,
@@ -856,6 +894,49 @@ mod tests {
         assert_eq!(drained, 1);
         assert_eq!(second.user_data, 0x51_7a_5_c);
         assert_eq!(second.result, 0);
+    }
+
+    #[test]
+    fn wait_completions_submits_and_drains_batch() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        ring.queue_nop(0x51_7a_5_e).unwrap();
+        ring.queue_nop(0x51_7a_5_f).unwrap();
+        assert_eq!(ring.pending_submissions(), 2);
+
+        assert_eq!(ring.wait_completions(2).unwrap(), 2);
+        assert_eq!(ring.pending_submissions(), 0);
+
+        let first = ring.wait_completion().unwrap();
+        let second = ring.wait_completion().unwrap();
+
+        assert_eq!(first.user_data, 0x51_7a_5_e);
+        assert_eq!(first.result, 0);
+        assert_eq!(second.user_data, 0x51_7a_5_f);
+        assert_eq!(second.result, 0);
+    }
+
+    #[test]
+    fn wait_completions_keeps_tracked_and_raw_completions_available() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        ring.queue_nop(0x51_7a_60).unwrap();
+        let operation = ring.queue_nop_operation().unwrap();
+
+        assert_eq!(ring.wait_completions(2).unwrap(), 2);
+
+        let tracked = ring.try_operation_completion().unwrap();
+        let raw = ring.wait_completion().unwrap();
+
+        assert_eq!(tracked.operation, operation);
+        assert_eq!(tracked.kind, IoUringOperationKind::Nop);
+        assert_eq!(tracked.result, 0);
+        assert_eq!(raw.user_data, 0x51_7a_60);
+        assert_eq!(raw.result, 0);
     }
 
     #[test]
