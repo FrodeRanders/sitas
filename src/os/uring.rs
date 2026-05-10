@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::os::raw::{c_int, c_long, c_uint, c_void};
@@ -24,6 +24,7 @@ const SQE_OFF_OFFSET: usize = 8;
 const SQE_ADDR_OFFSET: usize = 16;
 const SQE_LEN_OFFSET: usize = 24;
 const SQE_USER_DATA_OFFSET: usize = 32;
+const OPERATION_USER_DATA_BASE: u64 = 1 << 63;
 
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
@@ -105,6 +106,8 @@ pub struct IoUring {
     _cq_ring: Mapping,
     sqes: Mapping,
     completions: VecDeque<IoUringCompletion>,
+    operations: HashMap<IoUringOperationId, IoUringOperationKind>,
+    next_operation: u64,
     pending_submissions: u32,
     sq_head: *mut u32,
     sq_tail: *mut u32,
@@ -175,6 +178,8 @@ impl IoUring {
         Ok(Self {
             fd,
             completions: VecDeque::new(),
+            operations: HashMap::new(),
+            next_operation: 0,
             pending_submissions: 0,
             sq_head: offset_ptr(sq_base, params.sq_off.head),
             sq_tail: offset_ptr(sq_base, params.sq_off.tail),
@@ -205,6 +210,16 @@ impl IoUring {
         write_u8(sqe, IORING_OP_NOP);
         write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
         self.finish_sqe()
+    }
+
+    /// Queues a tracked no-op operation and returns its operation id.
+    pub fn queue_nop_operation(&mut self) -> io::Result<IoUringOperationId> {
+        let operation = self.allocate_operation(IoUringOperationKind::Nop)?;
+        if let Err(error) = self.queue_nop(operation.raw()) {
+            self.operations.remove(&operation);
+            return Err(error);
+        }
+        Ok(operation)
     }
 
     /// Submits one read operation tagged with `user_data`.
@@ -257,6 +272,30 @@ impl IoUring {
         )
     }
 
+    /// Queues a tracked read operation and returns its operation id.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must remain valid and uniquely writable until the completion
+    /// for the returned operation id has been observed. Dropping or mutating
+    /// the buffer before completion may let the kernel write through an
+    /// invalid or aliased pointer. The operation must also eventually be
+    /// submitted with [`IoUring::submit_pending`].
+    pub unsafe fn queue_read_operation(
+        &mut self,
+        fd: RawFd,
+        buffer: &mut [u8],
+        offset: u64,
+    ) -> io::Result<IoUringOperationId> {
+        let operation = self.allocate_operation(IoUringOperationKind::Read)?;
+        // SAFETY: the caller keeps the read buffer valid until completion.
+        if let Err(error) = unsafe { self.queue_read(fd, buffer, offset, operation.raw()) } {
+            self.operations.remove(&operation);
+            return Err(error);
+        }
+        Ok(operation)
+    }
+
     /// Submits one write operation tagged with `user_data`.
     ///
     /// # Safety
@@ -305,6 +344,30 @@ impl IoUring {
             user_data,
             "write",
         )
+    }
+
+    /// Queues a tracked write operation and returns its operation id.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must remain valid and immutable until the completion for the
+    /// returned operation id has been observed. Dropping or mutating the buffer
+    /// before completion may let the kernel read invalid or changing memory.
+    /// The operation must also eventually be submitted with
+    /// [`IoUring::submit_pending`].
+    pub unsafe fn queue_write_operation(
+        &mut self,
+        fd: RawFd,
+        buffer: &[u8],
+        offset: u64,
+    ) -> io::Result<IoUringOperationId> {
+        let operation = self.allocate_operation(IoUringOperationKind::Write)?;
+        // SAFETY: the caller keeps the write buffer valid until completion.
+        if let Err(error) = unsafe { self.queue_write(fd, buffer, offset, operation.raw()) } {
+            self.operations.remove(&operation);
+            return Err(error);
+        }
+        Ok(operation)
     }
 
     /// Reads once through `io_uring` and waits for the matching completion.
@@ -372,6 +435,39 @@ impl IoUring {
         Ok(submitted)
     }
 
+    /// Waits for the completion of a tracked operation.
+    pub fn wait_operation_completion(
+        &mut self,
+        operation: IoUringOperationId,
+    ) -> io::Result<IoUringOperationCompletion> {
+        let completion = self.wait_for_completion(operation.raw())?;
+        self.complete_operation(operation, completion)
+    }
+
+    /// Returns one completed tracked operation, if any, without blocking.
+    ///
+    /// Raw completions produced by untracked `queue_*` or `submit_*` calls are
+    /// retained for [`IoUring::try_completion`] and [`IoUring::wait_completion`].
+    pub fn try_operation_completion(&mut self) -> Option<IoUringOperationCompletion> {
+        if let Some(index) = self.completions.iter().position(|completion| {
+            self.operations
+                .contains_key(&IoUringOperationId(completion.user_data))
+        }) {
+            let completion = self.completions.remove(index).expect("completion exists");
+            return self
+                .complete_operation(IoUringOperationId(completion.user_data), completion)
+                .ok();
+        }
+
+        let completion = self.pop_ring_completion()?;
+        let operation = IoUringOperationId(completion.user_data);
+        if self.operations.contains_key(&operation) {
+            return self.complete_operation(operation, completion).ok();
+        }
+        self.completions.push_back(completion);
+        None
+    }
+
     fn queue_buffer_operation(
         &mut self,
         opcode: u8,
@@ -424,6 +520,39 @@ impl IoUring {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("io_uring pending submission count overflow"))?;
         Ok(())
+    }
+
+    fn allocate_operation(&mut self, kind: IoUringOperationKind) -> io::Result<IoUringOperationId> {
+        if self.next_operation == OPERATION_USER_DATA_BASE {
+            return Err(io::Error::other("io_uring operation id space exhausted"));
+        }
+
+        let operation = IoUringOperationId(OPERATION_USER_DATA_BASE | self.next_operation);
+        self.next_operation += 1;
+        if self.operations.insert(operation, kind).is_some() {
+            return Err(io::Error::other("io_uring operation id collision"));
+        }
+        Ok(operation)
+    }
+
+    fn complete_operation(
+        &mut self,
+        operation: IoUringOperationId,
+        completion: IoUringCompletion,
+    ) -> io::Result<IoUringOperationCompletion> {
+        let kind = self.operations.remove(&operation).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "io_uring completion does not match a tracked operation",
+            )
+        })?;
+
+        Ok(IoUringOperationCompletion {
+            operation,
+            kind,
+            result: completion.result,
+            flags: completion.flags,
+        })
     }
 
     fn enter(&self, to_submit: u32, min_complete: u32, flags: c_uint) -> io::Result<u32> {
@@ -538,6 +667,44 @@ pub struct IoUringCompletion {
     pub flags: u32,
 }
 
+/// Identifier for a tracked `io_uring` operation.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IoUringOperationId(u64);
+
+impl IoUringOperationId {
+    /// Returns the raw `user_data` value placed in the SQE.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Kind of tracked operation submitted through [`IoUring`].
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoUringOperationKind {
+    /// No-op operation.
+    Nop,
+    /// Read operation.
+    Read,
+    /// Write operation.
+    Write,
+}
+
+/// Completion for a tracked `io_uring` operation.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoUringOperationCompletion {
+    /// Operation id returned when the operation was queued.
+    pub operation: IoUringOperationId,
+    /// Kind of operation that completed.
+    pub kind: IoUringOperationKind,
+    /// Operation result.
+    pub result: i32,
+    /// Kernel completion flags.
+    pub flags: u32,
+}
+
 #[derive(Debug)]
 struct Mapping {
     ptr: *mut c_void,
@@ -618,7 +785,7 @@ fn read_cqe(ptr: *mut IoUringCqe) -> IoUringCqe {
 
 #[cfg(test)]
 mod tests {
-    use super::IoUring;
+    use super::{IoUring, IoUringOperationKind};
     use std::os::raw::c_void;
     use std::os::unix::io::RawFd;
 
@@ -677,6 +844,42 @@ mod tests {
     }
 
     #[test]
+    fn tracked_nop_completion_reports_operation_metadata() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        let operation = ring.queue_nop_operation().unwrap();
+        assert!(operation.raw() & super::OPERATION_USER_DATA_BASE != 0);
+        assert_eq!(ring.submit_pending().unwrap(), 1);
+
+        let completion = ring.wait_operation_completion(operation).unwrap();
+
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.kind, IoUringOperationKind::Nop);
+        assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn try_operation_completion_preserves_raw_completions() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        ring.queue_nop(0x51_7a_5_a).unwrap();
+        let operation = ring.queue_nop_operation().unwrap();
+        assert_eq!(ring.submit_pending().unwrap(), 2);
+
+        let tracked = ring.wait_operation_completion(operation).unwrap();
+        let raw = ring.wait_completion().unwrap();
+
+        assert_eq!(tracked.operation, operation);
+        assert_eq!(tracked.kind, IoUringOperationKind::Nop);
+        assert_eq!(raw.user_data, 0x51_7a_5_a);
+        assert_eq!(raw.result, 0);
+    }
+
+    #[test]
     fn wait_for_completion_preserves_other_completions() {
         let Some(mut ring) = available_ring() else {
             return;
@@ -732,6 +935,27 @@ mod tests {
     }
 
     #[test]
+    fn tracked_read_operation_reads_from_pipe() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+        write_bytes(write_fd.raw(), b"uring");
+
+        let mut buffer = [0u8; 5];
+        // SAFETY: the buffer is kept alive and uniquely borrowed until the
+        // tracked completion has been observed below.
+        let operation =
+            unsafe { ring.queue_read_operation(read_fd.raw(), &mut buffer, u64::MAX) }.unwrap();
+        let completion = ring.wait_operation_completion(operation).unwrap();
+
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.kind, IoUringOperationKind::Read);
+        assert_eq!(completion.result, 5);
+        assert_eq!(&buffer, b"uring");
+    }
+
+    #[test]
     fn write_once_writes_to_pipe() {
         let Some(mut ring) = available_ring() else {
             return;
@@ -745,6 +969,27 @@ mod tests {
         read_bytes(read_fd.raw(), &mut buffer);
 
         assert_eq!(completion.user_data, 0x51_7a_5_3);
+        assert_eq!(completion.result, 5);
+        assert_eq!(&buffer, b"uring");
+    }
+
+    #[test]
+    fn tracked_write_operation_writes_to_pipe() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+
+        // SAFETY: the buffer is kept alive and immutable until the tracked
+        // completion has been observed below.
+        let operation =
+            unsafe { ring.queue_write_operation(write_fd.raw(), b"uring", u64::MAX) }.unwrap();
+        let completion = ring.wait_operation_completion(operation).unwrap();
+        let mut buffer = [0u8; 5];
+        read_bytes(read_fd.raw(), &mut buffer);
+
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.kind, IoUringOperationKind::Write);
         assert_eq!(completion.result, 5);
         assert_eq!(&buffer, b"uring");
     }

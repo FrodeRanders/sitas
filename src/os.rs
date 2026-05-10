@@ -21,7 +21,10 @@ mod epoll;
 mod uring;
 
 #[cfg(target_os = "linux")]
-pub use uring::{IoUring, IoUringCompletion};
+pub use uring::{
+    IoUring, IoUringCompletion, IoUringOperationCompletion, IoUringOperationId,
+    IoUringOperationKind,
+};
 
 #[cfg(not(target_os = "linux"))]
 type Nfds = u32;
