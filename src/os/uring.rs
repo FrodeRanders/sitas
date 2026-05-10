@@ -4,6 +4,7 @@ use std::io;
 use std::os::raw::{c_int, c_long, c_uint, c_void};
 use std::os::unix::io::RawFd;
 use std::ptr;
+use std::time::Duration;
 
 use super::{OwnedFd, last_os_error};
 
@@ -16,6 +17,7 @@ const IORING_OFF_SQES: i64 = 0x1000_0000;
 const IORING_ENTER_GETEVENTS: c_uint = 1;
 
 const IORING_OP_NOP: u8 = 0;
+const IORING_OP_TIMEOUT: u8 = 11;
 const IORING_OP_READ: u8 = 22;
 const IORING_OP_WRITE: u8 = 23;
 const SQE_SIZE: usize = 64;
@@ -23,6 +25,7 @@ const SQE_FD_OFFSET: usize = 4;
 const SQE_OFF_OFFSET: usize = 8;
 const SQE_ADDR_OFFSET: usize = 16;
 const SQE_LEN_OFFSET: usize = 24;
+const SQE_TIMEOUT_FLAGS_OFFSET: usize = 28;
 const SQE_USER_DATA_OFFSET: usize = 32;
 const OPERATION_USER_DATA_BASE: u64 = 1 << 63;
 
@@ -82,6 +85,35 @@ struct IoUringCqe {
     flags: u32,
 }
 
+#[repr(C)]
+#[derive(Debug)]
+struct KernelTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+impl KernelTimespec {
+    fn from_duration(duration: Duration) -> io::Result<Self> {
+        let tv_sec = i64::try_from(duration.as_secs()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "io_uring timeout seconds exceed i64::MAX",
+            )
+        })?;
+
+        Ok(Self {
+            tv_sec,
+            tv_nsec: i64::from(duration.subsec_nanos()),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct IoUringOperationState {
+    kind: IoUringOperationKind,
+    _timeout: Option<Box<KernelTimespec>>,
+}
+
 unsafe extern "C" {
     fn mmap(
         addr: *mut c_void,
@@ -106,7 +138,7 @@ pub struct IoUring {
     _cq_ring: Mapping,
     sqes: Mapping,
     completions: VecDeque<IoUringCompletion>,
-    operations: HashMap<IoUringOperationId, IoUringOperationKind>,
+    operations: HashMap<IoUringOperationId, IoUringOperationState>,
     next_operation: u64,
     pending_submissions: u32,
     sq_head: *mut u32,
@@ -214,8 +246,27 @@ impl IoUring {
 
     /// Queues a tracked no-op operation and returns its operation id.
     pub fn queue_nop_operation(&mut self) -> io::Result<IoUringOperationId> {
-        let operation = self.allocate_operation(IoUringOperationKind::Nop)?;
+        let operation = self.allocate_operation(IoUringOperationKind::Nop, None)?;
         if let Err(error) = self.queue_nop(operation.raw()) {
+            self.operations.remove(&operation);
+            return Err(error);
+        }
+        Ok(operation)
+    }
+
+    /// Queues a tracked relative timeout operation and returns its operation id.
+    ///
+    /// The ring owns the timeout storage until the completion for the returned
+    /// operation id is observed.
+    pub fn queue_timeout_operation(
+        &mut self,
+        duration: Duration,
+    ) -> io::Result<IoUringOperationId> {
+        let timeout = Box::new(KernelTimespec::from_duration(duration)?);
+        let timeout_addr = timeout.as_ref() as *const KernelTimespec as u64;
+        let operation = self.allocate_operation(IoUringOperationKind::Timeout, Some(timeout))?;
+
+        if let Err(error) = self.queue_timeout(timeout_addr, operation.raw()) {
             self.operations.remove(&operation);
             return Err(error);
         }
@@ -287,7 +338,7 @@ impl IoUring {
         buffer: &mut [u8],
         offset: u64,
     ) -> io::Result<IoUringOperationId> {
-        let operation = self.allocate_operation(IoUringOperationKind::Read)?;
+        let operation = self.allocate_operation(IoUringOperationKind::Read, None)?;
         // SAFETY: the caller keeps the read buffer valid until completion.
         if let Err(error) = unsafe { self.queue_read(fd, buffer, offset, operation.raw()) } {
             self.operations.remove(&operation);
@@ -361,7 +412,7 @@ impl IoUring {
         buffer: &[u8],
         offset: u64,
     ) -> io::Result<IoUringOperationId> {
-        let operation = self.allocate_operation(IoUringOperationKind::Write)?;
+        let operation = self.allocate_operation(IoUringOperationKind::Write, None)?;
         // SAFETY: the caller keeps the write buffer valid until completion.
         if let Err(error) = unsafe { self.queue_write(fd, buffer, offset, operation.raw()) } {
             self.operations.remove(&operation);
@@ -388,6 +439,12 @@ impl IoUring {
         }
 
         self.wait_for_completion(user_data)
+    }
+
+    /// Waits for a relative timeout through `io_uring`.
+    pub fn timeout_once(&mut self, duration: Duration) -> io::Result<IoUringOperationCompletion> {
+        let operation = self.queue_timeout_operation(duration)?;
+        self.wait_operation_completion(operation)
     }
 
     /// Writes once through `io_uring` and waits for the matching completion.
@@ -543,6 +600,19 @@ impl IoUring {
         self.finish_sqe()
     }
 
+    fn queue_timeout(&mut self, timeout_addr: u64, user_data: u64) -> io::Result<()> {
+        let sqe = self.prepare_sqe()?;
+        write_u8(sqe, IORING_OP_TIMEOUT);
+        write_u64(unsafe { sqe.add(SQE_ADDR_OFFSET) }, timeout_addr);
+        write_u32(unsafe { sqe.add(SQE_LEN_OFFSET).cast::<u32>() }, 0);
+        write_u32(
+            unsafe { sqe.add(SQE_TIMEOUT_FLAGS_OFFSET).cast::<u32>() },
+            0,
+        );
+        write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
+        self.finish_sqe()
+    }
+
     fn prepare_sqe(&mut self) -> io::Result<*mut u8> {
         let tail = read_u32(self.sq_tail);
         let head = read_u32(self.sq_head);
@@ -570,14 +640,22 @@ impl IoUring {
         Ok(())
     }
 
-    fn allocate_operation(&mut self, kind: IoUringOperationKind) -> io::Result<IoUringOperationId> {
+    fn allocate_operation(
+        &mut self,
+        kind: IoUringOperationKind,
+        timeout: Option<Box<KernelTimespec>>,
+    ) -> io::Result<IoUringOperationId> {
         if self.next_operation == OPERATION_USER_DATA_BASE {
             return Err(io::Error::other("io_uring operation id space exhausted"));
         }
 
         let operation = IoUringOperationId(OPERATION_USER_DATA_BASE | self.next_operation);
         self.next_operation += 1;
-        if self.operations.insert(operation, kind).is_some() {
+        let state = IoUringOperationState {
+            kind,
+            _timeout: timeout,
+        };
+        if self.operations.insert(operation, state).is_some() {
             return Err(io::Error::other("io_uring operation id collision"));
         }
         Ok(operation)
@@ -588,7 +666,7 @@ impl IoUring {
         operation: IoUringOperationId,
         completion: IoUringCompletion,
     ) -> io::Result<IoUringOperationCompletion> {
-        let kind = self.operations.remove(&operation).ok_or_else(|| {
+        let state = self.operations.remove(&operation).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "io_uring completion does not match a tracked operation",
@@ -597,7 +675,7 @@ impl IoUring {
 
         Ok(IoUringOperationCompletion {
             operation,
-            kind,
+            kind: state.kind,
             result: completion.result,
             flags: completion.flags,
         })
@@ -737,6 +815,8 @@ pub enum IoUringOperationKind {
     Read,
     /// Write operation.
     Write,
+    /// Relative timeout operation.
+    Timeout,
 }
 
 /// Completion for a tracked `io_uring` operation.
@@ -836,6 +916,9 @@ mod tests {
     use super::{IoUring, IoUringOperationKind};
     use std::os::raw::c_void;
     use std::os::unix::io::RawFd;
+    use std::time::Duration;
+
+    const ETIME: i32 = 62;
 
     #[test]
     fn nop_completion_round_trip() {
@@ -970,6 +1053,34 @@ mod tests {
         assert_eq!(completion.operation, operation);
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn tracked_timeout_operation_completes_after_deadline() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        let operation = ring
+            .queue_timeout_operation(Duration::from_millis(1))
+            .unwrap();
+        let completion = ring.wait_operation_completion(operation).unwrap();
+
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.kind, IoUringOperationKind::Timeout);
+        assert_eq!(completion.result, -ETIME);
+    }
+
+    #[test]
+    fn timeout_once_waits_for_timeout_completion() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+
+        let completion = ring.timeout_once(Duration::from_millis(1)).unwrap();
+
+        assert_eq!(completion.kind, IoUringOperationKind::Timeout);
+        assert_eq!(completion.result, -ETIME);
     }
 
     #[test]
