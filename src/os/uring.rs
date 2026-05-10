@@ -1017,6 +1017,19 @@ impl IoUringOperationFuture {
         Ok(Self::new(dispatcher, operation))
     }
 
+    /// Queues a tracked cancellation request and returns a future for the
+    /// cancellation request completion.
+    pub fn queue_cancel(
+        dispatcher: SharedIoUringDispatcher,
+        target: IoUringOperationId,
+    ) -> io::Result<Self> {
+        let operation = dispatcher
+            .borrow_mut()
+            .ring_mut()
+            .queue_cancel_operation(target)?;
+        Ok(Self::new(dispatcher, operation))
+    }
+
     /// Returns the operation id this future waits for.
     pub fn operation(&self) -> IoUringOperationId {
         self.operation
@@ -1562,6 +1575,55 @@ mod tests {
         assert_eq!(completion.operation, operation);
         assert_eq!(completion.kind, IoUringOperationKind::Timeout);
         assert_eq!(completion.result, -ETIME);
+    }
+
+    #[test]
+    fn operation_future_can_queue_tracked_cancel() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let timeout = dispatcher
+            .borrow_mut()
+            .ring_mut()
+            .queue_timeout_operation(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            dispatcher.borrow_mut().ring_mut().submit_pending().unwrap(),
+            1
+        );
+
+        let mut cancel_future =
+            IoUringOperationFuture::queue_cancel(Rc::clone(&dispatcher), timeout).unwrap();
+        let cancel = cancel_future.operation();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut cancel_future).poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        let Poll::Ready(cancel_completion) = Pin::new(&mut cancel_future).poll(&mut context) else {
+            panic!("queued cancel future should be ready after dispatch");
+        };
+        assert_eq!(cancel_completion.operation, cancel);
+        assert_eq!(
+            cancel_completion.kind,
+            IoUringOperationKind::Cancel { target: timeout }
+        );
+        assert_eq!(cancel_completion.result, 0);
+
+        let timeout_completion = dispatcher
+            .borrow_mut()
+            .ring_mut()
+            .wait_operation_completion(timeout)
+            .unwrap();
+        assert_eq!(timeout_completion.kind, IoUringOperationKind::Timeout);
+        assert_eq!(timeout_completion.result, -ECANCELED);
     }
 
     #[test]
