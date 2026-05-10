@@ -16,6 +16,7 @@ const IORING_ENTER_GETEVENTS: c_uint = 1;
 
 const IORING_OP_NOP: u8 = 0;
 const IORING_OP_READ: u8 = 22;
+const IORING_OP_WRITE: u8 = 23;
 const SQE_SIZE: usize = 64;
 const SQE_FD_OFFSET: usize = 4;
 const SQE_OFF_OFFSET: usize = 8;
@@ -207,24 +208,41 @@ impl IoUring {
         offset: u64,
         user_data: u64,
     ) -> io::Result<()> {
-        let len = u32::try_from(buffer.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "io_uring read buffer length exceeds u32::MAX",
-            )
-        })?;
-
-        let sqe = self.prepare_sqe()?;
-        write_u8(sqe, IORING_OP_READ);
-        write_i32(unsafe { sqe.add(SQE_FD_OFFSET) }, fd);
-        write_u64(unsafe { sqe.add(SQE_OFF_OFFSET) }, offset);
-        write_u64(
-            unsafe { sqe.add(SQE_ADDR_OFFSET) },
+        self.submit_buffer_operation(
+            IORING_OP_READ,
+            fd,
             buffer.as_mut_ptr() as u64,
-        );
-        write_u32(unsafe { sqe.add(SQE_LEN_OFFSET).cast::<u32>() }, len);
-        write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
-        self.submit_one()
+            buffer.len(),
+            offset,
+            user_data,
+            "read",
+        )
+    }
+
+    /// Submits one write operation tagged with `user_data`.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must remain valid and immutable until the completion for
+    /// `user_data` has been observed. Dropping or mutating the buffer before
+    /// the completion arrives may let the kernel read invalid or changing
+    /// memory.
+    pub unsafe fn submit_write(
+        &mut self,
+        fd: RawFd,
+        buffer: &[u8],
+        offset: u64,
+        user_data: u64,
+    ) -> io::Result<()> {
+        self.submit_buffer_operation(
+            IORING_OP_WRITE,
+            fd,
+            buffer.as_ptr() as u64,
+            buffer.len(),
+            offset,
+            user_data,
+            "write",
+        )
     }
 
     /// Reads once through `io_uring` and waits for the matching completion.
@@ -250,6 +268,58 @@ impl IoUring {
                 return Ok(completion);
             }
         }
+    }
+
+    /// Writes once through `io_uring` and waits for the matching completion.
+    ///
+    /// This is a safe convenience wrapper around [`IoUring::submit_write`]
+    /// because it does not return until the kernel has completed the operation.
+    pub fn write_once(
+        &mut self,
+        fd: RawFd,
+        buffer: &[u8],
+        user_data: u64,
+    ) -> io::Result<IoUringCompletion> {
+        // SAFETY: this method waits for the completion before returning, so
+        // the borrowed buffer remains live and immutable for the whole
+        // submitted operation.
+        unsafe {
+            self.submit_write(fd, buffer, u64::MAX, user_data)?;
+        }
+
+        loop {
+            let completion = self.wait_completion()?;
+            if completion.user_data == user_data {
+                return Ok(completion);
+            }
+        }
+    }
+
+    fn submit_buffer_operation(
+        &mut self,
+        opcode: u8,
+        fd: RawFd,
+        buffer_addr: u64,
+        buffer_len: usize,
+        offset: u64,
+        user_data: u64,
+        operation_name: &str,
+    ) -> io::Result<()> {
+        let len = u32::try_from(buffer_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("io_uring {operation_name} buffer length exceeds u32::MAX"),
+            )
+        })?;
+
+        let sqe = self.prepare_sqe()?;
+        write_u8(sqe, opcode);
+        write_i32(unsafe { sqe.add(SQE_FD_OFFSET) }, fd);
+        write_u64(unsafe { sqe.add(SQE_OFF_OFFSET) }, offset);
+        write_u64(unsafe { sqe.add(SQE_ADDR_OFFSET) }, buffer_addr);
+        write_u32(unsafe { sqe.add(SQE_LEN_OFFSET).cast::<u32>() }, len);
+        write_u64(unsafe { sqe.add(SQE_USER_DATA_OFFSET) }, user_data);
+        self.submit_one()
     }
 
     fn prepare_sqe(&mut self) -> io::Result<*mut u8> {
@@ -473,6 +543,24 @@ mod tests {
         assert_eq!(&buffer, b"uring");
     }
 
+    #[test]
+    fn write_once_writes_to_pipe() {
+        let Some(mut ring) = available_ring() else {
+            return;
+        };
+        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+
+        let completion = ring
+            .write_once(write_fd.raw(), b"uring", 0x51_7a_5_3)
+            .unwrap();
+        let mut buffer = [0u8; 5];
+        read_bytes(read_fd.raw(), &mut buffer);
+
+        assert_eq!(completion.user_data, 0x51_7a_5_3);
+        assert_eq!(completion.result, 5);
+        assert_eq!(&buffer, b"uring");
+    }
+
     fn available_ring() -> Option<IoUring> {
         match IoUring::new(8) {
             Ok(ring) => Some(ring),
@@ -493,6 +581,15 @@ mod tests {
         // and tests pass an open non-blocking pipe write descriptor.
         let result =
             unsafe { super::super::write(fd, bytes.as_ptr().cast::<c_void>(), bytes.len()) };
+        assert_eq!(result, bytes.len() as isize);
+    }
+
+    fn read_bytes(fd: RawFd, bytes: &mut [u8]) {
+        // SAFETY: `bytes` is valid writable memory for `bytes.len()` bytes,
+        // and tests pass an open non-blocking pipe read descriptor containing
+        // exactly that many bytes.
+        let result =
+            unsafe { super::super::read(fd, bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) };
         assert_eq!(result, bytes.len() as isize);
     }
 }
