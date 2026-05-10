@@ -17,6 +17,11 @@ use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 mod epoll;
+#[cfg(target_os = "linux")]
+mod uring;
+
+#[cfg(target_os = "linux")]
+pub use uring::{IoUring, IoUringCompletion};
 
 #[cfg(not(target_os = "linux"))]
 type Nfds = u32;
