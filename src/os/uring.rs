@@ -1,10 +1,14 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::os::raw::{c_int, c_long, c_uint, c_void};
 use std::os::unix::io::RawFd;
+use std::pin::Pin;
 use std::ptr;
-use std::task::Waker;
+use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::{OwnedFd, last_os_error};
@@ -887,6 +891,11 @@ impl IoUringDispatcher {
         }
     }
 
+    /// Wraps this dispatcher in single-threaded shared ownership.
+    pub fn into_shared(self) -> SharedIoUringDispatcher {
+        Rc::new(RefCell::new(self))
+    }
+
     /// Returns shared access to the owned ring.
     pub fn ring(&self) -> &IoUring {
         &self.ring
@@ -962,6 +971,70 @@ impl fmt::Debug for IoUringDispatcher {
         f.debug_struct("IoUringDispatcher")
             .field("snapshot", &self.snapshot())
             .finish()
+    }
+}
+
+/// Single-thread shared ownership for an [`IoUringDispatcher`].
+pub type SharedIoUringDispatcher = Rc<RefCell<IoUringDispatcher>>;
+
+/// Future that completes when a tracked `io_uring` operation is dispatched.
+///
+/// The future registers the current task waker with the shared dispatcher when
+/// pending. An event loop still has to drive the dispatcher by calling
+/// [`IoUringDispatcher::dispatch_available`] or
+/// [`IoUringDispatcher::wait_and_dispatch`].
+pub struct IoUringOperationFuture {
+    dispatcher: SharedIoUringDispatcher,
+    operation: IoUringOperationId,
+}
+
+impl IoUringOperationFuture {
+    /// Creates a future for a tracked operation owned by `dispatcher`.
+    pub fn new(dispatcher: SharedIoUringDispatcher, operation: IoUringOperationId) -> Self {
+        Self {
+            dispatcher,
+            operation,
+        }
+    }
+
+    /// Returns the operation id this future waits for.
+    pub fn operation(&self) -> IoUringOperationId {
+        self.operation
+    }
+}
+
+impl Future for IoUringOperationFuture {
+    type Output = IoUringOperationCompletion;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut dispatcher = self.dispatcher.borrow_mut();
+        dispatcher.dispatch_available();
+
+        if let Some(completion) = dispatcher.take_completion(self.operation) {
+            return Poll::Ready(completion);
+        }
+
+        if dispatcher.register_waker(self.operation, context.waker())
+            && let Some(completion) = dispatcher.take_completion(self.operation)
+        {
+            return Poll::Ready(completion);
+        }
+
+        Poll::Pending
+    }
+}
+
+impl Drop for IoUringOperationFuture {
+    fn drop(&mut self) {
+        self.dispatcher.borrow_mut().clear_waker(self.operation);
+    }
+}
+
+impl fmt::Debug for IoUringOperationFuture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IoUringOperationFuture")
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1156,12 +1229,15 @@ fn read_cqe(ptr: *mut IoUringCqe) -> IoUringCqe {
 
 #[cfg(test)]
 mod tests {
-    use super::{IoUring, IoUringDispatcher, IoUringOperationKind};
+    use super::{IoUring, IoUringDispatcher, IoUringOperationFuture, IoUringOperationKind};
+    use std::future::Future;
     use std::os::raw::c_void;
     use std::os::unix::io::RawFd;
+    use std::pin::Pin;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Wake, Waker};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::Duration;
 
     const ETIME: i32 = 62;
@@ -1377,6 +1453,66 @@ mod tests {
         let completion = dispatcher.take_completion(operation).unwrap();
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(dispatcher.snapshot().completed_operations, 0);
+    }
+
+    #[test]
+    fn operation_future_registers_and_resolves_after_dispatch() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let operation = dispatcher
+            .borrow_mut()
+            .ring_mut()
+            .queue_nop_operation()
+            .unwrap();
+        let mut future = IoUringOperationFuture::new(Rc::clone(&dispatcher), operation);
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 1);
+
+        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        let Poll::Ready(completion) = Pin::new(&mut future).poll(&mut context) else {
+            panic!("operation future should be ready after dispatch");
+        };
+        assert_eq!(completion.operation, operation);
+        assert_eq!(completion.kind, IoUringOperationKind::Nop);
+        assert_eq!(completion.result, 0);
+    }
+
+    #[test]
+    fn dropping_pending_operation_future_clears_registered_waker() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let operation = dispatcher
+            .borrow_mut()
+            .ring_mut()
+            .queue_nop_operation()
+            .unwrap();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(wake_count);
+        let mut context = Context::from_waker(&waker);
+
+        {
+            let mut future = IoUringOperationFuture::new(Rc::clone(&dispatcher), operation);
+            assert!(matches!(
+                Pin::new(&mut future).poll(&mut context),
+                Poll::Pending
+            ));
+            assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 1);
+        }
+
+        assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
     }
 
     #[test]
