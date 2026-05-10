@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::mem;
 use std::os::raw::{c_int, c_long, c_uint, c_void};
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
@@ -1071,6 +1072,180 @@ impl fmt::Debug for IoUringOperationFuture {
     }
 }
 
+/// Result of an owned-buffer `io_uring` read future.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoUringReadCompletion {
+    /// Completion metadata for the read operation.
+    pub completion: IoUringOperationCompletion,
+    /// Buffer owned by the read operation.
+    pub buffer: Vec<u8>,
+}
+
+/// Future for a tracked read operation that owns its buffer.
+///
+/// The future keeps the buffer allocation alive until the kernel completion is
+/// observed. Dropping it while pending intentionally leaks the buffer rather
+/// than freeing memory that the kernel may still write through.
+pub struct IoUringReadFuture {
+    operation: IoUringOperationFuture,
+    buffer: Option<Vec<u8>>,
+}
+
+impl IoUringReadFuture {
+    /// Queues a tracked read operation using an owned buffer.
+    pub fn queue(
+        dispatcher: SharedIoUringDispatcher,
+        fd: RawFd,
+        mut buffer: Vec<u8>,
+        offset: u64,
+    ) -> io::Result<Self> {
+        let operation = {
+            let mut dispatcher_ref = dispatcher.borrow_mut();
+            // SAFETY: `buffer` is moved into the returned future and kept
+            // alive until completion. Moving the Vec value does not move the
+            // heap allocation passed to the kernel.
+            unsafe {
+                dispatcher_ref
+                    .ring_mut()
+                    .queue_read_operation(fd, &mut buffer, offset)?
+            }
+        };
+
+        Ok(Self {
+            operation: IoUringOperationFuture::new(dispatcher, operation),
+            buffer: Some(buffer),
+        })
+    }
+
+    /// Returns the operation id this future waits for.
+    pub fn operation(&self) -> IoUringOperationId {
+        self.operation.operation()
+    }
+}
+
+impl Future for IoUringReadFuture {
+    type Output = IoUringReadCompletion;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.operation).poll(context) {
+            Poll::Ready(completion) => Poll::Ready(IoUringReadCompletion {
+                completion,
+                buffer: this
+                    .buffer
+                    .take()
+                    .expect("read buffer exists until completion"),
+            }),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for IoUringReadFuture {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            mem::forget(buffer);
+        }
+    }
+}
+
+impl fmt::Debug for IoUringReadFuture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IoUringReadFuture")
+            .field("operation", &self.operation())
+            .field("buffer_len", &self.buffer.as_ref().map_or(0, Vec::len))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of an owned-buffer `io_uring` write future.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoUringWriteCompletion {
+    /// Completion metadata for the write operation.
+    pub completion: IoUringOperationCompletion,
+    /// Buffer owned by the write operation.
+    pub buffer: Vec<u8>,
+}
+
+/// Future for a tracked write operation that owns its buffer.
+///
+/// The future keeps the buffer allocation alive until the kernel completion is
+/// observed. Dropping it while pending intentionally leaks the buffer rather
+/// than freeing memory that the kernel may still read through.
+pub struct IoUringWriteFuture {
+    operation: IoUringOperationFuture,
+    buffer: Option<Vec<u8>>,
+}
+
+impl IoUringWriteFuture {
+    /// Queues a tracked write operation using an owned buffer.
+    pub fn queue(
+        dispatcher: SharedIoUringDispatcher,
+        fd: RawFd,
+        buffer: Vec<u8>,
+        offset: u64,
+    ) -> io::Result<Self> {
+        let operation = {
+            let mut dispatcher_ref = dispatcher.borrow_mut();
+            // SAFETY: `buffer` is moved into the returned future and kept
+            // alive until completion. Moving the Vec value does not move the
+            // heap allocation passed to the kernel.
+            unsafe {
+                dispatcher_ref
+                    .ring_mut()
+                    .queue_write_operation(fd, &buffer, offset)?
+            }
+        };
+
+        Ok(Self {
+            operation: IoUringOperationFuture::new(dispatcher, operation),
+            buffer: Some(buffer),
+        })
+    }
+
+    /// Returns the operation id this future waits for.
+    pub fn operation(&self) -> IoUringOperationId {
+        self.operation.operation()
+    }
+}
+
+impl Future for IoUringWriteFuture {
+    type Output = IoUringWriteCompletion;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.operation).poll(context) {
+            Poll::Ready(completion) => Poll::Ready(IoUringWriteCompletion {
+                completion,
+                buffer: this
+                    .buffer
+                    .take()
+                    .expect("write buffer exists until completion"),
+            }),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for IoUringWriteFuture {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            mem::forget(buffer);
+        }
+    }
+}
+
+impl fmt::Debug for IoUringWriteFuture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IoUringWriteFuture")
+            .field("operation", &self.operation())
+            .field("buffer_len", &self.buffer.as_ref().map_or(0, Vec::len))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Read-only locally observable state for an [`IoUringDispatcher`].
 #[must_use]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1262,7 +1437,10 @@ fn read_cqe(ptr: *mut IoUringCqe) -> IoUringCqe {
 
 #[cfg(test)]
 mod tests {
-    use super::{IoUring, IoUringDispatcher, IoUringOperationFuture, IoUringOperationKind};
+    use super::{
+        IoUring, IoUringDispatcher, IoUringOperationFuture, IoUringOperationKind,
+        IoUringReadFuture, IoUringWriteFuture,
+    };
     use std::future::Future;
     use std::os::raw::c_void;
     use std::os::unix::io::RawFd;
@@ -1624,6 +1802,79 @@ mod tests {
             .unwrap();
         assert_eq!(timeout_completion.kind, IoUringOperationKind::Timeout);
         assert_eq!(timeout_completion.result, -ECANCELED);
+    }
+
+    #[test]
+    fn owned_read_future_returns_filled_buffer() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+        write_bytes(write_fd.raw(), b"uring");
+
+        let mut future =
+            IoUringReadFuture::queue(Rc::clone(&dispatcher), read_fd.raw(), vec![0; 5], u64::MAX)
+                .unwrap();
+        let operation = future.operation();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        let Poll::Ready(read) = Pin::new(&mut future).poll(&mut context) else {
+            panic!("owned read future should be ready after dispatch");
+        };
+        assert_eq!(read.completion.operation, operation);
+        assert_eq!(read.completion.kind, IoUringOperationKind::Read);
+        assert_eq!(read.completion.result, 5);
+        assert_eq!(&read.buffer, b"uring");
+    }
+
+    #[test]
+    fn owned_write_future_returns_written_buffer() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+
+        let mut future = IoUringWriteFuture::queue(
+            Rc::clone(&dispatcher),
+            write_fd.raw(),
+            b"uring".to_vec(),
+            u64::MAX,
+        )
+        .unwrap();
+        let operation = future.operation();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        let Poll::Ready(write) = Pin::new(&mut future).poll(&mut context) else {
+            panic!("owned write future should be ready after dispatch");
+        };
+        let mut buffer = [0u8; 5];
+        read_bytes(read_fd.raw(), &mut buffer);
+
+        assert_eq!(write.completion.operation, operation);
+        assert_eq!(write.completion.kind, IoUringOperationKind::Write);
+        assert_eq!(write.completion.result, 5);
+        assert_eq!(&write.buffer, b"uring");
+        assert_eq!(&buffer, b"uring");
     }
 
     #[test]
