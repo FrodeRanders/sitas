@@ -21,8 +21,8 @@ fn main() -> std::io::Result<()> {
 
     for completion in &completions {
         println!(
-            "completed operation #{} (raw user_data {}) with result {}",
-            completion.operation.sequence(),
+            "completed operation {} (raw user_data {}) with result {}",
+            completion.operation,
             completion.operation.raw(),
             completion.result
         );

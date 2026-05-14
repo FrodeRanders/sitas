@@ -1379,7 +1379,7 @@ pub struct IoUringCompletion {
 /// application-owned raw completions in the lower half of the `u64` space. Use
 /// [`IoUringOperationId::sequence`] for compact diagnostics.
 #[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IoUringOperationId(u64);
 
 impl IoUringOperationId {
@@ -1397,9 +1397,24 @@ impl IoUringOperationId {
     }
 }
 
+impl fmt::Debug for IoUringOperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IoUringOperationId")
+            .field("sequence", &self.sequence())
+            .field("raw", &self.raw())
+            .finish()
+    }
+}
+
+impl fmt::Display for IoUringOperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{}", self.sequence())
+    }
+}
+
 /// Kind of tracked operation submitted through [`IoUring`].
 #[must_use]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IoUringOperationKind {
     /// No-op operation.
     Nop,
@@ -1414,6 +1429,18 @@ pub enum IoUringOperationKind {
         /// Target operation requested for cancellation.
         target: IoUringOperationId,
     },
+}
+
+impl fmt::Debug for IoUringOperationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Nop => f.write_str("Nop"),
+            Self::Read => f.write_str("Read"),
+            Self::Write => f.write_str("Write"),
+            Self::Timeout => f.write_str("Timeout"),
+            Self::Cancel { target } => write!(f, "Cancel {{ target: {target} }}"),
+        }
+    }
 }
 
 /// Counts of tracked operations by kind in an [`IoUringSnapshot`].
@@ -1595,6 +1622,19 @@ mod tests {
 
         assert_eq!(operation.raw(), super::OPERATION_USER_DATA_BASE | 42);
         assert_eq!(operation.sequence(), 42);
+        assert_eq!(operation.to_string(), "#42");
+        assert_eq!(
+            format!("{operation:?}"),
+            "IoUringOperationId { sequence: 42, raw: 9223372036854775850 }"
+        );
+    }
+
+    #[test]
+    fn cancel_operation_kind_debug_uses_readable_target() {
+        let operation = super::IoUringOperationId(super::OPERATION_USER_DATA_BASE | 42);
+        let kind = IoUringOperationKind::Cancel { target: operation };
+
+        assert_eq!(format!("{kind:?}"), "Cancel { target: #42 }");
     }
 
     #[test]

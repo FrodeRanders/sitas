@@ -13,11 +13,11 @@ fn main() -> std::io::Result<()> {
 
     let queued = ring.snapshot();
     println!(
-        "queued: submissions={} tracked={} timeout=#{} cancel=#{} timeouts={} cancellations={}",
+        "queued: submissions={} tracked={} timeout={} cancel={} timeouts={} cancellations={}",
         queued.pending_submissions,
         queued.tracked_operations,
-        timeout.sequence(),
-        cancel.sequence(),
+        timeout,
+        cancel,
         queued.operation_kinds.timeouts,
         queued.operation_kinds.cancellations
     );
