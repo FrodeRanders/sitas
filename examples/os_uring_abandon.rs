@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
-    use sitas::os::{IoUringDispatcher, IoUringOperationFuture};
+    use sitas::os::{
+        IoUringDispatcher, IoUringOperationFuture, available_io_uring, report_io_uring_unavailable,
+    };
     use std::future::Future;
     use std::pin::Pin;
     use std::rc::Rc;
@@ -8,8 +10,8 @@ fn main() -> std::io::Result<()> {
     use std::task::Context;
     use std::time::Duration;
 
-    let Some(ring) = available_ring()? else {
-        report_unavailable();
+    let Some(ring) = available_io_uring(8)? else {
+        report_io_uring_unavailable();
         return Ok(());
     };
 
@@ -82,39 +84,6 @@ fn drain_dispatcher_until_idle(
         "dispatcher did not become idle after draining: {:?}",
         dispatcher.borrow().snapshot()
     );
-}
-
-#[cfg(target_os = "linux")]
-fn available_ring() -> std::io::Result<Option<sitas::os::IoUring>> {
-    match sitas::os::IoUring::new(8) {
-        Ok(ring) => Ok(Some(ring)),
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(1) | Some(22) | Some(38) | Some(95)
-            ) =>
-        {
-            if require_io_uring() {
-                return Err(error);
-            }
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn report_unavailable() {
-    println!("io_uring unavailable on this Linux host");
-    println!("set SITAS_REQUIRE_IO_URING=1 to fail instead of skipping");
-}
-
-#[cfg(target_os = "linux")]
-fn require_io_uring() -> bool {
-    matches!(
-        std::env::var("SITAS_REQUIRE_IO_URING").as_deref(),
-        Ok("1" | "true" | "yes" | "on")
-    )
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -29,6 +29,47 @@ pub use uring::{
     block_on_io_uring_all,
 };
 
+/// Returns whether `SITAS_REQUIRE_IO_URING` requests strict `io_uring`
+/// availability.
+#[cfg(target_os = "linux")]
+pub fn io_uring_required() -> bool {
+    matches!(
+        std::env::var("SITAS_REQUIRE_IO_URING").as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Creates an [`IoUring`] when the current Linux host allows it.
+///
+/// Docker and other container runtimes may block `io_uring_setup`. In that
+/// case this returns `Ok(None)` unless [`io_uring_required`] is true, in which
+/// case the creation error is returned.
+#[cfg(target_os = "linux")]
+pub fn available_io_uring(entries: u32) -> io::Result<Option<IoUring>> {
+    match IoUring::new(entries) {
+        Ok(ring) => Ok(Some(ring)),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(1) | Some(22) | Some(38) | Some(95)
+            ) =>
+        {
+            if io_uring_required() {
+                return Err(error);
+            }
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Prints the standard message used when `io_uring` examples skip execution.
+#[cfg(target_os = "linux")]
+pub fn report_io_uring_unavailable() {
+    println!("io_uring unavailable on this Linux host");
+    println!("set SITAS_REQUIRE_IO_URING=1 to fail instead of skipping");
+}
+
 #[cfg(not(target_os = "linux"))]
 type Nfds = u32;
 type SockLen = u32;
