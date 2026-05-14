@@ -1018,6 +1018,11 @@ impl IoUringDispatcher {
 
     /// Returns a local dispatcher snapshot.
     pub fn snapshot(&self) -> IoUringDispatcherSnapshot {
+        let mut completed_operation_kinds = IoUringOperationKindCounts::default();
+        for completion in self.completions.values() {
+            completed_operation_kinds.add(completion.kind);
+        }
+
         let mut abandoned_operation_kinds = IoUringOperationKindCounts::default();
         for kind in self.abandoned_operations.values() {
             abandoned_operation_kinds.add(*kind);
@@ -1027,6 +1032,7 @@ impl IoUringDispatcher {
             ring: self.ring.snapshot(),
             registered_wakers: self.waiters.len(),
             completed_operations: self.completions.len(),
+            completed_operation_kinds,
             abandoned_operations: self.abandoned_operations.len(),
             abandoned_operation_kinds,
             deferred_buffers: self.deferred_buffers.len(),
@@ -1402,6 +1408,8 @@ pub struct IoUringDispatcherSnapshot {
     pub registered_wakers: usize,
     /// Number of completed tracked operations buffered for consumption.
     pub completed_operations: usize,
+    /// Completed tracked operations grouped by operation kind.
+    pub completed_operation_kinds: IoUringOperationKindCounts,
     /// Number of abandoned operations whose completions will be discarded.
     pub abandoned_operations: usize,
     /// Abandoned operations grouped by operation kind.
@@ -1896,10 +1904,12 @@ mod tests {
         assert_eq!(wake_count.load(Ordering::SeqCst), 0);
         assert_eq!(dispatcher.snapshot().registered_wakers, 0);
         assert_eq!(dispatcher.snapshot().completed_operations, 1);
+        assert_eq!(dispatcher.snapshot().completed_operation_kinds.nops, 1);
 
         let completion = dispatcher.take_completion(operation).unwrap();
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(dispatcher.snapshot().completed_operations, 0);
+        assert_eq!(dispatcher.snapshot().completed_operation_kinds.nops, 0);
     }
 
     #[test]
