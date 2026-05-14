@@ -13,7 +13,9 @@ if [ "$#" -eq 0 ]; then
         set -eu
         export PATH="/usr/local/cargo/bin:$PATH"
         rustup component add rustfmt
+        rustup component add clippy
         cargo fmt --check
+        cargo clippy --all-targets -- -D warnings
         cargo test
         cargo doc --no-deps
         cargo run --example basic_kv

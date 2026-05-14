@@ -442,9 +442,10 @@ Run the Linux Docker check from macOS:
 tools/linux-docker.sh
 ```
 
-By default this proves the Linux build and examples, but `io_uring` may be
-skipped if the container runtime blocks `io_uring_setup`. To require real
-`io_uring` coverage, run with Docker seccomp disabled:
+By default this proves the Linux build, formatting, clippy lints, tests, docs,
+and examples, but `io_uring` may be skipped if the container runtime blocks
+`io_uring_setup`. To require real `io_uring` coverage, run with Docker seccomp
+disabled:
 
 ```sh
 SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh
