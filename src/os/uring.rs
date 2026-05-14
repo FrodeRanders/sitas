@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -535,6 +535,11 @@ impl IoUring {
         self.operations.contains_key(&operation)
     }
 
+    /// Returns the kind of a tracked operation, if it is still tracked.
+    pub fn operation_kind(&self, operation: IoUringOperationId) -> Option<IoUringOperationKind> {
+        self.operations.get(&operation).map(|state| state.kind)
+    }
+
     /// Returns a read-only snapshot of locally tracked ring state.
     ///
     /// The snapshot is intentionally local: it reports queued submissions,
@@ -888,7 +893,7 @@ pub struct IoUringDispatcher {
     ring: IoUring,
     waiters: HashMap<IoUringOperationId, Waker>,
     completions: HashMap<IoUringOperationId, IoUringOperationCompletion>,
-    abandoned_operations: HashSet<IoUringOperationId>,
+    abandoned_operations: HashMap<IoUringOperationId, IoUringOperationKind>,
     deferred_buffers: HashMap<IoUringOperationId, Vec<u8>>,
 }
 
@@ -899,7 +904,7 @@ impl IoUringDispatcher {
             ring,
             waiters: HashMap::new(),
             completions: HashMap::new(),
-            abandoned_operations: HashSet::new(),
+            abandoned_operations: HashMap::new(),
             deferred_buffers: HashMap::new(),
         }
     }
@@ -957,13 +962,15 @@ impl IoUringDispatcher {
         if self.completions.remove(&operation).is_some() {
             return;
         }
-        if !self.ring.is_operation_tracked(operation)
-            || !self.abandoned_operations.insert(operation)
-        {
+        let Some(kind) = self.ring.operation_kind(operation) else {
+            return;
+        };
+        if self.abandoned_operations.insert(operation, kind).is_some() {
             return;
         }
         if let Ok(cancel) = self.ring.queue_cancel_operation(operation) {
-            self.abandoned_operations.insert(cancel);
+            self.abandoned_operations
+                .insert(cancel, IoUringOperationKind::Cancel { target: operation });
         }
     }
 
@@ -988,7 +995,7 @@ impl IoUringDispatcher {
         let mut dispatched = 0;
         while let Some(completion) = self.ring.try_operation_completion() {
             let operation = completion.operation;
-            if self.abandoned_operations.remove(&operation) {
+            if self.abandoned_operations.remove(&operation).is_some() {
                 self.deferred_buffers.remove(&operation);
                 dispatched += 1;
                 continue;
@@ -1011,11 +1018,17 @@ impl IoUringDispatcher {
 
     /// Returns a local dispatcher snapshot.
     pub fn snapshot(&self) -> IoUringDispatcherSnapshot {
+        let mut abandoned_operation_kinds = IoUringOperationKindCounts::default();
+        for kind in self.abandoned_operations.values() {
+            abandoned_operation_kinds.add(*kind);
+        }
+
         IoUringDispatcherSnapshot {
             ring: self.ring.snapshot(),
             registered_wakers: self.waiters.len(),
             completed_operations: self.completions.len(),
             abandoned_operations: self.abandoned_operations.len(),
+            abandoned_operation_kinds,
             deferred_buffers: self.deferred_buffers.len(),
         }
     }
@@ -1391,6 +1404,8 @@ pub struct IoUringDispatcherSnapshot {
     pub completed_operations: usize,
     /// Number of abandoned operations whose completions will be discarded.
     pub abandoned_operations: usize,
+    /// Abandoned operations grouped by operation kind.
+    pub abandoned_operation_kinds: IoUringOperationKindCounts,
     /// Number of abandoned owned buffers waiting for kernel completion.
     pub deferred_buffers: usize,
 }
@@ -2135,6 +2150,22 @@ mod tests {
         assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 1);
         assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 2);
+        assert_eq!(
+            dispatcher
+                .borrow()
+                .snapshot()
+                .abandoned_operation_kinds
+                .reads,
+            1
+        );
+        assert_eq!(
+            dispatcher
+                .borrow()
+                .snapshot()
+                .abandoned_operation_kinds
+                .cancellations,
+            1
+        );
 
         drain_dispatcher_until_idle(&dispatcher);
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
@@ -2211,6 +2242,22 @@ mod tests {
         assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 1);
         assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 2);
+        assert_eq!(
+            dispatcher
+                .borrow()
+                .snapshot()
+                .abandoned_operation_kinds
+                .writes,
+            1
+        );
+        assert_eq!(
+            dispatcher
+                .borrow()
+                .snapshot()
+                .abandoned_operation_kinds
+                .cancellations,
+            1
+        );
 
         drain_dispatcher_until_idle(&dispatcher);
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
@@ -2244,6 +2291,22 @@ mod tests {
 
         assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
         assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 2);
+        assert_eq!(
+            dispatcher
+                .borrow()
+                .snapshot()
+                .abandoned_operation_kinds
+                .nops,
+            1
+        );
+        assert_eq!(
+            dispatcher
+                .borrow()
+                .snapshot()
+                .abandoned_operation_kinds
+                .cancellations,
+            1
+        );
         drain_dispatcher_until_idle(&dispatcher);
         assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
         assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
