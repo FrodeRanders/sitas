@@ -33,6 +33,9 @@ const SQE_ADDR_OFFSET: usize = 16;
 const SQE_LEN_OFFSET: usize = 24;
 const SQE_TIMEOUT_FLAGS_OFFSET: usize = 28;
 const SQE_USER_DATA_OFFSET: usize = 32;
+// The high bit separates runtime-tracked operations from caller-supplied raw
+// user_data values. The low bits remain a small, monotonic sequence number that
+// is easier to read in logs and examples.
 const OPERATION_USER_DATA_BASE: u64 = 1 << 63;
 
 const PROT_READ: c_int = 0x1;
@@ -1370,6 +1373,11 @@ pub struct IoUringCompletion {
 }
 
 /// Identifier for a tracked `io_uring` operation.
+///
+/// The raw value is also the SQE `user_data` value used by the kernel. Tracked
+/// runtime operations reserve the high bit so they cannot collide with
+/// application-owned raw completions in the lower half of the `u64` space. Use
+/// [`IoUringOperationId::sequence`] for compact diagnostics.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IoUringOperationId(u64);
@@ -1378,6 +1386,14 @@ impl IoUringOperationId {
     /// Returns the raw `user_data` value placed in the SQE.
     pub fn raw(self) -> u64 {
         self.0
+    }
+
+    /// Returns the small sequence number allocated by this ring.
+    ///
+    /// This strips the runtime namespace bit from [`IoUringOperationId::raw`]
+    /// and is intended for human-facing diagnostics.
+    pub fn sequence(self) -> u64 {
+        self.0 ^ OPERATION_USER_DATA_BASE
     }
 }
 
@@ -1574,6 +1590,14 @@ mod tests {
     const REQUIRE_IO_URING_ENV: &str = "SITAS_REQUIRE_IO_URING";
 
     #[test]
+    fn operation_id_sequence_strips_runtime_namespace() {
+        let operation = super::IoUringOperationId(super::OPERATION_USER_DATA_BASE | 42);
+
+        assert_eq!(operation.raw(), super::OPERATION_USER_DATA_BASE | 42);
+        assert_eq!(operation.sequence(), 42);
+    }
+
+    #[test]
     fn nop_completion_round_trip() {
         let Some(mut ring) = available_ring() else {
             return;
@@ -1730,6 +1754,7 @@ mod tests {
 
         let operation = ring.queue_nop_operation().unwrap();
         assert!(operation.raw() & super::OPERATION_USER_DATA_BASE != 0);
+        assert_eq!(operation.sequence(), 0);
         assert_eq!(ring.submit_pending().unwrap(), 1);
 
         let completion = ring.wait_operation_completion(operation).unwrap();
