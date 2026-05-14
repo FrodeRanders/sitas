@@ -17,6 +17,16 @@ fn main() -> std::io::Result<()> {
         IoUringOperationFuture::queue_nop(Rc::clone(&dispatcher))?,
     ];
     let operations: Vec<_> = futures.iter().map(|future| future.operation()).collect();
+
+    assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(3)?, 3);
+    let ready = dispatcher.borrow().snapshot();
+    println!(
+        "buffered completions: total={} nops={}",
+        ready.completed_operations, ready.completed_operation_kinds.nops
+    );
+    assert_eq!(ready.completed_operations, 3);
+    assert_eq!(ready.completed_operation_kinds.nops, 3);
+
     let completions = block_on_io_uring_all(Rc::clone(&dispatcher), futures)?;
 
     for completion in &completions {
