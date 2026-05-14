@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -530,6 +530,11 @@ impl IoUring {
         self.operations.len()
     }
 
+    /// Returns whether `operation` is still tracked by this ring.
+    pub fn is_operation_tracked(&self, operation: IoUringOperationId) -> bool {
+        self.operations.contains_key(&operation)
+    }
+
     /// Returns a read-only snapshot of locally tracked ring state.
     ///
     /// The snapshot is intentionally local: it reports queued submissions,
@@ -651,6 +656,7 @@ impl IoUring {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn queue_buffer_operation(
         &mut self,
         opcode: u8,
@@ -882,6 +888,7 @@ pub struct IoUringDispatcher {
     ring: IoUring,
     waiters: HashMap<IoUringOperationId, Waker>,
     completions: HashMap<IoUringOperationId, IoUringOperationCompletion>,
+    abandoned_operations: HashSet<IoUringOperationId>,
     deferred_buffers: HashMap<IoUringOperationId, Vec<u8>>,
 }
 
@@ -892,6 +899,7 @@ impl IoUringDispatcher {
             ring,
             waiters: HashMap::new(),
             completions: HashMap::new(),
+            abandoned_operations: HashSet::new(),
             deferred_buffers: HashMap::new(),
         }
     }
@@ -938,6 +946,27 @@ impl IoUringDispatcher {
         self.completions.remove(&operation)
     }
 
+    /// Abandons a tracked operation and asks the kernel to cancel it.
+    ///
+    /// The original operation may still complete normally if the kernel cannot
+    /// cancel it in time. Either way, the dispatcher discards the operation's
+    /// completion because no future remains to consume it. The cancellation
+    /// request completion is also discarded.
+    pub fn abandon_operation(&mut self, operation: IoUringOperationId) {
+        self.clear_waker(operation);
+        if self.completions.remove(&operation).is_some() {
+            return;
+        }
+        if !self.ring.is_operation_tracked(operation)
+            || !self.abandoned_operations.insert(operation)
+        {
+            return;
+        }
+        if let Ok(cancel) = self.ring.queue_cancel_operation(operation) {
+            self.abandoned_operations.insert(cancel);
+        }
+    }
+
     /// Keeps an abandoned owned I/O buffer alive until its kernel operation
     /// completes.
     ///
@@ -945,8 +974,8 @@ impl IoUringDispatcher {
     /// buffer are discarded immediately because no future remains to consume
     /// them.
     pub fn defer_buffer_drop(&mut self, operation: IoUringOperationId, buffer: Vec<u8>) {
-        self.clear_waker(operation);
-        if self.completions.remove(&operation).is_none() {
+        self.abandon_operation(operation);
+        if self.ring.is_operation_tracked(operation) {
             self.deferred_buffers.insert(operation, buffer);
         }
     }
@@ -959,7 +988,8 @@ impl IoUringDispatcher {
         let mut dispatched = 0;
         while let Some(completion) = self.ring.try_operation_completion() {
             let operation = completion.operation;
-            if self.deferred_buffers.remove(&operation).is_some() {
+            if self.abandoned_operations.remove(&operation) {
+                self.deferred_buffers.remove(&operation);
                 dispatched += 1;
                 continue;
             }
@@ -985,6 +1015,7 @@ impl IoUringDispatcher {
             ring: self.ring.snapshot(),
             registered_wakers: self.waiters.len(),
             completed_operations: self.completions.len(),
+            abandoned_operations: self.abandoned_operations.len(),
             deferred_buffers: self.deferred_buffers.len(),
         }
     }
@@ -1152,7 +1183,9 @@ impl Future for IoUringOperationFuture {
 
 impl Drop for IoUringOperationFuture {
     fn drop(&mut self) {
-        self.dispatcher.borrow_mut().clear_waker(self.operation);
+        self.dispatcher
+            .borrow_mut()
+            .abandon_operation(self.operation);
     }
 }
 
@@ -1356,6 +1389,8 @@ pub struct IoUringDispatcherSnapshot {
     pub registered_wakers: usize,
     /// Number of completed tracked operations buffered for consumption.
     pub completed_operations: usize,
+    /// Number of abandoned operations whose completions will be discarded.
+    pub abandoned_operations: usize,
     /// Number of abandoned owned buffers waiting for kernel completion.
     pub deferred_buffers: usize,
 }
@@ -1597,6 +1632,8 @@ static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop,
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unusual_byte_groupings)]
+
     use super::{
         IoUring, IoUringDispatcher, IoUringOperationFuture, IoUringOperationKind,
         IoUringReadFuture, IoUringWriteFuture, block_on_io_uring, block_on_io_uring_all,
@@ -2097,9 +2134,11 @@ mod tests {
 
         assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 1);
+        assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 2);
 
-        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        drain_dispatcher_until_idle(&dispatcher);
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
+        assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
         assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
     }
 
@@ -2149,7 +2188,7 @@ mod tests {
             return;
         };
         let dispatcher = IoUringDispatcher::new(ring).into_shared();
-        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+        let (_read_fd, write_fd) = super::super::create_pipe().unwrap();
         let wake_count = Arc::new(AtomicUsize::new(0));
         let waker = counting_waker(wake_count);
         let mut context = Context::from_waker(&waker);
@@ -2171,18 +2210,16 @@ mod tests {
 
         assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 1);
+        assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 2);
 
-        assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1).unwrap(), 1);
+        drain_dispatcher_until_idle(&dispatcher);
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
+        assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
         assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
-
-        let mut buffer = [0u8; 5];
-        read_bytes(read_fd.raw(), &mut buffer);
-        assert_eq!(&buffer, b"uring");
     }
 
     #[test]
-    fn dropping_pending_operation_future_clears_registered_waker() {
+    fn dropping_pending_operation_future_cancels_and_discards_completion() {
         let Some(ring) = available_ring() else {
             return;
         };
@@ -2206,6 +2243,10 @@ mod tests {
         }
 
         assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 0);
+        assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 2);
+        drain_dispatcher_until_idle(&dispatcher);
+        assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
+        assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
     }
 
     #[test]
@@ -2411,6 +2452,24 @@ mod tests {
         assert_eq!(completion.kind, IoUringOperationKind::Write);
         assert_eq!(completion.result, 5);
         assert_eq!(&buffer, b"uring");
+    }
+
+    fn drain_dispatcher_until_idle(dispatcher: &super::SharedIoUringDispatcher) {
+        for _ in 0..8 {
+            let snapshot = dispatcher.borrow().snapshot();
+            if snapshot.ring.tracked_operations == 0
+                && snapshot.abandoned_operations == 0
+                && snapshot.deferred_buffers == 0
+            {
+                return;
+            }
+            dispatcher.borrow_mut().wait_and_dispatch(1).unwrap();
+        }
+
+        panic!(
+            "dispatcher did not become idle after draining: {:?}",
+            dispatcher.borrow().snapshot()
+        );
     }
 
     fn available_ring() -> Option<IoUring> {
