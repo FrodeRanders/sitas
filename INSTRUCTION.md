@@ -2,6 +2,10 @@ You are helping me create a new Rust project called `sitas`.
 
 The goal is to experiment with a Rust-native architecture inspired by Seastar, but not to clone Seastar directly.
 
+Status note: this document started as the first-milestone brief. The codebase
+has since moved beyond the initial standard-library kernel into a custom
+executor, networking reactor work, and an experimental Linux `io_uring` backend.
+
 Seastar’s valuable ideas are:
 
 - one shard per core / worker thread
@@ -634,6 +638,5 @@ Therefore:
 The first deliverable should be boring, small, and correct.
 
 Build the smallest useful kernel first.
-
 
 

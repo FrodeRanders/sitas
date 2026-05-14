@@ -442,8 +442,26 @@ Run the Linux Docker check from macOS:
 tools/linux-docker.sh
 ```
 
+By default this proves the Linux build and examples, but `io_uring` may be
+skipped if the container runtime blocks `io_uring_setup`. To require real
+`io_uring` coverage, run with Docker seccomp disabled:
+
+```sh
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh
+```
+
+That sets `SITAS_REQUIRE_IO_URING=1` inside the container, so the `io_uring`
+tests and examples fail instead of silently skipping when the kernel or
+container configuration does not allow `io_uring`. If seccomp is not enough for
+your Docker environment, the script also supports:
+
+```sh
+SITAS_DOCKER_PRIVILEGED=1 SITAS_REQUIRE_IO_URING=1 tools/linux-docker.sh
+```
+
 Pass a custom command after the script name to run a narrower Linux check:
 
 ```sh
 tools/linux-docker.sh cargo test os::tests
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test os::uring::tests -- --nocapture
 ```
