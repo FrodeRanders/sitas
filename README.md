@@ -117,7 +117,7 @@ This milestone does not include:
 - production-ready async I/O
 - production-ready networking
 - persistence
-- CPU pinning
+- portable production CPU pinning
 - scheduling classes
 - procedural macro service generation
 - broad `unsafe` usage outside the small Unix FFI backend

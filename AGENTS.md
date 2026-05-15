@@ -6,11 +6,11 @@ This repository explores a Rust-native, Seastar-inspired shard-per-core runtime 
 
 The original baseline is a dependency-free, standard-library sharded service kernel. The active exploration adds a custom executor, Unix OS primitives, readiness-based I/O, TCP helpers, sharded executors, shard-local state, observability snapshots, CPU placement, and experimental Linux `io_uring` support.
 
-Before changing runtime, executor, sharding, I/O, lifecycle, or service-state code, read `ARCHITECTURE.md`.
+Before changing runtime, executor, sharding, I/O, lifecycle, or service-state code, read `docs/architecture.md`.
 
 ## Architectural invariants
 
-Preserve these unless the change is explicitly about revising the architecture and updates `ARCHITECTURE.md` at the same time.
+Preserve these unless the change is explicitly about revising the architecture and updates `docs/architecture.md` at the same time.
 
 1. Only the owning shard may mutate its application service state.
 2. Application service state must not be hidden behind `Arc<Mutex<Service>>` as the normal programming model.
@@ -85,22 +85,24 @@ Run the narrowest relevant tests first, then broaden.
 Preferred commands:
 
 ```bash
-cargo fmt
+cargo fmt --check
 cargo test
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets -- -D warnings
+cargo doc --no-deps
 ```
 
 When touching platform-specific code, also run the relevant platform validation if available:
 
 ```bash
 cargo test --all-targets
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh
 ```
 
 For Linux-only features such as CPU affinity or `io_uring`, keep tests gated so macOS and other Unix platforms report unsupported behavior honestly rather than failing spuriously.
 
 ## Documentation responsibilities
 
-Update `ARCHITECTURE.md` when a change affects:
+Update `docs/architecture.md` when a change affects:
 
 - shard ownership rules;
 - executor semantics;
@@ -113,7 +115,7 @@ Update `ARCHITECTURE.md` when a change affects:
 - observability snapshot fields;
 - non-goals or roadmap direction.
 
-Keep `AGENTS.md` operational and concise. Put detailed design explanations in `ARCHITECTURE.md`.
+Keep `AGENTS.md` operational and concise. Put detailed design explanations in `docs/architecture.md`.
 
 ## Current non-goals
 
