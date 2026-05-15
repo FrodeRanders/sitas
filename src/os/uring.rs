@@ -1613,6 +1613,16 @@ pub struct IoUringOperationKindCounts {
 }
 
 impl IoUringOperationKindCounts {
+    /// Returns the sum of all operation-kind counts.
+    pub fn total(&self) -> usize {
+        self.nops + self.reads + self.writes + self.timeouts + self.cancellations
+    }
+
+    /// Returns whether all operation-kind counts are zero.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
     fn add(&mut self, kind: IoUringOperationKind) {
         match kind {
             IoUringOperationKind::Nop => self.nops += 1,
@@ -1860,6 +1870,8 @@ mod tests {
         assert_eq!(snapshot.tracked_operations, 2);
         assert_eq!(snapshot.operation_kinds.timeouts, 1);
         assert_eq!(snapshot.operation_kinds.cancellations, 1);
+        assert_eq!(snapshot.operation_kinds.total(), 2);
+        assert!(!snapshot.operation_kinds.is_empty());
         assert!(!snapshot.is_idle());
 
         let cancel_completion = ring.wait_operation_completion(cancel).unwrap();
@@ -1869,6 +1881,7 @@ mod tests {
         assert_eq!(timeout_completion.result, -ECANCELED);
         let idle = ring.snapshot();
         assert_eq!(idle.tracked_operations, 0);
+        assert!(idle.operation_kinds.is_empty());
         assert!(idle.is_idle());
     }
 
@@ -2004,6 +2017,10 @@ mod tests {
         assert_eq!(snapshot.total_buffered_operation_kinds.nops, 1);
         assert_eq!(snapshot.total_woken_operation_kinds.nops, 1);
         assert_eq!(snapshot.total_discarded_operation_kinds.nops, 0);
+        assert_eq!(snapshot.total_dispatched_operation_kinds.total(), 1);
+        assert_eq!(snapshot.total_buffered_operation_kinds.total(), 1);
+        assert_eq!(snapshot.total_woken_operation_kinds.total(), 1);
+        assert!(snapshot.total_discarded_operation_kinds.is_empty());
     }
 
     #[test]
@@ -2469,6 +2486,8 @@ mod tests {
         assert_eq!(drained.total_woken_operation_kinds.nops, 0);
         assert_eq!(drained.total_discarded_operation_kinds.nops, 1);
         assert_eq!(drained.total_discarded_operation_kinds.cancellations, 1);
+        assert_eq!(drained.total_dispatched_operation_kinds.total(), 2);
+        assert_eq!(drained.total_discarded_operation_kinds.total(), 2);
     }
 
     #[test]

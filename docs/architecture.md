@@ -283,6 +283,8 @@ The snapshot fields map to these states:
 - `IoUringSnapshot.tracked_operations`: operations that have been submitted or
   queued and whose tracked completion has not yet been consumed from `IoUring`.
 - `IoUringSnapshot.operation_kinds`: tracked operations grouped by kind.
+  `IoUringOperationKindCounts::total()` and `is_empty()` summarize those
+  grouped counts without repeating the individual fields.
 - `IoUringDispatcherSnapshot.registered_wakers`: tasks waiting for tracked
   completions.
 - `IoUringDispatcherSnapshot.completed_operations`: tracked completions buffered
