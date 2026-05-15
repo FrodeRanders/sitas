@@ -1016,6 +1016,48 @@ impl IoUringDispatcher {
         Ok(self.dispatch_available())
     }
 
+    /// Returns whether the dispatcher has no kernel, completion, or waiter
+    /// state left to drive.
+    pub fn is_idle(&self) -> bool {
+        let snapshot = self.snapshot();
+        snapshot.ring.pending_submissions == 0
+            && snapshot.ring.pending_completions == 0
+            && snapshot.ring.tracked_operations == 0
+            && snapshot.registered_wakers == 0
+            && snapshot.completed_operations == 0
+            && snapshot.abandoned_operations == 0
+            && snapshot.deferred_buffers == 0
+    }
+
+    /// Drives pending completions until the dispatcher is idle or the dispatch
+    /// limit is reached.
+    ///
+    /// The returned value is the number of tracked completions dispatched while
+    /// draining. This helper is intended for shutdown and cancellation paths:
+    /// it will return [`io::ErrorKind::TimedOut`] when `max_waits` waits pass
+    /// without reaching an idle dispatcher state.
+    pub fn drain_until_idle(&mut self, max_waits: usize) -> io::Result<usize> {
+        let mut dispatched = self.dispatch_available();
+        if self.is_idle() {
+            return Ok(dispatched);
+        }
+
+        for _ in 0..max_waits {
+            dispatched += self.wait_and_dispatch(1)?;
+            if self.is_idle() {
+                return Ok(dispatched);
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "io_uring dispatcher did not become idle: {:?}",
+                self.snapshot()
+            ),
+        ))
+    }
+
     /// Returns a local dispatcher snapshot.
     pub fn snapshot(&self) -> IoUringDispatcherSnapshot {
         let mut completed_operation_kinds = IoUringOperationKindCounts::default();
@@ -2177,7 +2219,7 @@ mod tests {
             1
         );
 
-        drain_dispatcher_until_idle(&dispatcher);
+        dispatcher.borrow_mut().drain_until_idle(8).unwrap();
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
         assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
         assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
@@ -2269,7 +2311,7 @@ mod tests {
             1
         );
 
-        drain_dispatcher_until_idle(&dispatcher);
+        dispatcher.borrow_mut().drain_until_idle(8).unwrap();
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
         assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
         assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
@@ -2317,7 +2359,7 @@ mod tests {
                 .cancellations,
             1
         );
-        drain_dispatcher_until_idle(&dispatcher);
+        dispatcher.borrow_mut().drain_until_idle(8).unwrap();
         assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
         assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
     }
@@ -2525,24 +2567,6 @@ mod tests {
         assert_eq!(completion.kind, IoUringOperationKind::Write);
         assert_eq!(completion.result, 5);
         assert_eq!(&buffer, b"uring");
-    }
-
-    fn drain_dispatcher_until_idle(dispatcher: &super::SharedIoUringDispatcher) {
-        for _ in 0..8 {
-            let snapshot = dispatcher.borrow().snapshot();
-            if snapshot.ring.tracked_operations == 0
-                && snapshot.abandoned_operations == 0
-                && snapshot.deferred_buffers == 0
-            {
-                return;
-            }
-            dispatcher.borrow_mut().wait_and_dispatch(1).unwrap();
-        }
-
-        panic!(
-            "dispatcher did not become idle after draining: {:?}",
-            dispatcher.borrow().snapshot()
-        );
     }
 
     fn available_ring() -> Option<IoUring> {

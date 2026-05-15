@@ -39,7 +39,7 @@ fn main() -> std::io::Result<()> {
     assert_eq!(abandoned.abandoned_operation_kinds.timeouts, 1);
     assert_eq!(abandoned.abandoned_operation_kinds.cancellations, 1);
 
-    drain_dispatcher_until_idle(&dispatcher)?;
+    dispatcher.borrow_mut().drain_until_idle(8)?;
 
     let drained = dispatcher.borrow().snapshot();
     println!(
@@ -63,27 +63,6 @@ struct NoopWake;
 #[cfg(target_os = "linux")]
 impl std::task::Wake for NoopWake {
     fn wake(self: std::sync::Arc<Self>) {}
-}
-
-#[cfg(target_os = "linux")]
-fn drain_dispatcher_until_idle(
-    dispatcher: &sitas::os::SharedIoUringDispatcher,
-) -> std::io::Result<()> {
-    for _ in 0..8 {
-        let snapshot = dispatcher.borrow().snapshot();
-        if snapshot.ring.tracked_operations == 0
-            && snapshot.abandoned_operations == 0
-            && snapshot.deferred_buffers == 0
-        {
-            return Ok(());
-        }
-        dispatcher.borrow_mut().wait_and_dispatch(1)?;
-    }
-
-    panic!(
-        "dispatcher did not become idle after draining: {:?}",
-        dispatcher.borrow().snapshot()
-    );
 }
 
 #[cfg(not(target_os = "linux"))]
