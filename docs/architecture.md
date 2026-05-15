@@ -156,7 +156,7 @@ Current responsibilities:
 
 - `ShardedExecutor::start` starts one executor/reactor on each shard thread;
 - `start_on_available_parallelism` starts one shard per available parallelism unit;
-- `start_with_config` accepts shard count, thread-name prefix, and CPU placement policy;
+- `start_with_config` accepts shard count, thread-name prefix, CPU placement policy, and optional required CPU placement;
 - shard threads are named predictably, for example `sitas-shard-N`;
 - `spawn_on` places a future on an explicit `ShardId`;
 - `spawn_named_on` gives observable task names;
@@ -168,7 +168,7 @@ Current responsibilities:
 - `submitter` creates cloneable cross-shard submission capability;
 - runtime shutdown drops owned spawners and joins executor threads.
 
-CPU placement is an explicit runtime request. Linux applies hard affinity with `sched_setaffinity` where supported and observes container cpuset restrictions through `sched_getaffinity`. Non-Linux platforms report unsupported placement honestly rather than pretending to pin.
+CPU placement is an explicit runtime request. Linux applies hard affinity with `sched_setaffinity` where supported and observes container cpuset restrictions through `sched_getaffinity`. Non-Linux platforms report unsupported placement honestly rather than pretending to pin. By default, placement failures are recorded in shard snapshots and startup still succeeds. `require_cpu_placement` turns that into fail-fast startup behavior for deployments that depend on hard affinity.
 
 This layer is not yet load balancing or scheduling classes. It establishes the shared-nothing async shape: work is owned by a shard thread and moves only through explicit submission.
 

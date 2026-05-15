@@ -130,7 +130,7 @@ Do not implement these unless explicitly requested by the current task:
 - distributed clustering;
 - replacing the custom runtime with a third-party runtime.
 
-CPU placement exists as an explicit experimental runtime request on Linux. Do not treat it as a finished portable scheduling policy.
+CPU placement exists as an explicit experimental runtime request on Linux. Callers may opt into fail-fast required placement, but do not treat CPU placement as a finished portable scheduling policy.
 
 ## Design direction
 

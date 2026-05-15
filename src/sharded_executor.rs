@@ -43,6 +43,7 @@ pub struct ShardedExecutorConfig {
     shard_count: usize,
     thread_name_prefix: String,
     cpu_placement: CpuPlacement,
+    require_cpu_placement: bool,
 }
 
 impl ShardedExecutorConfig {
@@ -52,6 +53,7 @@ impl ShardedExecutorConfig {
             shard_count,
             thread_name_prefix: String::from("sitas-shard"),
             cpu_placement: CpuPlacement::Unpinned,
+            require_cpu_placement: false,
         }
     }
 
@@ -80,6 +82,15 @@ impl ShardedExecutorConfig {
         self
     }
 
+    /// Requires requested CPU placement to be applied successfully.
+    ///
+    /// Without this, failed or unsupported CPU placement is reported in shard
+    /// snapshots but does not prevent the runtime from starting.
+    pub fn require_cpu_placement(mut self) -> Self {
+        self.require_cpu_placement = true;
+        self
+    }
+
     /// Returns the configured number of executor shards.
     pub fn shard_count(&self) -> usize {
         self.shard_count
@@ -93,6 +104,11 @@ impl ShardedExecutorConfig {
     /// Returns the configured CPU placement policy.
     pub fn cpu_placement(&self) -> &CpuPlacement {
         &self.cpu_placement
+    }
+
+    /// Returns whether requested CPU placement must be applied successfully.
+    pub fn is_cpu_placement_required(&self) -> bool {
+        self.require_cpu_placement
     }
 
     fn validate(&self) -> Result<(), ShardError> {
@@ -162,7 +178,7 @@ impl ShardedExecutor {
             let (executor, spawner) = executor_and_spawner();
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
 
-            let join = thread::Builder::new()
+            let join = match thread::Builder::new()
                 .name(thread_name.clone())
                 .spawn(move || {
                     let cpu_placement = affinity::apply_to_current_thread(requested_cpu);
@@ -170,12 +186,32 @@ impl ShardedExecutor {
                     let _ = started_sender.send(cpu_placement);
                     executor.run();
                     CURRENT_EXECUTOR_SHARD.with(|current| current.set(None));
-                })
-                .map_err(|_| ShardError::ThreadJoinFailed)?;
+                }) {
+                Ok(join) => join,
+                Err(_) => {
+                    Self::cleanup_started_shards(&mut shards, &mut joins);
+                    return Err(ShardError::ThreadJoinFailed);
+                }
+            };
 
-            let cpu_placement = started_receiver
-                .recv()
-                .map_err(|_| ShardError::ThreadJoinFailed)?;
+            let cpu_placement = match started_receiver.recv() {
+                Ok(cpu_placement) => cpu_placement,
+                Err(_) => {
+                    joins.push(join);
+                    Self::cleanup_started_shards(&mut shards, &mut joins);
+                    return Err(ShardError::ThreadJoinFailed);
+                }
+            };
+
+            if config.require_cpu_placement
+                && requested_cpu.is_some()
+                && !cpu_placement.is_applied()
+            {
+                drop(spawner);
+                joins.push(join);
+                Self::cleanup_started_shards(&mut shards, &mut joins);
+                return Err(ShardError::CpuPlacementFailed(cpu_placement.to_string()));
+            }
 
             shards.push(AsyncShard {
                 shard_id,
@@ -187,6 +223,14 @@ impl ShardedExecutor {
         }
 
         Ok(Self { shards, joins })
+    }
+
+    fn cleanup_started_shards(shards: &mut [AsyncShard], joins: &mut Vec<thread::JoinHandle<()>>) {
+        for shard in shards {
+            shard.spawner.take();
+        }
+
+        let _ = join_all(std::mem::take(joins));
     }
 
     /// Returns the number of async executor shards.
@@ -680,7 +724,8 @@ mod tests {
     fn config_reports_shard_count_and_thread_prefix() {
         let config = ShardedExecutorConfig::new(3)
             .with_thread_name_prefix("worker")
-            .with_cpu_placement(CpuPlacement::Explicit(vec![CpuId(1), CpuId(2), CpuId(3)]));
+            .with_cpu_placement(CpuPlacement::Explicit(vec![CpuId(1), CpuId(2), CpuId(3)]))
+            .require_cpu_placement();
 
         assert_eq!(config.shard_count(), 3);
         assert_eq!(config.thread_name_prefix(), "worker");
@@ -688,6 +733,7 @@ mod tests {
             config.cpu_placement(),
             &CpuPlacement::Explicit(vec![CpuId(1), CpuId(2), CpuId(3)])
         );
+        assert!(config.is_cpu_placement_required());
     }
 
     #[test]
@@ -777,6 +823,20 @@ mod tests {
         runtime.stop().unwrap();
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn required_cpu_placement_rejects_unsupported_platforms() {
+        let error = ShardedExecutor::start_with_config(
+            ShardedExecutorConfig::new(1)
+                .with_cpu_placement(CpuPlacement::Sequential)
+                .require_cpu_placement(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ShardError::CpuPlacementFailed(_)));
+        assert!(error.to_string().contains("unsupported"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_cpu_placement_pins_shard_thread_affinity_masks() {
@@ -790,7 +850,8 @@ mod tests {
         let expected_cpus = cpus.into_iter().take(shard_count).collect::<Vec<_>>();
         let runtime = ShardedExecutor::start_with_config(
             ShardedExecutorConfig::new(shard_count)
-                .with_cpu_placement(CpuPlacement::Explicit(expected_cpus.clone())),
+                .with_cpu_placement(CpuPlacement::Explicit(expected_cpus.clone()))
+                .require_cpu_placement(),
         )
         .unwrap();
         let (sender, receiver) = mpsc::sync_channel(shard_count);
@@ -824,6 +885,19 @@ mod tests {
         }
 
         runtime.stop().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn required_cpu_placement_rejects_failed_linux_affinity() {
+        let error = ShardedExecutor::start_with_config(
+            ShardedExecutorConfig::new(1)
+                .with_cpu_placement(CpuPlacement::Explicit(vec![CpuId(usize::MAX)]))
+                .require_cpu_placement(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ShardError::CpuPlacementFailed(_)));
     }
 
     #[test]
