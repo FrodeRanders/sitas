@@ -25,12 +25,15 @@ It deliberately does not know about key-value commands or service state.
 - read/write-readiness waiting for caller-provided file descriptors
 - a cloneable `OsWaker`
 - a blocking `OsReactor::wait` that can be woken by the pipe
+- an experimental Linux `io_uring` backend for tracked no-op, timeout, cancel,
+  read, and write operations
+- an `io_uring` dispatcher that bridges tracked kernel completions to async
+  task wakers and exposes snapshot-based observability
 
 This is intentionally smaller than a full reactor. It establishes the FFI
 boundary, a portable macOS/Linux wake mechanism, and the first
 platform-specific readiness backend before introducing persistent file
-descriptor registration, kernel timers, or deeper backends such as `kqueue` or
-`io_uring`.
+descriptor registration, kernel timers, or deeper backends such as `kqueue`.
 
 `executor` provides a minimal single-threaded async kernel:
 
@@ -183,6 +186,124 @@ and key timestamps. This is enough to build simple long-running task progress
 views without adding a logging framework, Tokio console, or third-party
 dependencies.
 
+## io_uring Completion Lifecycle
+
+The Linux `io_uring` backend has two layers of completion state. `IoUring`
+owns the raw ring and local tracked-operation table. `IoUringDispatcher` owns
+the async-facing state: task wakers, buffered tracked completions, abandoned
+operations, deferred owned buffers, and cumulative counters.
+
+The normal tracked completion path is:
+
+```text
+queue_*_operation()
+  |
+  | records IoUringOperationId -> IoUringOperationKind
+  | increments IoUringSnapshot.ring.tracked_operations
+  v
+pending SQE
+  |
+  | submit_pending() or wait_completions()
+  | decrements IoUringSnapshot.ring.pending_submissions
+  v
+kernel owns operation
+  |
+  | CQE appears
+  v
+IoUring local completion queue
+  |
+  | drain_completions() / wait_completions()
+  | reflected by IoUringSnapshot.pending_completions
+  v
+IoUring::try_operation_completion()
+  |
+  | removes the operation from IoUring's tracked table
+  | returns IoUringOperationCompletion { operation, kind, result, flags }
+  v
+IoUringDispatcher::dispatch_available()
+  |
+  | no abandon record exists
+  | increments total_dispatched_* and total_buffered_*
+  v
+dispatcher.completions
+  |
+  | optional registered waker is removed and woken
+  | reflected by completed_operations and completed_operation_kinds
+  v
+future polls again
+  |
+  | take_completion()
+  v
+completion consumed by the future
+```
+
+When a future is dropped before its operation completes, the dispatcher changes
+the path:
+
+```text
+future Drop
+  |
+  | clear_waker(operation)
+  v
+abandon_operation(operation)
+  |
+  | records operation -> kind in abandoned_operations
+  | queues async cancel when possible
+  | records cancel operation as abandoned too
+  v
+kernel completes original and/or cancel operation
+  |
+  v
+IoUring::try_operation_completion()
+  |
+  v
+IoUringDispatcher::dispatch_available()
+  |
+  | operation exists in abandoned_operations
+  | removes abandoned record
+  | removes deferred buffer if this was owned read/write
+  | increments total_dispatched_* and total_discarded_*
+  v
+completion discarded
+```
+
+The dispatcher keeps abandoned owned read/write buffers alive in
+`deferred_buffers` until the matching kernel completion is dispatched. This is
+the safety boundary for owned-buffer futures: dropping the future does not drop
+the allocation while the kernel may still read from or write to it.
+
+The snapshot fields map to these states:
+
+- `IoUringSnapshot.pending_submissions`: SQEs queued in userspace but not yet
+  accepted by the kernel.
+- `IoUringSnapshot.pending_completions`: raw CQEs already drained into the
+  local `IoUring` queue.
+- `IoUringSnapshot.tracked_operations`: operations that have been submitted or
+  queued and whose tracked completion has not yet been consumed from `IoUring`.
+- `IoUringSnapshot.operation_kinds`: tracked operations grouped by kind.
+- `IoUringDispatcherSnapshot.registered_wakers`: tasks waiting for tracked
+  completions.
+- `IoUringDispatcherSnapshot.completed_operations`: tracked completions buffered
+  for futures to consume.
+- `IoUringDispatcherSnapshot.completed_operation_kinds`: buffered completions
+  grouped by operation kind.
+- `IoUringDispatcherSnapshot.abandoned_operations`: original and cancellation
+  operations whose completions will be discarded.
+- `IoUringDispatcherSnapshot.abandoned_operation_kinds`: abandoned operations
+  grouped by kind.
+- `IoUringDispatcherSnapshot.deferred_buffers`: owned read/write buffers being
+  kept alive only because the kernel operation has not completed yet.
+- `IoUringDispatcherSnapshot.total_dispatched_operations`: all tracked
+  completions dispatched since the dispatcher was created.
+- `IoUringDispatcherSnapshot.total_buffered_operations`: dispatched completions
+  made available to futures.
+- `IoUringDispatcherSnapshot.total_woken_operations`: dispatched completions
+  that woke a registered task.
+- `IoUringDispatcherSnapshot.total_discarded_operations`: abandoned completions
+  discarded instead of being exposed to a future.
+- `IoUringDispatcherSnapshot.total_*_operation_kinds`: the same cumulative
+  counters grouped by no-op, timeout, cancel, read, and write operation kind.
+
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than
 `std::sync::mpsc`, so a waiting future can store its task waker directly in the
@@ -316,14 +437,12 @@ return errors.
 
 This milestone does not implement:
 
-- non-blocking I/O
-- file descriptor registration
-- actor framework behavior
-- networking
 - persistence
 - CPU pinning
-- `io_uring`
 - procedural macros
+- production-grade `io_uring` integration with the sharded executor
+- `kqueue` support on macOS
+- load balancing or scheduling classes
 
-Those are later runtime concerns. The current goal is the shard-local ownership
-and message-passing kernel.
+Those are later runtime concerns. The current goal is still to grow the
+shared-nothing runtime shape in small, dependency-free steps.
