@@ -113,6 +113,11 @@ pub(crate) fn available_cpu_ids() -> Vec<CpuId> {
     })
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn current_thread_cpu_ids() -> Option<Vec<CpuId>> {
+    platform::available_cpu_ids()
+}
+
 pub(crate) fn apply_to_current_thread(requested: Option<CpuId>) -> CpuPlacementStatus {
     let Some(cpu) = requested else {
         return CpuPlacementStatus::Unpinned;

@@ -772,6 +772,55 @@ mod tests {
         runtime.stop().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cpu_placement_pins_shard_thread_affinity_masks() {
+        let cpus = super::affinity::available_cpu_ids();
+        let shard_count = cpus.len().min(2);
+
+        if shard_count == 0 {
+            return;
+        }
+
+        let expected_cpus = cpus.into_iter().take(shard_count).collect::<Vec<_>>();
+        let runtime = ShardedExecutor::start_with_config(
+            ShardedExecutorConfig::new(shard_count)
+                .with_cpu_placement(CpuPlacement::Explicit(expected_cpus.clone())),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::sync_channel(shard_count);
+
+        for shard_idx in 0..shard_count {
+            let sender = sender.clone();
+            runtime
+                .spawn_on(ShardId(shard_idx), async move {
+                    sender
+                        .send((
+                            ShardId(shard_idx),
+                            super::affinity::current_thread_cpu_ids(),
+                        ))
+                        .unwrap();
+                })
+                .unwrap();
+        }
+
+        drop(sender);
+
+        let mut observed = receiver.into_iter().collect::<Vec<_>>();
+        observed.sort_by_key(|(shard_id, _)| shard_id.0);
+
+        for (shard_id, cpus) in observed {
+            let expected_cpu = expected_cpus[shard_id.0];
+            assert_eq!(cpus, Some(vec![expected_cpu]));
+            assert_eq!(
+                runtime.snapshot().shards[shard_id.0].cpu_placement,
+                CpuPlacementStatus::Applied(expected_cpu)
+            );
+        }
+
+        runtime.stop().unwrap();
+    }
+
     #[test]
     fn default_cpu_placement_is_unpinned() {
         let runtime = ShardedExecutor::start(1).unwrap();
