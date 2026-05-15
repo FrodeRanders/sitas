@@ -126,6 +126,8 @@ Responsibilities:
 - timer registration, timeout futures, and cancellation cleanup;
 - readiness futures for read/write interests;
 - Unix reactor sleep when no tasks are ready.
+- cumulative executor counters for spawned tasks, completed tasks, task polls,
+  and ready-poll budget exhaustion events.
 
 The executor is intentionally small and dependency-free. It is a semantic experiment before a production runtime.
 

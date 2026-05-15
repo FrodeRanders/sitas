@@ -151,6 +151,16 @@ pub struct ExecutorSnapshot {
     /// Number of registered write-readiness interests.
     #[cfg(unix)]
     pub write_interest_count: usize,
+    /// Maximum number of ready tasks polled before timers and readiness are checked.
+    pub ready_poll_budget: usize,
+    /// Number of tasks accepted by this executor since startup.
+    pub total_spawned_tasks: u64,
+    /// Number of tasks that have completed, panicked, or been cancelled since startup.
+    pub total_completed_tasks: u64,
+    /// Number of spawned task polls performed since startup.
+    pub total_task_polls: u64,
+    /// Number of ready-poll batches that consumed the full ready-poll budget.
+    pub ready_poll_budget_exhaustions: u64,
     /// Owned snapshots for tasks that are still externally observable.
     pub tasks: Vec<TaskSnapshot>,
 }
@@ -427,12 +437,20 @@ impl Executor {
     }
 
     fn poll_ready_tasks(&self) {
+        let mut polled = 0;
+
         for _ in 0..READY_POLL_BUDGET {
             let Some(task) = self.scheduler.next_task() else {
                 break;
             };
+            polled += 1;
             task.poll();
         }
+
+        self.scheduler.record_ready_poll_batch(
+            polled,
+            polled == READY_POLL_BUDGET && self.scheduler.has_ready_tasks(),
+        );
     }
 }
 

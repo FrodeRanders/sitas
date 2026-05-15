@@ -284,6 +284,11 @@ fn run_until_timer_completes_while_task_keeps_waking() {
     });
 
     assert!(started.elapsed() < Duration::from_secs(1));
+
+    let snapshot = executor.snapshot();
+    assert_eq!(snapshot.ready_poll_budget, super::READY_POLL_BUDGET);
+    assert!(snapshot.total_task_polls >= super::READY_POLL_BUDGET as u64);
+    assert!(snapshot.ready_poll_budget_exhaustions > 0);
 }
 
 #[test]
@@ -510,6 +515,29 @@ fn repeated_wakes_share_one_ready_queue_entry() {
             .len(),
         1
     );
+}
+
+#[test]
+fn executor_snapshot_reports_cumulative_scheduler_counters() {
+    let (executor, spawner) = executor_and_spawner();
+
+    for _ in 0..3 {
+        spawner
+            .spawn(async {
+                yield_now().await;
+            })
+            .unwrap();
+    }
+
+    drop(spawner);
+    executor.run();
+
+    let snapshot = executor.snapshot();
+    assert_eq!(snapshot.ready_poll_budget, super::READY_POLL_BUDGET);
+    assert_eq!(snapshot.total_spawned_tasks, 3);
+    assert_eq!(snapshot.total_completed_tasks, 3);
+    assert_eq!(snapshot.total_task_polls, 6);
+    assert_eq!(snapshot.ready_poll_budget_exhaustions, 0);
 }
 
 #[test]

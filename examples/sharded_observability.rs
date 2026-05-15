@@ -29,13 +29,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!(
-                "  shard {}: ready={} tasks={} timers={} read={} write={}",
+                "  shard {}: ready={} tasks={} timers={} read={} write={} polls={} done={} budget_hits={}",
                 shard.shard_id.0,
                 executor.ready_queue_len,
                 executor.task_count,
                 executor.timer_count,
                 executor.read_interest_count,
-                executor.write_interest_count
+                executor.write_interest_count,
+                executor.total_task_polls,
+                executor.total_completed_tasks,
+                executor.ready_poll_budget_exhaustions
             );
 
             for task in &executor.tasks {

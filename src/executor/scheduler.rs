@@ -11,7 +11,7 @@ use std::os::unix::io::RawFd;
 use crate::os::OsWaker;
 
 use super::task::{Task, set_current_task_waiting_for};
-use super::{ExecutorSnapshot, SpawnError, TaskId, TaskWait};
+use super::{ExecutorSnapshot, READY_POLL_BUDGET, SpawnError, TaskId, TaskWait};
 
 thread_local! {
     static CURRENT_SCHEDULER: RefCell<Option<Arc<Scheduler>>> = const { RefCell::new(None) };
@@ -36,6 +36,10 @@ pub(super) struct SchedulerState {
     accepting: bool,
     spawner_count: usize,
     task_count: usize,
+    total_spawned_tasks: u64,
+    total_completed_tasks: u64,
+    total_task_polls: u64,
+    ready_poll_budget_exhaustions: u64,
     next_task_id: usize,
     next_timer_id: usize,
 }
@@ -155,6 +159,10 @@ impl Scheduler {
                 accepting: true,
                 spawner_count: 1,
                 task_count: 0,
+                total_spawned_tasks: 0,
+                total_completed_tasks: 0,
+                total_task_polls: 0,
+                ready_poll_budget_exhaustions: 0,
                 next_task_id: 0,
                 next_timer_id: 0,
             }),
@@ -199,6 +207,7 @@ impl Scheduler {
                 return Err(SpawnError);
             }
             state.task_count += 1;
+            state.total_spawned_tasks += 1;
             state.tasks.push(Arc::downgrade(&task));
             state.queue.push_back(task);
         }
@@ -281,6 +290,10 @@ impl Scheduler {
         let task_count = state.task_count;
         let ready_queue_len = state.queue.len();
         let timer_count = state.timers.len();
+        let total_spawned_tasks = state.total_spawned_tasks;
+        let total_completed_tasks = state.total_completed_tasks;
+        let total_task_polls = state.total_task_polls;
+        let ready_poll_budget_exhaustions = state.ready_poll_budget_exhaustions;
         #[cfg(unix)]
         let read_interest_count = state.read_interests.len();
         #[cfg(unix)]
@@ -305,6 +318,11 @@ impl Scheduler {
             read_interest_count,
             #[cfg(unix)]
             write_interest_count,
+            ready_poll_budget: READY_POLL_BUDGET,
+            total_spawned_tasks,
+            total_completed_tasks,
+            total_task_polls,
+            ready_poll_budget_exhaustions,
             tasks,
         }
     }
@@ -313,11 +331,20 @@ impl Scheduler {
         let should_wake = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
             state.task_count = state.task_count.saturating_sub(1);
+            state.total_completed_tasks += 1;
             state.queue.is_empty() && state.spawner_count == 0 && state.task_count == 0
         };
 
         if should_wake {
             self.wake_reactor();
+        }
+    }
+
+    pub(super) fn record_ready_poll_batch(&self, polled: usize, exhausted_budget: bool) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.total_task_polls += polled as u64;
+        if exhausted_budget {
+            state.ready_poll_budget_exhaustions += 1;
         }
     }
 
