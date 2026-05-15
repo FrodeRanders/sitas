@@ -1,25 +1,30 @@
 use sitas::{
-    ShardId, ShardedExecutor, available_cpu_ids, current_executor_cpu_placement,
-    current_executor_shard, executor::block_on,
+    CpuPlacement, ShardId, ShardedExecutor, ShardedExecutorConfig, available_cpu_ids,
+    current_executor_cpu_placement, current_executor_shard, executor::block_on,
 };
 use std::cmp::Ordering;
+use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const RECORD_COUNT: usize = 10_000;
+const DEFAULT_RECORD_COUNT: usize = 10_000;
+const DEFAULT_SEED: u64 = 0x517a_5eed;
 const PAYLOAD_SIZE: usize = 24;
 const RECORD_SIZE: usize = 8 + PAYLOAD_SIZE;
 const INDEX_ENTRY_SIZE: usize = 16;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = DemoConfig::from_args(env::args())?;
     let paths = DemoPaths::new();
     fs::create_dir_all(&paths.run_dir)?;
-    create_data_file(&paths.data, RECORD_COUNT)?;
+    create_data_file(&paths.data, config.record_count, config.seed)?;
     File::create(&paths.index)?;
 
-    let runtime = ShardedExecutor::start_pinned_on_available_cpus()?;
+    let runtime = ShardedExecutor::start_with_config(
+        ShardedExecutorConfig::new(config.shard_count).with_cpu_placement(CpuPlacement::Sequential),
+    )?;
     let shard_count = runtime.shard_count();
     let progress = Arc::new(Mutex::new(vec![ShardProgress::default(); shard_count]));
     let mut handles = Vec::with_capacity(shard_count);
@@ -29,12 +34,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("run files: {}", paths.run_dir.display());
     println!("available CPUs: {:?}", available_cpu_ids());
     println!(
-        "records: {RECORD_COUNT}, shards: {shard_count}, record bytes: {}, index-entry bytes: {INDEX_ENTRY_SIZE}",
-        RECORD_COUNT * RECORD_SIZE
+        "records: {}, shards: {shard_count}, seed: 0x{:016x}, record bytes: {}, index-entry bytes: {INDEX_ENTRY_SIZE}",
+        config.record_count,
+        config.seed,
+        config.record_count * RECORD_SIZE
     );
 
     for shard_idx in 0..shard_count {
-        let partition = Partition::for_shard(shard_idx, shard_count, RECORD_COUNT);
+        let partition = Partition::for_shard(shard_idx, shard_count, config.record_count);
         let data_path = paths.data.clone();
         let run_path = paths.partition_run_path(shard_idx);
         let progress = Arc::clone(&progress);
@@ -71,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runs.sort_by_key(|run| run.shard_id.0);
     let final_run = merge_runs_on_shards(&runtime, &progress, &paths.run_dir, runs)?;
     fs::copy(&final_run.path, &paths.index)?;
-    verify_index_file(&paths.data, &paths.index, RECORD_COUNT)?;
+    verify_index_file(&paths.data, &paths.index, config.record_count)?;
 
     println!(
         "wrote {} sorted index entries ({} bytes) from {}",
@@ -81,6 +88,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     runtime.stop()?;
+    if config.cleanup {
+        cleanup_files(&paths)?;
+        println!("removed generated files");
+    }
+
     Ok(())
 }
 
@@ -152,9 +164,9 @@ fn build_sorted_run(
     })
 }
 
-fn create_data_file(path: &Path, record_count: usize) -> io::Result<()> {
+fn create_data_file(path: &Path, record_count: usize, seed: u64) -> io::Result<()> {
     let mut file = File::create(path)?;
-    let mut rng = Lcg::new(0x517a_5eed);
+    let mut rng = Lcg::new(seed);
 
     for _ in 0..record_count {
         let mut payload = [0u8; PAYLOAD_SIZE];
@@ -168,6 +180,25 @@ fn create_data_file(path: &Path, record_count: usize) -> io::Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+fn cleanup_files(paths: &DemoPaths) -> io::Result<()> {
+    match fs::remove_file(&paths.data) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match fs::remove_file(&paths.index) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match fs::remove_dir_all(&paths.run_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     Ok(())
 }
 
@@ -497,6 +528,114 @@ impl RunReader {
 
 fn record_offset(record_idx: usize) -> u64 {
     (record_idx * RECORD_SIZE) as u64
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DemoConfig {
+    record_count: usize,
+    shard_count: usize,
+    seed: u64,
+    cleanup: bool,
+}
+
+impl DemoConfig {
+    fn from_args(
+        args: impl IntoIterator<Item = String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut config = Self {
+            record_count: DEFAULT_RECORD_COUNT,
+            shard_count: available_cpu_ids().len(),
+            seed: DEFAULT_SEED,
+            cleanup: false,
+        };
+
+        let mut args = args.into_iter();
+        let program = args
+            .next()
+            .unwrap_or_else(|| String::from("sharded_index_build"));
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--records" => {
+                    let value = next_arg(&mut args, "--records")?;
+                    config.record_count = parse_non_zero_usize("--records", &value)?;
+                }
+                "--shards" => {
+                    let value = next_arg(&mut args, "--shards")?;
+                    config.shard_count = parse_non_zero_usize("--shards", &value)?;
+                }
+                "--seed" => {
+                    let value = next_arg(&mut args, "--seed")?;
+                    config.seed = parse_u64("--seed", &value)?;
+                }
+                "--cleanup" => config.cleanup = true,
+                "--help" | "-h" => {
+                    print_usage(&program);
+                    std::process::exit(0);
+                }
+                unknown => {
+                    return Err(invalid_input(format!(
+                        "unknown argument {unknown:?}; run with --help for usage"
+                    ))
+                    .into());
+                }
+            }
+        }
+
+        Ok(config)
+    }
+}
+
+fn next_arg(
+    args: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    args.next()
+        .ok_or_else(|| invalid_input(format!("{option} requires a value")).into())
+}
+
+fn parse_non_zero_usize(option: &str, value: &str) -> io::Result<usize> {
+    let parsed = parse_usize(value)
+        .map_err(|error| invalid_input(format!("{option} expects a positive integer: {error}")))?;
+    if parsed == 0 {
+        return Err(invalid_input(format!("{option} must be greater than zero")));
+    }
+    Ok(parsed)
+}
+
+fn parse_usize(value: &str) -> Result<usize, std::num::ParseIntError> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        usize::from_str_radix(hex, 16)
+    } else {
+        value.parse()
+    }
+}
+
+fn parse_u64(option: &str, value: &str) -> io::Result<u64> {
+    let parsed = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else {
+        value.parse()
+    };
+
+    parsed.map_err(|error| invalid_input(format!("{option} expects an integer seed: {error}")))
+}
+
+fn print_usage(program: &str) {
+    println!(
+        "usage: {program} [--records N] [--shards N] [--seed N|0xHEX] [--cleanup]\n\
+         defaults: --records {DEFAULT_RECORD_COUNT} --shards <available-cpus> --seed 0x{DEFAULT_SEED:016x}"
+    );
+}
+
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
 #[derive(Debug)]
