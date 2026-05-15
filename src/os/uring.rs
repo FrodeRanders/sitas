@@ -899,6 +899,10 @@ pub struct IoUringDispatcher {
     total_buffered_operations: usize,
     total_woken_operations: usize,
     total_discarded_operations: usize,
+    total_dispatched_operation_kinds: IoUringOperationKindCounts,
+    total_buffered_operation_kinds: IoUringOperationKindCounts,
+    total_woken_operation_kinds: IoUringOperationKindCounts,
+    total_discarded_operation_kinds: IoUringOperationKindCounts,
 }
 
 impl IoUringDispatcher {
@@ -914,6 +918,10 @@ impl IoUringDispatcher {
             total_buffered_operations: 0,
             total_woken_operations: 0,
             total_discarded_operations: 0,
+            total_dispatched_operation_kinds: IoUringOperationKindCounts::default(),
+            total_buffered_operation_kinds: IoUringOperationKindCounts::default(),
+            total_woken_operation_kinds: IoUringOperationKindCounts::default(),
+            total_discarded_operation_kinds: IoUringOperationKindCounts::default(),
         }
     }
 
@@ -1004,17 +1012,21 @@ impl IoUringDispatcher {
         while let Some(completion) = self.ring.try_operation_completion() {
             let operation = completion.operation;
             self.total_dispatched_operations += 1;
+            self.total_dispatched_operation_kinds.add(completion.kind);
             if self.abandoned_operations.remove(&operation).is_some() {
                 self.deferred_buffers.remove(&operation);
                 self.total_discarded_operations += 1;
+                self.total_discarded_operation_kinds.add(completion.kind);
                 dispatched += 1;
                 continue;
             }
 
             self.completions.insert(operation, completion);
             self.total_buffered_operations += 1;
+            self.total_buffered_operation_kinds.add(completion.kind);
             if let Some(waker) = self.waiters.remove(&operation) {
                 self.total_woken_operations += 1;
+                self.total_woken_operation_kinds.add(completion.kind);
                 waker.wake();
             }
             dispatched += 1;
@@ -1094,6 +1106,10 @@ impl IoUringDispatcher {
             total_buffered_operations: self.total_buffered_operations,
             total_woken_operations: self.total_woken_operations,
             total_discarded_operations: self.total_discarded_operations,
+            total_dispatched_operation_kinds: self.total_dispatched_operation_kinds,
+            total_buffered_operation_kinds: self.total_buffered_operation_kinds,
+            total_woken_operation_kinds: self.total_woken_operation_kinds,
+            total_discarded_operation_kinds: self.total_discarded_operation_kinds,
         }
     }
 }
@@ -1482,6 +1498,14 @@ pub struct IoUringDispatcherSnapshot {
     pub total_woken_operations: usize,
     /// Total abandoned completions discarded by the dispatcher.
     pub total_discarded_operations: usize,
+    /// Total dispatched tracked completions grouped by operation kind.
+    pub total_dispatched_operation_kinds: IoUringOperationKindCounts,
+    /// Total buffered tracked completions grouped by operation kind.
+    pub total_buffered_operation_kinds: IoUringOperationKindCounts,
+    /// Total woken tracked completions grouped by operation kind.
+    pub total_woken_operation_kinds: IoUringOperationKindCounts,
+    /// Total discarded abandoned completions grouped by operation kind.
+    pub total_discarded_operation_kinds: IoUringOperationKindCounts,
 }
 
 /// One `io_uring` completion queue entry.
@@ -1957,6 +1981,10 @@ mod tests {
         assert_eq!(snapshot.total_buffered_operations, 1);
         assert_eq!(snapshot.total_woken_operations, 1);
         assert_eq!(snapshot.total_discarded_operations, 0);
+        assert_eq!(snapshot.total_dispatched_operation_kinds.nops, 1);
+        assert_eq!(snapshot.total_buffered_operation_kinds.nops, 1);
+        assert_eq!(snapshot.total_woken_operation_kinds.nops, 1);
+        assert_eq!(snapshot.total_discarded_operation_kinds.nops, 0);
     }
 
     #[test]
@@ -1980,6 +2008,16 @@ mod tests {
         assert_eq!(dispatcher.snapshot().total_buffered_operations, 1);
         assert_eq!(dispatcher.snapshot().total_woken_operations, 0);
         assert_eq!(dispatcher.snapshot().total_discarded_operations, 0);
+        assert_eq!(
+            dispatcher.snapshot().total_dispatched_operation_kinds.nops,
+            1
+        );
+        assert_eq!(dispatcher.snapshot().total_buffered_operation_kinds.nops, 1);
+        assert_eq!(dispatcher.snapshot().total_woken_operation_kinds.nops, 0);
+        assert_eq!(
+            dispatcher.snapshot().total_discarded_operation_kinds.nops,
+            0
+        );
 
         let completion = dispatcher.take_completion(operation).unwrap();
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
@@ -1987,6 +2025,7 @@ mod tests {
         assert_eq!(dispatcher.snapshot().completed_operation_kinds.nops, 0);
         assert_eq!(dispatcher.snapshot().total_dispatched_operations, 1);
         assert_eq!(dispatcher.snapshot().total_buffered_operations, 1);
+        assert_eq!(dispatcher.snapshot().total_buffered_operation_kinds.nops, 1);
     }
 
     #[test]
@@ -2402,6 +2441,12 @@ mod tests {
         assert_eq!(drained.total_buffered_operations, 0);
         assert_eq!(drained.total_woken_operations, 0);
         assert_eq!(drained.total_discarded_operations, 2);
+        assert_eq!(drained.total_dispatched_operation_kinds.nops, 1);
+        assert_eq!(drained.total_dispatched_operation_kinds.cancellations, 1);
+        assert_eq!(drained.total_buffered_operation_kinds.nops, 0);
+        assert_eq!(drained.total_woken_operation_kinds.nops, 0);
+        assert_eq!(drained.total_discarded_operation_kinds.nops, 1);
+        assert_eq!(drained.total_discarded_operation_kinds.cancellations, 1);
     }
 
     #[test]

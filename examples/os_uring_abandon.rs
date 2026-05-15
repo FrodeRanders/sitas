@@ -43,13 +43,15 @@ fn main() -> std::io::Result<()> {
 
     let drained = dispatcher.borrow().snapshot();
     println!(
-        "after drain: pending={} abandoned={} deferred_buffers={} completed={} dispatched={} discarded={}",
+        "after drain: pending={} abandoned={} deferred_buffers={} completed={} dispatched={} discarded={} discarded_timeouts={} discarded_cancellations={}",
         drained.ring.pending_submissions,
         drained.abandoned_operations,
         drained.deferred_buffers,
         drained.completed_operations,
         drained.total_dispatched_operations,
-        drained.total_discarded_operations
+        drained.total_discarded_operations,
+        drained.total_discarded_operation_kinds.timeouts,
+        drained.total_discarded_operation_kinds.cancellations
     );
     assert_eq!(drained.ring.tracked_operations, 0);
     assert_eq!(drained.abandoned_operations, 0);
@@ -57,6 +59,8 @@ fn main() -> std::io::Result<()> {
     assert_eq!(drained.completed_operations, 0);
     assert_eq!(drained.total_dispatched_operations, 2);
     assert_eq!(drained.total_discarded_operations, 2);
+    assert_eq!(drained.total_discarded_operation_kinds.timeouts, 1);
+    assert_eq!(drained.total_discarded_operation_kinds.cancellations, 1);
 
     Ok(())
 }
