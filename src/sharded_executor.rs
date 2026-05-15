@@ -34,6 +34,54 @@ pub fn current_executor_shard() -> Option<ShardId> {
     CURRENT_EXECUTOR_SHARD.with(std::cell::Cell::get)
 }
 
+/// Configuration for starting a [`ShardedExecutor`].
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardedExecutorConfig {
+    shard_count: usize,
+    thread_name_prefix: String,
+}
+
+impl ShardedExecutorConfig {
+    /// Creates a config for `shard_count` executor shards.
+    pub fn new(shard_count: usize) -> Self {
+        Self {
+            shard_count,
+            thread_name_prefix: String::from("sitas-shard"),
+        }
+    }
+
+    /// Sets the OS thread-name prefix used for shard executor threads.
+    ///
+    /// Thread names are formatted as `{prefix}-{shard_index}`.
+    pub fn with_thread_name_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.thread_name_prefix = prefix.into();
+        self
+    }
+
+    /// Returns the configured number of executor shards.
+    pub fn shard_count(&self) -> usize {
+        self.shard_count
+    }
+
+    /// Returns the configured OS thread-name prefix.
+    pub fn thread_name_prefix(&self) -> &str {
+        &self.thread_name_prefix
+    }
+
+    fn validate(&self) -> Result<(), ShardError> {
+        if self.shard_count == 0 {
+            return Err(ShardError::InvalidShardCount);
+        }
+
+        Ok(())
+    }
+
+    fn thread_name(&self, shard_id: ShardId) -> String {
+        format!("{}-{}", self.thread_name_prefix, shard_id.0)
+    }
+}
+
 /// A small shard-per-thread async runtime.
 ///
 /// Each shard owns one [`crate::executor::Executor`] and one OS thread. Work is
@@ -57,16 +105,19 @@ struct AsyncShard {
 impl ShardedExecutor {
     /// Starts `shard_count` async executor shards.
     pub fn start(shard_count: usize) -> Result<Self, ShardError> {
-        if shard_count == 0 {
-            return Err(ShardError::InvalidShardCount);
-        }
+        Self::start_with_config(ShardedExecutorConfig::new(shard_count))
+    }
 
-        let mut shards = Vec::with_capacity(shard_count);
-        let mut joins = Vec::with_capacity(shard_count);
+    /// Starts async executor shards using `config`.
+    pub fn start_with_config(config: ShardedExecutorConfig) -> Result<Self, ShardError> {
+        config.validate()?;
 
-        for shard_idx in 0..shard_count {
+        let mut shards = Vec::with_capacity(config.shard_count);
+        let mut joins = Vec::with_capacity(config.shard_count);
+
+        for shard_idx in 0..config.shard_count {
             let shard_id = ShardId(shard_idx);
-            let thread_name = format!("sitas-shard-{shard_idx}");
+            let thread_name = config.thread_name(shard_id);
             let (executor, spawner) = executor_and_spawner();
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
 
@@ -551,7 +602,9 @@ impl Drop for ShardedExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShardedExecutor, ShardedSpawnError, current_executor_shard};
+    use super::{
+        ShardedExecutor, ShardedExecutorConfig, ShardedSpawnError, current_executor_shard,
+    };
     use crate::ShardId;
     use crate::executor::block_on;
     use crate::executor::{TaskStatus, TaskWait, sleep};
@@ -565,6 +618,52 @@ mod tests {
             ShardedExecutor::start(0).unwrap_err().to_string(),
             "shard count must be greater than zero"
         );
+    }
+
+    #[test]
+    fn config_reports_shard_count_and_thread_prefix() {
+        let config = ShardedExecutorConfig::new(3).with_thread_name_prefix("worker");
+
+        assert_eq!(config.shard_count(), 3);
+        assert_eq!(config.thread_name_prefix(), "worker");
+    }
+
+    #[test]
+    fn start_with_config_uses_custom_thread_name_prefix() {
+        let runtime = ShardedExecutor::start_with_config(
+            ShardedExecutorConfig::new(2).with_thread_name_prefix("core"),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::sync_channel(2);
+
+        for shard_idx in 0..runtime.shard_count() {
+            let sender = sender.clone();
+            runtime
+                .spawn_on(ShardId(shard_idx), async move {
+                    sender
+                        .send((
+                            current_executor_shard(),
+                            thread::current().name().map(str::to_owned),
+                        ))
+                        .unwrap();
+                })
+                .unwrap();
+        }
+
+        drop(sender);
+
+        let mut seen = receiver.into_iter().collect::<Vec<_>>();
+        seen.sort_by_key(|(shard, _)| shard.map(|id| id.0));
+
+        assert_eq!(
+            seen,
+            vec![
+                (Some(ShardId(0)), Some(String::from("core-0"))),
+                (Some(ShardId(1)), Some(String::from("core-1"))),
+            ]
+        );
+        assert_eq!(runtime.snapshot().shards[0].thread_name, "core-0");
+        runtime.stop().unwrap();
     }
 
     #[test]

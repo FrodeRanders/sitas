@@ -116,6 +116,8 @@ descriptor registration, kernel timers, or deeper backends such as `kqueue`.
 direction:
 
 - `ShardedExecutor::start` starts one executor/reactor on each shard thread
+- `ShardedExecutor::start_with_config` accepts a `ShardedExecutorConfig`,
+  currently covering shard count and thread-name prefix
 - shard executor threads are named `sitas-shard-N`, matching their `ShardId`
   and giving OS/debugging tools a stable per-shard label
 - `spawn_on` places a future on an explicit `ShardId`
