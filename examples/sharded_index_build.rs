@@ -49,11 +49,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_progress("joined partition", &runtime, &progress);
     }
 
-    runs.sort_by_key(|run| run.shard_id.0);
-    let index_entries = merge_runs(&runs);
-    write_index_file(&paths.index, &index_entries)?;
-    verify_index_file(&paths.data, &paths.index, RECORD_COUNT)?;
-
     for run in &runs {
         println!(
             "shard {} scanned {} records, sorted {} entries, observed {}",
@@ -63,10 +58,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run.cpu_placement
         );
     }
+
+    runs.sort_by_key(|run| run.shard_id.0);
+    let final_run = merge_runs_on_shards(&runtime, &progress, runs)?;
+    write_index_file(&paths.index, &final_run.entries)?;
+    verify_index_file(&paths.data, &paths.index, RECORD_COUNT)?;
+
     println!(
         "wrote {} sorted index entries ({} bytes)",
-        index_entries.len(),
-        index_entries.len() * INDEX_ENTRY_SIZE
+        final_run.entries.len(),
+        final_run.entries.len() * INDEX_ENTRY_SIZE
     );
 
     runtime.stop()?;
@@ -102,7 +103,7 @@ fn build_sorted_run(
 
     set_progress(&progress, shard_id, Phase::Sorting, entries.len());
     entries.sort_unstable();
-    set_progress(&progress, shard_id, Phase::Done, entries.len());
+    set_progress(&progress, shard_id, Phase::Sorted, entries.len());
 
     Ok(ShardRun {
         shard_id,
@@ -183,29 +184,99 @@ fn verify_index_file(
     Ok(())
 }
 
-fn merge_runs(runs: &[ShardRun]) -> Vec<IndexEntry> {
-    let total_entries = runs.iter().map(|run| run.entries.len()).sum();
-    let mut positions = vec![0usize; runs.len()];
-    let mut merged = Vec::with_capacity(total_entries);
+fn merge_runs_on_shards(
+    runtime: &ShardedExecutor,
+    progress: &Arc<Mutex<Vec<ShardProgress>>>,
+    mut runs: Vec<ShardRun>,
+) -> Result<ShardRun, Box<dyn std::error::Error>> {
+    let mut round = 0usize;
 
-    while merged.len() < total_entries {
-        let mut selected = None;
+    while runs.len() > 1 {
+        let mut handles = Vec::with_capacity(runs.len() / 2);
+        let mut carried = Vec::with_capacity(runs.len() % 2);
+        let mut run_iter = runs.into_iter();
 
-        for (run_idx, run) in runs.iter().enumerate() {
-            let Some(entry) = run.entries.get(positions[run_idx]) else {
-                continue;
+        while let Some(left) = run_iter.next() {
+            let Some(right) = run_iter.next() else {
+                carried.push(left);
+                break;
             };
 
-            if selected
-                .is_none_or(|(_, selected_entry): (usize, &IndexEntry)| entry < selected_entry)
-            {
-                selected = Some((run_idx, entry));
-            }
+            let target_shard = left.shard_id;
+            let progress = Arc::clone(progress);
+            let handle = runtime.spawn_with_handle_named_on(
+                target_shard,
+                format!(
+                    "index-merge-round-{round}-{}-{}",
+                    left.shard_id.0, right.shard_id.0
+                ),
+                async move { merge_pair(left, right, progress) },
+            )?;
+            handles.push(handle);
         }
 
-        let (run_idx, entry) = selected.expect("at least one run still has entries");
-        merged.push(*entry);
-        positions[run_idx] += 1;
+        let mut merged = carried;
+        for handle in handles {
+            merged.push(block_on(handle)??);
+            print_progress("joined merge", runtime, progress);
+        }
+
+        merged.sort_by_key(|run| run.shard_id.0);
+        println!("merge round {round} produced {} runs", merged.len());
+        runs = merged;
+        round += 1;
+    }
+
+    Ok(runs.pop().expect("at least one sorted run"))
+}
+
+fn merge_pair(
+    left: ShardRun,
+    right: ShardRun,
+    progress: Arc<Mutex<Vec<ShardProgress>>>,
+) -> io::Result<ShardRun> {
+    let shard_id = current_executor_shard().expect("merge task runs on a shard");
+    let cpu_placement =
+        current_executor_cpu_placement().expect("merge task runs on a sharded executor");
+    let total_entries = left.entries.len() + right.entries.len();
+
+    set_progress(&progress, shard_id, Phase::Merging, total_entries);
+
+    let entries = merge_entries(left.entries, right.entries);
+
+    set_progress(&progress, shard_id, Phase::Merged, entries.len());
+
+    Ok(ShardRun {
+        shard_id,
+        cpu_placement,
+        records_scanned: left.records_scanned + right.records_scanned,
+        entries,
+    })
+}
+
+fn merge_entries(left: Vec<IndexEntry>, right: Vec<IndexEntry>) -> Vec<IndexEntry> {
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+
+    loop {
+        match (left.peek(), right.peek()) {
+            (Some(left_entry), Some(right_entry)) if left_entry <= right_entry => {
+                merged.push(left.next().expect("left entry was peeked"));
+            }
+            (Some(_), Some(_)) => {
+                merged.push(right.next().expect("right entry was peeked"));
+            }
+            (Some(_), None) => {
+                merged.extend(left);
+                break;
+            }
+            (None, Some(_)) => {
+                merged.extend(right);
+                break;
+            }
+            (None, None) => break,
+        }
     }
 
     merged
@@ -390,7 +461,9 @@ enum Phase {
     Waiting,
     Scanning,
     Sorting,
-    Done,
+    Sorted,
+    Merging,
+    Merged,
 }
 
 impl Phase {
@@ -399,7 +472,9 @@ impl Phase {
             Phase::Waiting => "waiting",
             Phase::Scanning => "scanning",
             Phase::Sorting => "sorting",
-            Phase::Done => "done",
+            Phase::Sorted => "sorted",
+            Phase::Merging => "merging",
+            Phase::Merged => "merged",
         }
     }
 }
