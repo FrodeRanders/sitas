@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "shard {} scanned {} records, sorted {} entries, observed {}, run {}",
             run.shard_id.0,
             run.records_scanned,
-            run.entries.len(),
+            run.entry_count,
             run.cpu_placement,
             run.path.display()
         );
@@ -65,13 +65,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     runs.sort_by_key(|run| run.shard_id.0);
     let final_run = merge_runs_on_shards(&runtime, &progress, &paths.run_dir, runs)?;
-    write_index_file(&paths.index, &final_run.entries)?;
+    fs::copy(&final_run.path, &paths.index)?;
     verify_index_file(&paths.data, &paths.index, RECORD_COUNT)?;
 
     println!(
         "wrote {} sorted index entries ({} bytes) from {}",
-        final_run.entries.len(),
-        final_run.entries.len() * INDEX_ENTRY_SIZE,
+        final_run.entry_count,
+        final_run.entry_count * INDEX_ENTRY_SIZE,
         final_run.path.display()
     );
 
@@ -116,8 +116,8 @@ fn build_sorted_run(
         shard_id,
         cpu_placement,
         records_scanned: entries.len(),
+        entry_count: entries.len(),
         path: run_path,
-        entries,
     })
 }
 
@@ -143,9 +143,14 @@ fn create_data_file(path: &Path, record_count: usize) -> io::Result<()> {
 fn write_index_file(path: &Path, entries: &[IndexEntry]) -> io::Result<()> {
     let mut file = File::create(path)?;
     for entry in entries {
-        file.write_all(&entry.key.to_le_bytes())?;
-        file.write_all(&entry.offset.to_le_bytes())?;
+        write_index_entry(&mut file, *entry)?;
     }
+    Ok(())
+}
+
+fn write_index_entry(file: &mut File, entry: IndexEntry) -> io::Result<()> {
+    file.write_all(&entry.key.to_le_bytes())?;
+    file.write_all(&entry.offset.to_le_bytes())?;
     Ok(())
 }
 
@@ -252,50 +257,60 @@ fn merge_pair(
     let shard_id = current_executor_shard().expect("merge task runs on a shard");
     let cpu_placement =
         current_executor_cpu_placement().expect("merge task runs on a sharded executor");
-    let total_entries = left.entries.len() + right.entries.len();
+    let total_entries = left.entry_count + right.entry_count;
 
     set_progress(&progress, shard_id, Phase::Merging, total_entries);
 
-    let entries = merge_entries(left.entries, right.entries);
-    write_index_file(&output_path, &entries)?;
+    let entry_count = merge_run_files(&left.path, &right.path, &output_path)?;
 
-    set_progress(&progress, shard_id, Phase::Merged, entries.len());
+    set_progress(&progress, shard_id, Phase::Merged, entry_count);
 
     Ok(ShardRun {
         shard_id,
         cpu_placement,
         records_scanned: left.records_scanned + right.records_scanned,
+        entry_count,
         path: output_path,
-        entries,
     })
 }
 
-fn merge_entries(left: Vec<IndexEntry>, right: Vec<IndexEntry>) -> Vec<IndexEntry> {
-    let mut left = left.into_iter().peekable();
-    let mut right = right.into_iter().peekable();
-    let mut merged = Vec::with_capacity(left.len() + right.len());
+fn merge_run_files(left_path: &Path, right_path: &Path, output_path: &Path) -> io::Result<usize> {
+    let mut left = RunReader::open(left_path)?;
+    let mut right = RunReader::open(right_path)?;
+    let mut output = File::create(output_path)?;
+    let mut count = 0usize;
 
     loop {
-        match (left.peek(), right.peek()) {
+        match (left.peek()?, right.peek()?) {
             (Some(left_entry), Some(right_entry)) if left_entry <= right_entry => {
-                merged.push(left.next().expect("left entry was peeked"));
+                write_index_entry(&mut output, left_entry)?;
+                left.consume();
+                count += 1;
             }
-            (Some(_), Some(_)) => {
-                merged.push(right.next().expect("right entry was peeked"));
+            (Some(_), Some(right_entry)) => {
+                write_index_entry(&mut output, right_entry)?;
+                right.consume();
+                count += 1;
             }
-            (Some(_), None) => {
-                merged.extend(left);
+            (Some(left_entry), None) => {
+                write_index_entry(&mut output, left_entry)?;
+                left.consume();
+                count += 1;
+                count += left.drain_into(&mut output)?;
                 break;
             }
-            (None, Some(_)) => {
-                merged.extend(right);
+            (None, Some(right_entry)) => {
+                write_index_entry(&mut output, right_entry)?;
+                right.consume();
+                count += 1;
+                count += right.drain_into(&mut output)?;
                 break;
             }
             (None, None) => break,
         }
     }
 
-    merged
+    Ok(count)
 }
 
 fn print_progress(
@@ -384,6 +399,44 @@ fn read_index_entry(file: &mut File) -> io::Result<Option<IndexEntry>> {
     }))
 }
 
+struct RunReader {
+    file: File,
+    peeked: Option<Option<IndexEntry>>,
+}
+
+impl RunReader {
+    fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            file: File::open(path)?,
+            peeked: None,
+        })
+    }
+
+    fn peek(&mut self) -> io::Result<Option<IndexEntry>> {
+        if self.peeked.is_none() {
+            self.peeked = Some(read_index_entry(&mut self.file)?);
+        }
+
+        Ok(self.peeked.expect("peeked entry initialized"))
+    }
+
+    fn consume(&mut self) {
+        self.peeked = None;
+    }
+
+    fn drain_into(&mut self, output: &mut File) -> io::Result<usize> {
+        let mut count = 0usize;
+
+        while let Some(entry) = self.peek()? {
+            write_index_entry(output, entry)?;
+            self.consume();
+            count += 1;
+        }
+
+        Ok(count)
+    }
+}
+
 fn record_offset(record_idx: usize) -> u64 {
     (record_idx * RECORD_SIZE) as u64
 }
@@ -434,8 +487,8 @@ struct ShardRun {
     shard_id: ShardId,
     cpu_placement: sitas::CpuPlacementStatus,
     records_scanned: usize,
+    entry_count: usize,
     path: PathBuf,
-    entries: Vec<IndexEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
