@@ -157,6 +157,7 @@ Current responsibilities:
 - `ShardedExecutor::start` starts one executor/reactor on each shard thread;
 - `start_on_available_parallelism` starts one shard per available parallelism unit;
 - `start_on_available_cpus` starts one shard per CPU in `available_cpu_ids`;
+- `start_pinned_on_available_cpus` and `start_required_pinned_on_available_cpus` combine one-shard-per-available-CPU sizing with sequential CPU placement;
 - `start_with_config` accepts shard count, thread-name prefix, CPU placement policy, and optional required CPU placement;
 - shard threads are named predictably, for example `sitas-shard-N`;
 - `spawn_on` places a future on an explicit `ShardId`;

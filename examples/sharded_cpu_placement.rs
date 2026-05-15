@@ -1,12 +1,9 @@
-use sitas::{CpuPlacement, ShardedExecutor, ShardedExecutorConfig, available_cpu_ids};
+use sitas::{ShardedExecutor, available_cpu_ids};
 
 fn main() {
     println!("available CPUs: {:?}", available_cpu_ids());
 
-    let runtime = ShardedExecutor::start_with_config(
-        ShardedExecutorConfig::for_available_cpus().with_cpu_placement(CpuPlacement::Sequential),
-    )
-    .unwrap();
+    let runtime = ShardedExecutor::start_pinned_on_available_cpus().unwrap();
 
     for shard in runtime.snapshot().shards {
         println!(

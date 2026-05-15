@@ -74,6 +74,25 @@ impl ShardedExecutorConfig {
         Self::new(available_cpu_ids().len())
     }
 
+    /// Creates a config with one shard per available CPU and sequential CPU
+    /// placement requested.
+    ///
+    /// Linux applies hard shard-thread affinity. Other platforms keep the
+    /// placement request visible in snapshots as unsupported.
+    pub fn for_pinned_available_cpus() -> Self {
+        Self::for_available_cpus().with_cpu_placement(CpuPlacement::Sequential)
+    }
+
+    /// Creates a config with one shard per available CPU and required
+    /// sequential CPU placement.
+    ///
+    /// This is the fail-fast form for deployments that depend on hard CPU
+    /// affinity. It succeeds on Linux when every shard can be pinned, and
+    /// returns [`ShardError::CpuPlacementFailed`] otherwise.
+    pub fn for_required_pinned_available_cpus() -> Self {
+        Self::for_pinned_available_cpus().require_cpu_placement()
+    }
+
     /// Sets the OS thread-name prefix used for shard executor threads.
     ///
     /// Thread names are formatted as `{prefix}-{shard_index}`.
@@ -182,6 +201,18 @@ impl ShardedExecutor {
     /// Starts one async executor shard for each CPU available to this process.
     pub fn start_on_available_cpus() -> Result<Self, ShardError> {
         Self::start_with_config(ShardedExecutorConfig::for_available_cpus())
+    }
+
+    /// Starts one async executor shard for each available CPU and requests
+    /// sequential CPU placement.
+    pub fn start_pinned_on_available_cpus() -> Result<Self, ShardError> {
+        Self::start_with_config(ShardedExecutorConfig::for_pinned_available_cpus())
+    }
+
+    /// Starts one async executor shard for each available CPU and requires
+    /// sequential CPU placement to be applied.
+    pub fn start_required_pinned_on_available_cpus() -> Result<Self, ShardError> {
+        Self::start_with_config(ShardedExecutorConfig::for_required_pinned_available_cpus())
     }
 
     /// Starts async executor shards using `config`.
@@ -814,6 +845,24 @@ mod tests {
     }
 
     #[test]
+    fn pinned_available_cpu_config_requests_sequential_placement() {
+        let config = ShardedExecutorConfig::for_pinned_available_cpus();
+
+        assert_eq!(config.shard_count(), available_cpu_ids().len());
+        assert_eq!(config.cpu_placement(), &CpuPlacement::Sequential);
+        assert!(!config.is_cpu_placement_required());
+    }
+
+    #[test]
+    fn required_pinned_available_cpu_config_requires_placement() {
+        let config = ShardedExecutorConfig::for_required_pinned_available_cpus();
+
+        assert_eq!(config.shard_count(), available_cpu_ids().len());
+        assert_eq!(config.cpu_placement(), &CpuPlacement::Sequential);
+        assert!(config.is_cpu_placement_required());
+    }
+
+    #[test]
     fn start_on_available_parallelism_starts_reported_shard_count() {
         let runtime = ShardedExecutor::start_on_available_parallelism().unwrap();
 
@@ -828,6 +877,44 @@ mod tests {
 
         assert_eq!(runtime.shard_count(), available_cpu_ids().len());
         assert!(runtime.shard_count() >= 1);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn start_pinned_on_available_cpus_records_requested_placement() {
+        let runtime = ShardedExecutor::start_pinned_on_available_cpus().unwrap();
+
+        assert_eq!(runtime.shard_count(), available_cpu_ids().len());
+        for shard in &runtime.snapshot().shards {
+            assert!(shard.cpu_placement.requested_cpu().is_some());
+            assert!(!matches!(shard.cpu_placement, CpuPlacementStatus::Unpinned));
+        }
+
+        runtime.stop().unwrap();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn required_pinned_available_cpu_start_rejects_unsupported_platforms() {
+        let error = ShardedExecutor::start_required_pinned_on_available_cpus().unwrap_err();
+
+        assert!(matches!(error, ShardError::CpuPlacementFailed(_)));
+        assert!(error.to_string().contains("unsupported"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn required_pinned_available_cpu_start_applies_placement() {
+        let runtime = ShardedExecutor::start_required_pinned_on_available_cpus().unwrap();
+
+        assert_eq!(runtime.shard_count(), available_cpu_ids().len());
+        for shard in &runtime.snapshot().shards {
+            assert!(matches!(
+                shard.cpu_placement,
+                CpuPlacementStatus::Applied(_)
+            ));
+        }
+
         runtime.stop().unwrap();
     }
 
