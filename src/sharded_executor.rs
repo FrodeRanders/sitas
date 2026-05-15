@@ -779,7 +779,7 @@ mod tests {
     use crate::executor::{TaskStatus, TaskWait, sleep};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn start_rejects_zero_shards() {
@@ -1188,17 +1188,44 @@ mod tests {
 
         receiver.recv().unwrap();
 
-        let snapshot = runtime.snapshot();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (snapshot, shard, task) = loop {
+            let snapshot = runtime.snapshot();
+            let shard = snapshot
+                .shards
+                .iter()
+                .find(|shard| shard.shard_id == ShardId(1))
+                .unwrap()
+                .clone();
+            let executor = shard.executor.as_ref().unwrap();
+            let task = executor
+                .tasks
+                .iter()
+                .find(|task| task.name.as_deref() == Some("slow-worker"))
+                .unwrap()
+                .clone();
+
+            if task.status == TaskStatus::Waiting
+                && matches!(task.waiting_for, Some(TaskWait::Timer { .. }))
+            {
+                break (snapshot, shard, task);
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "slow-worker did not enter timer wait state: {task:?}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+
+        let executor = shard.executor.as_ref().unwrap();
+        let task_count = executor.task_count;
+        let timer_count = executor.timer_count;
+
         let shard = snapshot
             .shards
             .iter()
             .find(|shard| shard.shard_id == ShardId(1))
-            .unwrap();
-        let executor = shard.executor.as_ref().unwrap();
-        let task = executor
-            .tasks
-            .iter()
-            .find(|task| task.name.as_deref() == Some("slow-worker"))
             .unwrap();
 
         assert_eq!(snapshot.shard_count, 2);
@@ -1207,8 +1234,8 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Waiting);
         assert!(matches!(task.waiting_for, Some(TaskWait::Timer { .. })));
         assert!(task.poll_count >= 1);
-        assert_eq!(executor.task_count, 1);
-        assert_eq!(executor.timer_count, 1);
+        assert_eq!(task_count, 1);
+        assert_eq!(timer_count, 1);
 
         runtime.stop().unwrap();
     }

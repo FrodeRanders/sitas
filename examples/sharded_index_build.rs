@@ -28,7 +28,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("index file: {}", paths.index.display());
     println!("run files: {}", paths.run_dir.display());
     println!("available CPUs: {:?}", available_cpu_ids());
-    println!("records: {RECORD_COUNT}, shards: {shard_count}");
+    println!(
+        "records: {RECORD_COUNT}, shards: {shard_count}, record bytes: {}, index-entry bytes: {INDEX_ENTRY_SIZE}",
+        RECORD_COUNT * RECORD_SIZE
+    );
 
     for shard_idx in 0..shard_count {
         let partition = Partition::for_shard(shard_idx, shard_count, RECORD_COUNT);
@@ -54,10 +57,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for run in &runs {
         println!(
-            "shard {} scanned {} records, sorted {} entries, observed {}, run {}",
+            "shard {} scanned {} records, sorted {} entries, read {} bytes, wrote {} bytes, observed {}, run {}",
             run.shard_id.0,
             run.records_scanned,
             run.entry_count,
+            run.bytes_read,
+            run.bytes_written,
             run.cpu_placement,
             run.path.display()
         );
@@ -89,7 +94,7 @@ fn build_sorted_run(
     let cpu_placement =
         current_executor_cpu_placement().expect("index task runs on a sharded executor");
 
-    set_progress(&progress, shard_id, Phase::Scanning, 0);
+    set_progress(&progress, shard_id, Phase::Scanning, 0, 0, 0);
 
     let mut data = File::open(data_path)?;
     data.seek(SeekFrom::Start(record_offset(partition.start_record)))?;
@@ -103,20 +108,46 @@ fn build_sorted_run(
         });
 
         if entries.len() % 512 == 0 || record_idx + 1 == partition.end_record {
-            set_progress(&progress, shard_id, Phase::Scanning, entries.len());
+            set_progress(
+                &progress,
+                shard_id,
+                Phase::Scanning,
+                entries.len(),
+                entries.len() * RECORD_SIZE,
+                0,
+            );
         }
     }
 
-    set_progress(&progress, shard_id, Phase::Sorting, entries.len());
+    let bytes_read = entries.len() * RECORD_SIZE;
+    let bytes_written = entries.len() * INDEX_ENTRY_SIZE;
+
+    set_progress(
+        &progress,
+        shard_id,
+        Phase::Sorting,
+        entries.len(),
+        bytes_read,
+        0,
+    );
     entries.sort_unstable();
     write_index_file(&run_path, &entries)?;
-    set_progress(&progress, shard_id, Phase::Sorted, entries.len());
+    set_progress(
+        &progress,
+        shard_id,
+        Phase::Sorted,
+        entries.len(),
+        bytes_read,
+        bytes_written,
+    );
 
     Ok(ShardRun {
         shard_id,
         cpu_placement,
         records_scanned: entries.len(),
         entry_count: entries.len(),
+        bytes_read,
+        bytes_written,
         path: run_path,
     })
 }
@@ -258,18 +289,36 @@ fn merge_pair(
     let cpu_placement =
         current_executor_cpu_placement().expect("merge task runs on a sharded executor");
     let total_entries = left.entry_count + right.entry_count;
+    let bytes_read = total_entries * INDEX_ENTRY_SIZE;
+    let bytes_written = total_entries * INDEX_ENTRY_SIZE;
 
-    set_progress(&progress, shard_id, Phase::Merging, total_entries);
+    set_progress(
+        &progress,
+        shard_id,
+        Phase::Merging,
+        total_entries,
+        bytes_read,
+        0,
+    );
 
     let entry_count = merge_run_files(&left.path, &right.path, &output_path)?;
 
-    set_progress(&progress, shard_id, Phase::Merged, entry_count);
+    set_progress(
+        &progress,
+        shard_id,
+        Phase::Merged,
+        entry_count,
+        bytes_read,
+        bytes_written,
+    );
 
     Ok(ShardRun {
         shard_id,
         cpu_placement,
         records_scanned: left.records_scanned + right.records_scanned,
         entry_count,
+        bytes_read,
+        bytes_written,
         path: output_path,
     })
 }
@@ -329,11 +378,13 @@ fn print_progress(
             .as_ref()
             .map_or(0, |executor| executor.task_count);
         println!(
-            "  shard {} {} phase={} records={} tasks={}",
+            "  shard {} {} phase={} records={} read={}B wrote={}B tasks={}",
             shard.shard_id.0,
             shard.cpu_placement,
             progress.phase.name(),
             progress.records,
+            progress.bytes_read,
+            progress.bytes_written,
             task_count
         );
     }
@@ -344,9 +395,16 @@ fn set_progress(
     shard_id: ShardId,
     phase: Phase,
     records: usize,
+    bytes_read: usize,
+    bytes_written: usize,
 ) {
     let mut progress = progress.lock().expect("progress mutex poisoned");
-    progress[shard_id.0] = ShardProgress { phase, records };
+    progress[shard_id.0] = ShardProgress {
+        phase,
+        records,
+        bytes_read,
+        bytes_written,
+    };
 }
 
 fn read_record(file: &mut File) -> io::Result<Record> {
@@ -488,6 +546,8 @@ struct ShardRun {
     cpu_placement: sitas::CpuPlacementStatus,
     records_scanned: usize,
     entry_count: usize,
+    bytes_read: usize,
+    bytes_written: usize,
     path: PathBuf,
 }
 
@@ -521,6 +581,8 @@ struct Record {
 struct ShardProgress {
     phase: Phase,
     records: usize,
+    bytes_read: usize,
+    bytes_written: usize,
 }
 
 impl Default for ShardProgress {
@@ -528,6 +590,8 @@ impl Default for ShardProgress {
         Self {
             phase: Phase::Waiting,
             records: 0,
+            bytes_read: 0,
+            bytes_written: 0,
         }
     }
 }
