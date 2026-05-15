@@ -125,6 +125,9 @@ direction:
 - `CpuPlacement::Sequential` maps shard threads across the CPUs available to
   the process; Linux applies hard affinity with `sched_setaffinity`, while
   non-Linux platforms report the requested placement as unsupported
+- `available_cpu_ids` exposes the CPU ids used by sequential placement; Linux
+  reads this from `sched_getaffinity`, so container cpuset restrictions are
+  visible before starting shard threads
 - `spawn_on` places a future on an explicit `ShardId`
 - `spawn_named_on` places a future with a human-readable name for snapshots
 - `spawn_with_handle_on` places a future and returns an awaitable join handle

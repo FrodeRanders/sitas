@@ -106,7 +106,12 @@ impl fmt::Display for CpuPlacementStatus {
     }
 }
 
-pub(crate) fn available_cpu_ids() -> Vec<CpuId> {
+/// Returns the CPU ids available to this process for shard placement.
+///
+/// On Linux this uses `sched_getaffinity`, so it honors container cpusets and
+/// other process affinity restrictions. On other platforms it falls back to
+/// `0..std::thread::available_parallelism()`.
+pub fn available_cpu_ids() -> Vec<CpuId> {
     platform::available_cpu_ids().unwrap_or_else(|| {
         let count = thread::available_parallelism().map_or(1, usize::from);
         (0..count).map(CpuId).collect()

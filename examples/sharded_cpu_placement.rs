@@ -1,6 +1,8 @@
-use sitas::{CpuPlacement, ShardedExecutor, ShardedExecutorConfig};
+use sitas::{CpuPlacement, ShardedExecutor, ShardedExecutorConfig, available_cpu_ids};
 
 fn main() {
+    println!("available CPUs: {:?}", available_cpu_ids());
+
     let runtime = ShardedExecutor::start_with_config(
         ShardedExecutorConfig::for_available_parallelism()
             .with_cpu_placement(CpuPlacement::Sequential),

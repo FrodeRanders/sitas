@@ -71,6 +71,6 @@ pub use sharded_executor::{
     CpuId, CpuPlacement, CpuPlacementStatus, ShardedExecutor, ShardedExecutorConfig,
     ShardedExecutorObserver, ShardedExecutorShardSnapshot, ShardedExecutorSnapshot,
     ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
-    ShardedSpawnError, ShardedSubmitter, available_parallelism, current_executor_shard,
-    join_all_shards,
+    ShardedSpawnError, ShardedSubmitter, available_cpu_ids, available_parallelism,
+    current_executor_shard, join_all_shards,
 };

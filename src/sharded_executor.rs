@@ -20,7 +20,7 @@ use crate::shard::ShardId;
 mod affinity;
 mod join;
 
-pub use affinity::{CpuId, CpuPlacement, CpuPlacementStatus};
+pub use affinity::{CpuId, CpuPlacement, CpuPlacementStatus, available_cpu_ids};
 pub use join::{
     ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
     ShardedSpawnError, join_all_shards,
@@ -151,7 +151,7 @@ impl ShardedExecutor {
 
         let mut shards = Vec::with_capacity(config.shard_count);
         let mut joins = Vec::with_capacity(config.shard_count);
-        let available_cpus = affinity::available_cpu_ids();
+        let available_cpus = available_cpu_ids();
 
         for shard_idx in 0..config.shard_count {
             let shard_id = ShardId(shard_idx);
@@ -658,7 +658,7 @@ impl Drop for ShardedExecutor {
 mod tests {
     use super::{
         CpuId, CpuPlacement, CpuPlacementStatus, ShardedExecutor, ShardedExecutorConfig,
-        ShardedSpawnError, available_parallelism, current_executor_shard,
+        ShardedSpawnError, available_cpu_ids, available_parallelism, current_executor_shard,
     };
     use crate::ShardId;
     use crate::error::ShardError;
@@ -709,6 +709,11 @@ mod tests {
         assert_eq!(available_parallelism(), reported);
         assert_eq!(config.shard_count(), reported);
         assert!(config.shard_count() >= 1);
+    }
+
+    #[test]
+    fn available_cpu_ids_reports_at_least_one_cpu() {
+        assert!(!available_cpu_ids().is_empty());
     }
 
     #[test]
@@ -775,7 +780,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_cpu_placement_pins_shard_thread_affinity_masks() {
-        let cpus = super::affinity::available_cpu_ids();
+        let cpus = available_cpu_ids();
         let shard_count = cpus.len().min(2);
 
         if shard_count == 0 {
