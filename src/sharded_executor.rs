@@ -324,6 +324,134 @@ impl ShardedExecutor {
         }
     }
 
+    /// Spawns one task onto each executor shard.
+    pub fn spawn_on_all<MakeFuture, Fut>(
+        &self,
+        make_future: MakeFuture,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_handle_on_all(make_future).map(|_| ())
+    }
+
+    /// Spawns one task onto each executor shard and returns shard-tagged join
+    /// handles.
+    pub fn spawn_with_handle_on_all<MakeFuture, Fut>(
+        &self,
+        mut make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let mut handles = Vec::with_capacity(self.shard_count());
+
+        for shard in &self.shards {
+            let spawner = shard
+                .spawner
+                .as_ref()
+                .ok_or(ShardedSpawnError::Stopped(shard.shard_id))?;
+            let handle = spawner
+                .spawn_with_handle(make_future(shard.shard_id))
+                .map_err(ShardedSpawnError::Spawn)?;
+            handles.push(ShardedJoinHandle::new(shard.shard_id, handle));
+        }
+
+        Ok(handles)
+    }
+
+    /// Spawns one named task onto each executor shard and returns shard-tagged
+    /// join handles.
+    pub fn spawn_with_handle_named_on_all<MakeName, MakeFuture, Fut>(
+        &self,
+        mut make_name: MakeName,
+        mut make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let mut handles = Vec::with_capacity(self.shard_count());
+
+        for shard in &self.shards {
+            let spawner = shard
+                .spawner
+                .as_ref()
+                .ok_or(ShardedSpawnError::Stopped(shard.shard_id))?;
+            let handle = spawner
+                .spawn_with_handle_named(make_name(shard.shard_id), make_future(shard.shard_id))
+                .map_err(ShardedSpawnError::Spawn)?;
+            handles.push(ShardedJoinHandle::new(shard.shard_id, handle));
+        }
+
+        Ok(handles)
+    }
+
+    /// Runs one async computation per shard and collects shard-tagged outputs.
+    pub async fn map_all<MakeFuture, Fut>(
+        &self,
+        make_future: MakeFuture,
+    ) -> Result<Vec<(ShardId, Fut::Output)>, ShardedOperationError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let handles = self
+            .spawn_with_handle_on_all(make_future)
+            .map_err(ShardedOperationError::Submit)?;
+        join_all_shards(handles)
+            .await
+            .map_err(ShardedOperationError::Join)
+    }
+
+    /// Runs one named async computation per shard and collects shard-tagged
+    /// outputs.
+    pub async fn map_named_all<MakeName, MakeFuture, Fut>(
+        &self,
+        make_name: MakeName,
+        make_future: MakeFuture,
+    ) -> Result<Vec<(ShardId, Fut::Output)>, ShardedOperationError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let handles = self
+            .spawn_with_handle_named_on_all(make_name, make_future)
+            .map_err(ShardedOperationError::Submit)?;
+        join_all_shards(handles)
+            .await
+            .map_err(ShardedOperationError::Join)
+    }
+
+    /// Runs one async computation per shard and reduces the shard-tagged
+    /// outputs into one value.
+    pub async fn map_reduce_all<MakeFuture, Fut, Acc, Reduce>(
+        &self,
+        make_future: MakeFuture,
+        mut initial: Acc,
+        mut reduce: Reduce,
+    ) -> Result<Acc, ShardedOperationError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+        Reduce: FnMut(Acc, ShardId, Fut::Output) -> Acc,
+    {
+        for (shard_id, output) in self.map_all(make_future).await? {
+            initial = reduce(initial, shard_id, output);
+        }
+
+        Ok(initial)
+    }
+
     /// Spawns a task onto a specific executor shard.
     pub fn spawn_on<F>(&self, shard_id: ShardId, future: F) -> Result<(), ShardedSpawnError>
     where
@@ -1149,6 +1277,118 @@ mod tests {
 
         assert_eq!(block_on(handle).unwrap(), 42);
         runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn runtime_can_spawn_on_all_shards_and_join_outputs() {
+        let runtime = ShardedExecutor::start(4).unwrap();
+
+        let handles = runtime
+            .spawn_with_handle_named_on_all(
+                |shard_id| format!("runtime-broadcast-{}", shard_id.0),
+                |shard_id| async move {
+                    assert_eq!(current_executor_shard(), Some(shard_id));
+                    shard_id.0 * 10
+                },
+            )
+            .unwrap();
+
+        let outputs = block_on(super::join_all_shards(handles)).unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                (ShardId(0), 0),
+                (ShardId(1), 10),
+                (ShardId(2), 20),
+                (ShardId(3), 30)
+            ]
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn runtime_can_map_reduce_across_shards() {
+        let runtime = ShardedExecutor::start(4).unwrap();
+
+        let total = block_on(runtime.map_reduce_all(
+            |shard_id| async move {
+                assert_eq!(current_executor_shard(), Some(shard_id));
+                shard_id.0 + 1
+            },
+            0usize,
+            |sum, _shard_id, value| sum + value,
+        ))
+        .unwrap();
+
+        assert_eq!(total, 10);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn runtime_map_named_all_tasks_are_observable() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+
+        let handles = runtime
+            .spawn_with_handle_named_on_all(
+                |shard_id| format!("runtime-map-{}", shard_id.0),
+                |shard_id| async move {
+                    sleep(Duration::from_millis(100)).await;
+                    current_executor_shard().unwrap_or(shard_id)
+                },
+            )
+            .unwrap();
+
+        let expected_0 = String::from("runtime-map-0");
+        let expected_1 = String::from("runtime-map-1");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let task_names = loop {
+            let snapshot = runtime.snapshot();
+            let task_names = snapshot
+                .shards
+                .iter()
+                .flat_map(|shard| {
+                    shard
+                        .executor
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|executor| executor.tasks.iter())
+                })
+                .filter_map(|task| task.name.clone())
+                .collect::<Vec<_>>();
+
+            if task_names.contains(&expected_0) && task_names.contains(&expected_1) {
+                break task_names;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "runtime map tasks were not observable: {task_names:?}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+
+        assert!(task_names.contains(&expected_0));
+        assert!(task_names.contains(&expected_1));
+
+        let outputs = block_on(super::join_all_shards(handles)).unwrap();
+        assert_eq!(
+            outputs,
+            vec![(ShardId(0), ShardId(0)), (ShardId(1), ShardId(1))]
+        );
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn runtime_spawn_on_all_rejects_stopped_shards() {
+        let mut runtime = ShardedExecutor::start(1).unwrap();
+        runtime.shutdown().unwrap();
+
+        let error = runtime
+            .spawn_on_all(|_shard_id| async {})
+            .expect_err("stopped shard should fail");
+
+        assert_eq!(error, ShardedSpawnError::Stopped(ShardId(0)));
     }
 
     #[test]
