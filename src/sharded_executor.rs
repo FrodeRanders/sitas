@@ -355,35 +355,28 @@ impl ShardedExecutor {
     /// handles.
     pub fn spawn_with_handle_on_all<MakeFuture, Fut>(
         &self,
-        mut make_future: MakeFuture,
+        make_future: MakeFuture,
     ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
     where
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let mut handles = Vec::with_capacity(self.shard_count());
-
-        for shard in &self.shards {
-            let spawner = shard
-                .spawner
-                .as_ref()
-                .ok_or(ShardedSpawnError::Stopped(shard.shard_id))?;
-            let handle = spawner
-                .spawn_with_handle(make_future(shard.shard_id))
-                .map_err(ShardedSpawnError::Spawn)?;
-            handles.push(ShardedJoinHandle::new(shard.shard_id, handle));
-        }
-
-        Ok(handles)
+        spawn_with_handle_on_all_shards(
+            self.shards
+                .iter()
+                .map(|shard| (shard.shard_id, shard.spawner.as_ref())),
+            self.shard_count(),
+            make_future,
+        )
     }
 
     /// Spawns one named task onto each executor shard and returns shard-tagged
     /// join handles.
     pub fn spawn_with_handle_named_on_all<MakeName, MakeFuture, Fut>(
         &self,
-        mut make_name: MakeName,
-        mut make_future: MakeFuture,
+        make_name: MakeName,
+        make_future: MakeFuture,
     ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
     where
         MakeName: FnMut(ShardId) -> String,
@@ -391,20 +384,14 @@ impl ShardedExecutor {
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let mut handles = Vec::with_capacity(self.shard_count());
-
-        for shard in &self.shards {
-            let spawner = shard
-                .spawner
-                .as_ref()
-                .ok_or(ShardedSpawnError::Stopped(shard.shard_id))?;
-            let handle = spawner
-                .spawn_with_handle_named(make_name(shard.shard_id), make_future(shard.shard_id))
-                .map_err(ShardedSpawnError::Spawn)?;
-            handles.push(ShardedJoinHandle::new(shard.shard_id, handle));
-        }
-
-        Ok(handles)
+        spawn_with_handle_named_on_all_shards(
+            self.shards
+                .iter()
+                .map(|shard| (shard.shard_id, shard.spawner.as_ref())),
+            self.shard_count(),
+            make_name,
+            make_future,
+        )
     }
 
     /// Runs one async computation per shard and collects shard-tagged outputs.
@@ -709,35 +696,28 @@ impl ShardedSubmitter {
     /// Submits one task to each shard and returns shard-tagged join handles.
     pub fn submit_with_handle_to_all<MakeFuture, Fut>(
         &self,
-        mut make_future: MakeFuture,
+        make_future: MakeFuture,
     ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
     where
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let mut handles = Vec::with_capacity(self.shard_count());
-
-        for shard in &self.shards {
-            let spawner = shard
-                .spawner
-                .as_ref()
-                .ok_or(ShardedSpawnError::Stopped(shard.shard_id))?;
-            let handle = spawner
-                .spawn_with_handle(make_future(shard.shard_id))
-                .map_err(ShardedSpawnError::Spawn)?;
-            handles.push(ShardedJoinHandle::new(shard.shard_id, handle));
-        }
-
-        Ok(handles)
+        spawn_with_handle_on_all_shards(
+            self.shards
+                .iter()
+                .map(|shard| (shard.shard_id, shard.spawner.as_ref())),
+            self.shard_count(),
+            make_future,
+        )
     }
 
     /// Submits one named task to each shard and returns shard-tagged join
     /// handles.
     pub fn submit_with_handle_named_to_all<MakeName, MakeFuture, Fut>(
         &self,
-        mut make_name: MakeName,
-        mut make_future: MakeFuture,
+        make_name: MakeName,
+        make_future: MakeFuture,
     ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
     where
         MakeName: FnMut(ShardId) -> String,
@@ -745,20 +725,14 @@ impl ShardedSubmitter {
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let mut handles = Vec::with_capacity(self.shard_count());
-
-        for shard in &self.shards {
-            let spawner = shard
-                .spawner
-                .as_ref()
-                .ok_or(ShardedSpawnError::Stopped(shard.shard_id))?;
-            let handle = spawner
-                .spawn_with_handle_named(make_name(shard.shard_id), make_future(shard.shard_id))
-                .map_err(ShardedSpawnError::Spawn)?;
-            handles.push(ShardedJoinHandle::new(shard.shard_id, handle));
-        }
-
-        Ok(handles)
+        spawn_with_handle_named_on_all_shards(
+            self.shards
+                .iter()
+                .map(|shard| (shard.shard_id, shard.spawner.as_ref())),
+            self.shard_count(),
+            make_name,
+            make_future,
+        )
     }
 
     /// Runs one async computation per shard and collects shard-tagged outputs.
@@ -833,6 +807,56 @@ impl ShardedSubmitter {
             .as_ref()
             .ok_or(ShardedSpawnError::Stopped(shard_id))
     }
+}
+
+fn spawn_with_handle_on_all_shards<'a, I, MakeFuture, Fut>(
+    shards: I,
+    capacity: usize,
+    mut make_future: MakeFuture,
+) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+where
+    I: IntoIterator<Item = (ShardId, Option<&'a Spawner>)>,
+    MakeFuture: FnMut(ShardId) -> Fut,
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    let mut handles = Vec::with_capacity(capacity);
+
+    for (shard_id, spawner) in shards {
+        let spawner = spawner.ok_or(ShardedSpawnError::Stopped(shard_id))?;
+        let handle = spawner
+            .spawn_with_handle(make_future(shard_id))
+            .map_err(ShardedSpawnError::Spawn)?;
+        handles.push(ShardedJoinHandle::new(shard_id, handle));
+    }
+
+    Ok(handles)
+}
+
+fn spawn_with_handle_named_on_all_shards<'a, I, MakeName, MakeFuture, Fut>(
+    shards: I,
+    capacity: usize,
+    mut make_name: MakeName,
+    mut make_future: MakeFuture,
+) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+where
+    I: IntoIterator<Item = (ShardId, Option<&'a Spawner>)>,
+    MakeName: FnMut(ShardId) -> String,
+    MakeFuture: FnMut(ShardId) -> Fut,
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    let mut handles = Vec::with_capacity(capacity);
+
+    for (shard_id, spawner) in shards {
+        let spawner = spawner.ok_or(ShardedSpawnError::Stopped(shard_id))?;
+        let handle = spawner
+            .spawn_with_handle_named(make_name(shard_id), make_future(shard_id))
+            .map_err(ShardedSpawnError::Spawn)?;
+        handles.push(ShardedJoinHandle::new(shard_id, handle));
+    }
+
+    Ok(handles)
 }
 
 /// Weak observer handle for a sharded executor runtime.
