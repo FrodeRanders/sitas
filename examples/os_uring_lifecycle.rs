@@ -63,7 +63,8 @@ fn main() -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn print_snapshot(label: &str, snapshot: &sitas::os::IoUringDispatcherSnapshot) {
     println!(
-        "{label}: pending={} tracked={} wakers={} completed={} abandoned={} deferred={} total_dispatched={} total_buffered={} total_woken={} total_discarded={}",
+        "{label}: idle={} pending={} tracked={} wakers={} completed={} abandoned={} deferred={} total_dispatched={} total_buffered={} total_woken={} total_discarded={}",
+        snapshot.is_idle(),
         snapshot.ring.pending_submissions,
         snapshot.ring.tracked_operations,
         snapshot.registered_wakers,

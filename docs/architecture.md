@@ -306,6 +306,13 @@ The snapshot fields map to these states:
 - `IoUringDispatcherSnapshot.total_*_operation_kinds`: the same cumulative
   counters grouped by no-op, timeout, cancel, read, and write operation kind.
 
+Both `IoUringSnapshot` and `IoUringDispatcherSnapshot` expose `is_idle()`.
+For the raw ring, idle means no pending submissions, no locally buffered
+completions, and no tracked operations. For the dispatcher, idle additionally
+requires no registered wakers, buffered completions, abandoned operations, or
+deferred owned buffers. Cumulative totals do not affect idleness; they describe
+history, not live work.
+
 Shard reply handles can be converted into awaitable futures through
 `wait_async`. Replies use a small custom std-only one-shot primitive rather than
 `std::sync::mpsc`, so a waiting future can store its task waker directly in the

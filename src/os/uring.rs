@@ -1043,14 +1043,7 @@ impl IoUringDispatcher {
     /// Returns whether the dispatcher has no kernel, completion, or waiter
     /// state left to drive.
     pub fn is_idle(&self) -> bool {
-        let snapshot = self.snapshot();
-        snapshot.ring.pending_submissions == 0
-            && snapshot.ring.pending_completions == 0
-            && snapshot.ring.tracked_operations == 0
-            && snapshot.registered_wakers == 0
-            && snapshot.completed_operations == 0
-            && snapshot.abandoned_operations == 0
-            && snapshot.deferred_buffers == 0
+        self.snapshot().is_idle()
     }
 
     /// Drives pending completions until the dispatcher is idle or the dispatch
@@ -1508,6 +1501,18 @@ pub struct IoUringDispatcherSnapshot {
     pub total_discarded_operation_kinds: IoUringOperationKindCounts,
 }
 
+impl IoUringDispatcherSnapshot {
+    /// Returns whether the dispatcher had no kernel, completion, waiter, or
+    /// abandonment state left to drive when this snapshot was taken.
+    pub fn is_idle(&self) -> bool {
+        self.ring.is_idle()
+            && self.registered_wakers == 0
+            && self.completed_operations == 0
+            && self.abandoned_operations == 0
+            && self.deferred_buffers == 0
+    }
+}
+
 /// One `io_uring` completion queue entry.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1631,6 +1636,16 @@ pub struct IoUringSnapshot {
     pub tracked_operations: usize,
     /// Tracked operations grouped by operation kind.
     pub operation_kinds: IoUringOperationKindCounts,
+}
+
+impl IoUringSnapshot {
+    /// Returns whether the local ring snapshot had no queued submissions,
+    /// buffered completions, or tracked operations when it was taken.
+    pub fn is_idle(&self) -> bool {
+        self.pending_submissions == 0
+            && self.pending_completions == 0
+            && self.tracked_operations == 0
+    }
 }
 
 /// Completion for a tracked `io_uring` operation.
@@ -1845,13 +1860,16 @@ mod tests {
         assert_eq!(snapshot.tracked_operations, 2);
         assert_eq!(snapshot.operation_kinds.timeouts, 1);
         assert_eq!(snapshot.operation_kinds.cancellations, 1);
+        assert!(!snapshot.is_idle());
 
         let cancel_completion = ring.wait_operation_completion(cancel).unwrap();
         let timeout_completion = ring.wait_operation_completion(timeout).unwrap();
 
         assert_eq!(cancel_completion.result, 0);
         assert_eq!(timeout_completion.result, -ECANCELED);
-        assert_eq!(ring.snapshot().tracked_operations, 0);
+        let idle = ring.snapshot();
+        assert_eq!(idle.tracked_operations, 0);
+        assert!(idle.is_idle());
     }
 
     #[test]
@@ -1977,6 +1995,7 @@ mod tests {
         let snapshot = dispatcher.snapshot();
         assert_eq!(snapshot.registered_wakers, 0);
         assert_eq!(snapshot.completed_operations, 0);
+        assert!(snapshot.is_idle());
         assert_eq!(snapshot.total_dispatched_operations, 1);
         assert_eq!(snapshot.total_buffered_operations, 1);
         assert_eq!(snapshot.total_woken_operations, 1);
@@ -2003,6 +2022,7 @@ mod tests {
         assert_eq!(wake_count.load(Ordering::SeqCst), 0);
         assert_eq!(dispatcher.snapshot().registered_wakers, 0);
         assert_eq!(dispatcher.snapshot().completed_operations, 1);
+        assert!(!dispatcher.snapshot().is_idle());
         assert_eq!(dispatcher.snapshot().completed_operation_kinds.nops, 1);
         assert_eq!(dispatcher.snapshot().total_dispatched_operations, 1);
         assert_eq!(dispatcher.snapshot().total_buffered_operations, 1);
@@ -2022,6 +2042,7 @@ mod tests {
         let completion = dispatcher.take_completion(operation).unwrap();
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(dispatcher.snapshot().completed_operations, 0);
+        assert!(dispatcher.snapshot().is_idle());
         assert_eq!(dispatcher.snapshot().completed_operation_kinds.nops, 0);
         assert_eq!(dispatcher.snapshot().total_dispatched_operations, 1);
         assert_eq!(dispatcher.snapshot().total_buffered_operations, 1);
@@ -2437,6 +2458,7 @@ mod tests {
         let drained = dispatcher.borrow().snapshot();
         assert_eq!(drained.abandoned_operations, 0);
         assert_eq!(drained.completed_operations, 0);
+        assert!(drained.is_idle());
         assert_eq!(drained.total_dispatched_operations, 2);
         assert_eq!(drained.total_buffered_operations, 0);
         assert_eq!(drained.total_woken_operations, 0);
