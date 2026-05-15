@@ -4,8 +4,7 @@ fn main() {
     println!("available CPUs: {:?}", available_cpu_ids());
 
     let runtime = ShardedExecutor::start_with_config(
-        ShardedExecutorConfig::for_available_parallelism()
-            .with_cpu_placement(CpuPlacement::Sequential),
+        ShardedExecutorConfig::for_available_cpus().with_cpu_placement(CpuPlacement::Sequential),
     )
     .unwrap();
 

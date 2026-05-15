@@ -65,6 +65,15 @@ impl ShardedExecutorConfig {
         Self::new(available_parallelism())
     }
 
+    /// Creates a config sized to the process's available CPU set.
+    ///
+    /// This is the shard count counterpart to [`CpuPlacement::Sequential`]:
+    /// Linux uses `sched_getaffinity`, while other platforms fall back to
+    /// reported parallelism.
+    pub fn for_available_cpus() -> Self {
+        Self::new(available_cpu_ids().len())
+    }
+
     /// Sets the OS thread-name prefix used for shard executor threads.
     ///
     /// Thread names are formatted as `{prefix}-{shard_index}`.
@@ -168,6 +177,11 @@ impl ShardedExecutor {
     /// parallelism.
     pub fn start_on_available_parallelism() -> Result<Self, ShardError> {
         Self::start_with_config(ShardedExecutorConfig::for_available_parallelism())
+    }
+
+    /// Starts one async executor shard for each CPU available to this process.
+    pub fn start_on_available_cpus() -> Result<Self, ShardError> {
+        Self::start_with_config(ShardedExecutorConfig::for_available_cpus())
     }
 
     /// Starts async executor shards using `config`.
@@ -792,10 +806,27 @@ mod tests {
     }
 
     #[test]
+    fn available_cpu_config_uses_available_cpu_count() {
+        let config = ShardedExecutorConfig::for_available_cpus();
+
+        assert_eq!(config.shard_count(), available_cpu_ids().len());
+        assert!(config.shard_count() >= 1);
+    }
+
+    #[test]
     fn start_on_available_parallelism_starts_reported_shard_count() {
         let runtime = ShardedExecutor::start_on_available_parallelism().unwrap();
 
         assert_eq!(runtime.shard_count(), available_parallelism());
+        assert!(runtime.shard_count() >= 1);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn start_on_available_cpus_starts_available_cpu_count() {
+        let runtime = ShardedExecutor::start_on_available_cpus().unwrap();
+
+        assert_eq!(runtime.shard_count(), available_cpu_ids().len());
         assert!(runtime.shard_count() >= 1);
         runtime.stop().unwrap();
     }
