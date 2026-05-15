@@ -44,6 +44,32 @@ impl CpuPlacement {
             CpuPlacement::Unpinned | CpuPlacement::Sequential => true,
         }
     }
+
+    pub(crate) fn validate_against_available_cpus(
+        &self,
+        shard_count: usize,
+        available_cpus: &[CpuId],
+    ) -> Result<(), String> {
+        match self {
+            CpuPlacement::Explicit(cpus) if cpus.len() < shard_count => Err(format!(
+                "explicit placement provides {} CPUs for {shard_count} shards",
+                cpus.len()
+            )),
+            CpuPlacement::Explicit(cpus) => {
+                for cpu in cpus.iter().take(shard_count) {
+                    if !available_cpus.contains(cpu) {
+                        return Err(format!(
+                            "CPU {} is not in the process available CPU set {:?}",
+                            cpu.0, available_cpus
+                        ));
+                    }
+                }
+
+                Ok(())
+            }
+            CpuPlacement::Unpinned | CpuPlacement::Sequential => Ok(()),
+        }
+    }
 }
 
 /// Result of applying CPU placement to one shard thread.

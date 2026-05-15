@@ -10,8 +10,8 @@ pub enum ShardError {
     InvalidShardId(usize),
     /// A bounded shard mailbox was configured with zero capacity.
     InvalidMailboxCapacity,
-    /// A sharded executor CPU placement policy does not cover all shards.
-    InvalidCpuPlacement,
+    /// A sharded executor CPU placement policy is invalid.
+    InvalidCpuPlacement(String),
     /// Required CPU placement could not be applied.
     CpuPlacementFailed(String),
     /// A non-blocking send found the target shard mailbox full.
@@ -36,8 +36,8 @@ impl fmt::Display for ShardError {
             ShardError::InvalidMailboxCapacity => {
                 write!(f, "mailbox capacity must be greater than zero")
             }
-            ShardError::InvalidCpuPlacement => {
-                write!(f, "CPU placement must provide a CPU for every shard")
+            ShardError::InvalidCpuPlacement(reason) => {
+                write!(f, "invalid CPU placement: {reason}")
             }
             ShardError::CpuPlacementFailed(reason) => {
                 write!(f, "required CPU placement failed: {reason}")

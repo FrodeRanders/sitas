@@ -117,10 +117,19 @@ impl ShardedExecutorConfig {
         }
 
         if !self.cpu_placement.validate(self.shard_count) {
-            return Err(ShardError::InvalidCpuPlacement);
+            return Err(ShardError::InvalidCpuPlacement(format!(
+                "explicit placement does not provide a CPU for every shard: {} shards requested",
+                self.shard_count
+            )));
         }
 
         Ok(())
+    }
+
+    fn validate_cpu_placement_against(&self, available_cpus: &[CpuId]) -> Result<(), ShardError> {
+        self.cpu_placement
+            .validate_against_available_cpus(self.shard_count, available_cpus)
+            .map_err(ShardError::InvalidCpuPlacement)
     }
 
     fn thread_name(&self, shard_id: ShardId) -> String {
@@ -165,9 +174,11 @@ impl ShardedExecutor {
     pub fn start_with_config(config: ShardedExecutorConfig) -> Result<Self, ShardError> {
         config.validate()?;
 
+        let available_cpus = available_cpu_ids();
+        config.validate_cpu_placement_against(&available_cpus)?;
+
         let mut shards = Vec::with_capacity(config.shard_count);
         let mut joins = Vec::with_capacity(config.shard_count);
-        let available_cpus = available_cpu_ids();
 
         for shard_idx in 0..config.shard_count {
             let shard_id = ShardId(shard_idx);
@@ -744,7 +755,25 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, ShardError::InvalidCpuPlacement);
+        assert!(matches!(error, ShardError::InvalidCpuPlacement(_)));
+        assert!(error.to_string().contains("does not provide"));
+    }
+
+    #[test]
+    fn config_rejects_explicit_cpu_placement_outside_available_cpu_set() {
+        let unavailable_cpu = CpuId(usize::MAX);
+        let error = ShardedExecutor::start_with_config(
+            ShardedExecutorConfig::new(1)
+                .with_cpu_placement(CpuPlacement::Explicit(vec![unavailable_cpu])),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ShardError::InvalidCpuPlacement(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("not in the process available CPU set")
+        );
     }
 
     #[test]
@@ -885,19 +914,6 @@ mod tests {
         }
 
         runtime.stop().unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn required_cpu_placement_rejects_failed_linux_affinity() {
-        let error = ShardedExecutor::start_with_config(
-            ShardedExecutorConfig::new(1)
-                .with_cpu_placement(CpuPlacement::Explicit(vec![CpuId(usize::MAX)]))
-                .require_cpu_placement(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, ShardError::CpuPlacementFailed(_)));
     }
 
     #[test]
