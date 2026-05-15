@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-`shardstar` is an experimental Rust runtime and service model inspired by Seastar's shard-per-core architecture. It is not a direct Seastar clone. The project explores how the same broad ideas can be expressed in a Rust-native way:
+`sitas` is an experimental Rust runtime and service model inspired by Seastar's shard-per-core architecture. It is not a direct Seastar clone. The project explores how the same broad ideas can be expressed in a Rust-native way:
 
 - shard-local ownership;
 - explicit cross-shard communication;
