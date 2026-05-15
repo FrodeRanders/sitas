@@ -70,6 +70,6 @@ pub use shard_local::{
 pub use sharded_executor::{
     ShardedExecutor, ShardedExecutorConfig, ShardedExecutorObserver, ShardedExecutorShardSnapshot,
     ShardedExecutorSnapshot, ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError,
-    ShardedOperationError, ShardedSpawnError, ShardedSubmitter, current_executor_shard,
-    join_all_shards,
+    ShardedOperationError, ShardedSpawnError, ShardedSubmitter, available_parallelism,
+    current_executor_shard, join_all_shards,
 };

@@ -116,6 +116,8 @@ descriptor registration, kernel timers, or deeper backends such as `kqueue`.
 direction:
 
 - `ShardedExecutor::start` starts one executor/reactor on each shard thread
+- `ShardedExecutor::start_on_available_parallelism` starts one shard for each
+  unit reported by `std::thread::available_parallelism`
 - `ShardedExecutor::start_with_config` accepts a `ShardedExecutorConfig`,
   currently covering shard count and thread-name prefix
 - shard executor threads are named `sitas-shard-N`, matching their `ShardId`

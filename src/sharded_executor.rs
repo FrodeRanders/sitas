@@ -51,6 +51,14 @@ impl ShardedExecutorConfig {
         }
     }
 
+    /// Creates a config sized to the host's reported parallelism.
+    ///
+    /// If the platform cannot report available parallelism, this falls back to
+    /// one shard.
+    pub fn for_available_parallelism() -> Self {
+        Self::new(available_parallelism())
+    }
+
     /// Sets the OS thread-name prefix used for shard executor threads.
     ///
     /// Thread names are formatted as `{prefix}-{shard_index}`.
@@ -106,6 +114,12 @@ impl ShardedExecutor {
     /// Starts `shard_count` async executor shards.
     pub fn start(shard_count: usize) -> Result<Self, ShardError> {
         Self::start_with_config(ShardedExecutorConfig::new(shard_count))
+    }
+
+    /// Starts one async executor shard for each reported unit of host
+    /// parallelism.
+    pub fn start_on_available_parallelism() -> Result<Self, ShardError> {
+        Self::start_with_config(ShardedExecutorConfig::for_available_parallelism())
     }
 
     /// Starts async executor shards using `config`.
@@ -290,6 +304,11 @@ impl ShardedExecutor {
             .as_ref()
             .ok_or(ShardedSpawnError::Stopped(shard_id))
     }
+}
+
+/// Returns the host's reported available parallelism, falling back to one.
+pub fn available_parallelism() -> usize {
+    thread::available_parallelism().map_or(1, usize::from)
 }
 
 /// Cloneable handle for submitting work to a [`ShardedExecutor`].
@@ -603,7 +622,8 @@ impl Drop for ShardedExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        ShardedExecutor, ShardedExecutorConfig, ShardedSpawnError, current_executor_shard,
+        ShardedExecutor, ShardedExecutorConfig, ShardedSpawnError, available_parallelism,
+        current_executor_shard,
     };
     use crate::ShardId;
     use crate::executor::block_on;
@@ -626,6 +646,25 @@ mod tests {
 
         assert_eq!(config.shard_count(), 3);
         assert_eq!(config.thread_name_prefix(), "worker");
+    }
+
+    #[test]
+    fn available_parallelism_config_uses_reported_parallelism() {
+        let reported = thread::available_parallelism().map_or(1, usize::from);
+        let config = ShardedExecutorConfig::for_available_parallelism();
+
+        assert_eq!(available_parallelism(), reported);
+        assert_eq!(config.shard_count(), reported);
+        assert!(config.shard_count() >= 1);
+    }
+
+    #[test]
+    fn start_on_available_parallelism_starts_reported_shard_count() {
+        let runtime = ShardedExecutor::start_on_available_parallelism().unwrap();
+
+        assert_eq!(runtime.shard_count(), available_parallelism());
+        assert!(runtime.shard_count() >= 1);
+        runtime.stop().unwrap();
     }
 
     #[test]
