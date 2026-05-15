@@ -68,8 +68,9 @@ pub use shard_local::{
     StoppableShardLocalWorkers,
 };
 pub use sharded_executor::{
-    ShardedExecutor, ShardedExecutorConfig, ShardedExecutorObserver, ShardedExecutorShardSnapshot,
-    ShardedExecutorSnapshot, ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError,
-    ShardedOperationError, ShardedSpawnError, ShardedSubmitter, available_parallelism,
-    current_executor_shard, join_all_shards,
+    CpuId, CpuPlacement, CpuPlacementStatus, ShardedExecutor, ShardedExecutorConfig,
+    ShardedExecutorObserver, ShardedExecutorShardSnapshot, ShardedExecutorSnapshot,
+    ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
+    ShardedSpawnError, ShardedSubmitter, available_parallelism, current_executor_shard,
+    join_all_shards,
 };

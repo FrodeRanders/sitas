@@ -119,27 +119,32 @@ direction:
 - `ShardedExecutor::start_on_available_parallelism` starts one shard for each
   unit reported by `std::thread::available_parallelism`
 - `ShardedExecutor::start_with_config` accepts a `ShardedExecutorConfig`,
-  currently covering shard count and thread-name prefix
+  currently covering shard count, thread-name prefix, and CPU placement policy
 - shard executor threads are named `sitas-shard-N`, matching their `ShardId`
   and giving OS/debugging tools a stable per-shard label
+- `CpuPlacement::Sequential` maps shard threads across the CPUs available to
+  the process; Linux applies hard affinity with `sched_setaffinity`, while
+  non-Linux platforms report the requested placement as unsupported
 - `spawn_on` places a future on an explicit `ShardId`
 - `spawn_named_on` places a future with a human-readable name for snapshots
 - `spawn_with_handle_on` places a future and returns an awaitable join handle
 - `current_executor_shard` lets code running on a shard thread observe its
   current shard identity
 - `snapshot` returns owned per-shard executor snapshots with ready queue depth,
-  task count, timer count, I/O interest counts, shard thread names, and named
-  task states
+  task count, timer count, I/O interest counts, shard thread names, CPU
+  placement status, and named task states
 - `observer` returns a weak monitoring handle that can snapshot the runtime
   without keeping shard threads alive
 - `submitter` returns a cloneable cross-shard submission handle so shard-local
   tasks can submit work to another shard and await the result
 - stopping the runtime drops the owned spawners and joins the executor threads
 
-This is not CPU pinning yet, and it does not implement load balancing or
-scheduling classes. It establishes the first shared-nothing async shape: work is
-owned by a shard thread and remains on that shard unless callers explicitly
-submit different work to a different shard.
+This is not load balancing or scheduling classes. It establishes the first
+shared-nothing async shape: work is owned by a shard thread and remains on that
+shard unless callers explicitly submit different work to a different shard. CPU
+placement is now an explicit runtime request and an observable startup result,
+so Linux can hard-pin shard threads while macOS keeps honest unsupported
+semantics.
 
 `ShardedSubmitter` is the first explicit cross-shard async mechanism. A task on
 one shard can call `submit_with_handle_to` for another `ShardId`, then await the
