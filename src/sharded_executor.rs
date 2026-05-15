@@ -336,6 +336,21 @@ impl ShardedExecutor {
         self.spawn_with_handle_on_all(make_future).map(|_| ())
     }
 
+    /// Spawns one named task onto each executor shard.
+    pub fn spawn_named_on_all<MakeName, MakeFuture, Fut>(
+        &self,
+        make_name: MakeName,
+        make_future: MakeFuture,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_handle_named_on_all(make_name, make_future)
+            .map(|_| ())
+    }
+
     /// Spawns one task onto each executor shard and returns shard-tagged join
     /// handles.
     pub fn spawn_with_handle_on_all<MakeFuture, Fut>(
@@ -674,6 +689,21 @@ impl ShardedSubmitter {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.submit_with_handle_to_all(make_future).map(|_| ())
+    }
+
+    /// Submits one named task to each shard.
+    pub fn submit_named_to_all<MakeName, MakeFuture, Fut>(
+        &self,
+        make_name: MakeName,
+        make_future: MakeFuture,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.submit_with_handle_named_to_all(make_name, make_future)
+            .map(|_| ())
     }
 
     /// Submits one task to each shard and returns shard-tagged join handles.
@@ -1308,6 +1338,28 @@ mod tests {
     }
 
     #[test]
+    fn runtime_can_spawn_named_on_all_shards_without_join_handles() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+
+        runtime
+            .spawn_named_on_all(
+                |shard_id| format!("runtime-fire-and-forget-{}", shard_id.0),
+                |_shard_id| async {
+                    sleep(Duration::from_millis(100)).await;
+                },
+            )
+            .unwrap();
+
+        let expected_0 = String::from("runtime-fire-and-forget-0");
+        let expected_1 = String::from("runtime-fire-and-forget-1");
+        let task_names = wait_for_task_names(&runtime, [&expected_0, &expected_1]);
+        assert!(task_names.contains(&expected_0));
+        assert!(task_names.contains(&expected_1));
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn runtime_can_map_reduce_across_shards() {
         let runtime = ShardedExecutor::start(4).unwrap();
 
@@ -1341,33 +1393,7 @@ mod tests {
 
         let expected_0 = String::from("runtime-map-0");
         let expected_1 = String::from("runtime-map-1");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let task_names = loop {
-            let snapshot = runtime.snapshot();
-            let task_names = snapshot
-                .shards
-                .iter()
-                .flat_map(|shard| {
-                    shard
-                        .executor
-                        .as_ref()
-                        .into_iter()
-                        .flat_map(|executor| executor.tasks.iter())
-                })
-                .filter_map(|task| task.name.clone())
-                .collect::<Vec<_>>();
-
-            if task_names.contains(&expected_0) && task_names.contains(&expected_1) {
-                break task_names;
-            }
-
-            assert!(
-                Instant::now() < deadline,
-                "runtime map tasks were not observable: {task_names:?}"
-            );
-            thread::sleep(Duration::from_millis(1));
-        };
-
+        let task_names = wait_for_task_names(&runtime, [&expected_0, &expected_1]);
         assert!(task_names.contains(&expected_0));
         assert!(task_names.contains(&expected_1));
 
@@ -1575,6 +1601,30 @@ mod tests {
     }
 
     #[test]
+    fn submitter_can_submit_named_to_all_shards_without_join_handles() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+
+        submitter
+            .submit_named_to_all(
+                |shard_id| format!("submitter-fire-and-forget-{}", shard_id.0),
+                |_shard_id| async {
+                    sleep(Duration::from_millis(100)).await;
+                },
+            )
+            .unwrap();
+
+        let expected_0 = String::from("submitter-fire-and-forget-0");
+        let expected_1 = String::from("submitter-fire-and-forget-1");
+        let task_names = wait_for_task_names(&runtime, [&expected_0, &expected_1]);
+        assert!(task_names.contains(&expected_0));
+        assert!(task_names.contains(&expected_1));
+
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn submitter_can_map_reduce_across_shards() {
         let runtime = ShardedExecutor::start(4).unwrap();
         let submitter = runtime.submitter();
@@ -1600,5 +1650,38 @@ mod tests {
 
         drop(submitter);
         runtime.stop().unwrap();
+    }
+
+    fn wait_for_task_names<const N: usize>(
+        runtime: &ShardedExecutor,
+        expected: [&String; N],
+    ) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            let snapshot = runtime.snapshot();
+            let task_names = snapshot
+                .shards
+                .iter()
+                .flat_map(|shard| {
+                    shard
+                        .executor
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|executor| executor.tasks.iter())
+                })
+                .filter_map(|task| task.name.clone())
+                .collect::<Vec<_>>();
+
+            if expected.iter().all(|name| task_names.contains(*name)) {
+                return task_names;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "tasks were not observable: expected {expected:?}, observed {task_names:?}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
