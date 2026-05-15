@@ -1,5 +1,6 @@
 use sitas::{ShardId, ShardedExecutor, current_executor_shard};
 use std::sync::mpsc;
+use std::thread;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = ShardedExecutor::start(4)?;
@@ -9,7 +10,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sender = sender.clone();
         runtime.spawn_on(ShardId(shard_idx), async move {
             sender
-                .send(current_executor_shard().expect("task is running on a shard"))
+                .send((
+                    current_executor_shard().expect("task is running on a shard"),
+                    thread::current().name().unwrap_or("unnamed").to_owned(),
+                ))
                 .expect("receiver is alive");
         })?;
     }
@@ -17,10 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(sender);
 
     let mut shards = receiver.into_iter().collect::<Vec<_>>();
-    shards.sort_by_key(|shard_id| shard_id.0);
+    shards.sort_by_key(|(shard_id, _)| shard_id.0);
 
-    for shard_id in shards {
-        println!("task ran on shard {}", shard_id.0);
+    for (shard_id, thread_name) in shards {
+        println!("task ran on shard {} ({thread_name})", shard_id.0);
     }
 
     runtime.stop()?;

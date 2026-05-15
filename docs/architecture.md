@@ -116,13 +116,16 @@ descriptor registration, kernel timers, or deeper backends such as `kqueue`.
 direction:
 
 - `ShardedExecutor::start` starts one executor/reactor on each shard thread
+- shard executor threads are named `sitas-shard-N`, matching their `ShardId`
+  and giving OS/debugging tools a stable per-shard label
 - `spawn_on` places a future on an explicit `ShardId`
 - `spawn_named_on` places a future with a human-readable name for snapshots
 - `spawn_with_handle_on` places a future and returns an awaitable join handle
 - `current_executor_shard` lets code running on a shard thread observe its
   current shard identity
 - `snapshot` returns owned per-shard executor snapshots with ready queue depth,
-  task count, timer count, I/O interest counts, and named task states
+  task count, timer count, I/O interest counts, shard thread names, and named
+  task states
 - `observer` returns a weak monitoring handle that can snapshot the runtime
   without keeping shard threads alive
 - `submitter` returns a cloneable cross-shard submission handle so shard-local

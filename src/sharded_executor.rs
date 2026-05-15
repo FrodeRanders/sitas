@@ -50,6 +50,7 @@ pub struct ShardedExecutor {
 #[derive(Debug)]
 struct AsyncShard {
     shard_id: ShardId,
+    thread_name: String,
     spawner: Option<Spawner>,
 }
 
@@ -65,15 +66,19 @@ impl ShardedExecutor {
 
         for shard_idx in 0..shard_count {
             let shard_id = ShardId(shard_idx);
+            let thread_name = format!("sitas-shard-{shard_idx}");
             let (executor, spawner) = executor_and_spawner();
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
 
-            let join = thread::spawn(move || {
-                CURRENT_EXECUTOR_SHARD.with(|current| current.set(Some(shard_id)));
-                let _ = started_sender.send(());
-                executor.run();
-                CURRENT_EXECUTOR_SHARD.with(|current| current.set(None));
-            });
+            let join = thread::Builder::new()
+                .name(thread_name.clone())
+                .spawn(move || {
+                    CURRENT_EXECUTOR_SHARD.with(|current| current.set(Some(shard_id)));
+                    let _ = started_sender.send(());
+                    executor.run();
+                    CURRENT_EXECUTOR_SHARD.with(|current| current.set(None));
+                })
+                .map_err(|_| ShardError::ThreadJoinFailed)?;
 
             started_receiver
                 .recv()
@@ -81,6 +86,7 @@ impl ShardedExecutor {
 
             shards.push(AsyncShard {
                 shard_id,
+                thread_name,
                 spawner: Some(spawner),
             });
             joins.push(join);
@@ -180,6 +186,7 @@ impl ShardedExecutor {
                 .iter()
                 .map(|shard| ShardedExecutorShardSnapshot {
                     shard_id: shard.shard_id,
+                    thread_name: shard.thread_name.clone(),
                     executor: shard.spawner.as_ref().map(Spawner::snapshot),
                 })
                 .collect(),
@@ -198,6 +205,7 @@ impl ShardedExecutor {
                 .iter()
                 .map(|shard| ShardedExecutorShardObserver {
                     shard_id: shard.shard_id,
+                    thread_name: shard.thread_name.clone(),
                     executor: shard.spawner.as_ref().map(Spawner::observer),
                 })
                 .collect(),
@@ -470,6 +478,7 @@ pub struct ShardedExecutorObserver {
 #[derive(Debug, Clone)]
 struct ShardedExecutorShardObserver {
     shard_id: ShardId,
+    thread_name: String,
     executor: Option<ExecutorObserver>,
 }
 
@@ -487,6 +496,7 @@ impl ShardedExecutorObserver {
 
                 ShardedExecutorShardSnapshot {
                     shard_id: shard.shard_id,
+                    thread_name: shard.thread_name.clone(),
                     executor,
                 }
             })
@@ -518,6 +528,8 @@ pub struct ShardedExecutorSnapshot {
 pub struct ShardedExecutorShardSnapshot {
     /// The shard this snapshot describes.
     pub shard_id: ShardId,
+    /// OS thread name assigned to this shard executor.
+    pub thread_name: String,
     /// Executor snapshot, or `None` if the shard has already stopped.
     pub executor: Option<ExecutorSnapshot>,
 }
@@ -544,6 +556,7 @@ mod tests {
     use crate::executor::block_on;
     use crate::executor::{TaskStatus, TaskWait, sleep};
     use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
 
     #[test]
@@ -563,7 +576,12 @@ mod tests {
             let sender = sender.clone();
             runtime
                 .spawn_on(ShardId(shard_idx), async move {
-                    sender.send(current_executor_shard()).unwrap();
+                    sender
+                        .send((
+                            current_executor_shard(),
+                            thread::current().name().map(str::to_owned),
+                        ))
+                        .unwrap();
                 })
                 .unwrap();
         }
@@ -571,11 +589,15 @@ mod tests {
         drop(sender);
 
         let mut seen = receiver.into_iter().collect::<Vec<_>>();
-        seen.sort_by_key(|shard| shard.map(|id| id.0));
+        seen.sort_by_key(|(shard, _)| shard.map(|id| id.0));
 
         assert_eq!(
             seen,
-            vec![Some(ShardId(0)), Some(ShardId(1)), Some(ShardId(2))]
+            vec![
+                (Some(ShardId(0)), Some(String::from("sitas-shard-0"))),
+                (Some(ShardId(1)), Some(String::from("sitas-shard-1"))),
+                (Some(ShardId(2)), Some(String::from("sitas-shard-2")))
+            ]
         );
         runtime.stop().unwrap();
     }
@@ -646,6 +668,7 @@ mod tests {
 
         assert_eq!(snapshot.shard_count, 2);
         assert!(snapshot.running);
+        assert_eq!(shard.thread_name, "sitas-shard-1");
         assert_eq!(task.status, TaskStatus::Waiting);
         assert!(matches!(task.waiting_for, Some(TaskWait::Timer { .. })));
         assert!(task.poll_count >= 1);
@@ -662,12 +685,14 @@ mod tests {
 
         let snapshot = observer.snapshot();
         assert!(snapshot.running);
+        assert_eq!(snapshot.shards[0].thread_name, "sitas-shard-0");
         assert!(snapshot.shards[0].executor.is_some());
 
         runtime.stop().unwrap();
 
         let snapshot = observer.snapshot();
         assert!(!snapshot.running);
+        assert_eq!(snapshot.shards[0].thread_name, "sitas-shard-0");
         assert!(snapshot.shards[0].executor.is_none());
     }
 
