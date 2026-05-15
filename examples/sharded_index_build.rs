@@ -3,7 +3,7 @@ use sitas::{
     current_executor_shard, executor::block_on,
 };
 use std::cmp::Ordering;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,7 @@ const INDEX_ENTRY_SIZE: usize = 16;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = DemoPaths::new();
+    fs::create_dir_all(&paths.run_dir)?;
     create_data_file(&paths.data, RECORD_COUNT)?;
     File::create(&paths.index)?;
 
@@ -25,17 +26,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("data file: {}", paths.data.display());
     println!("index file: {}", paths.index.display());
+    println!("run files: {}", paths.run_dir.display());
     println!("available CPUs: {:?}", available_cpu_ids());
     println!("records: {RECORD_COUNT}, shards: {shard_count}");
 
     for shard_idx in 0..shard_count {
         let partition = Partition::for_shard(shard_idx, shard_count, RECORD_COUNT);
         let data_path = paths.data.clone();
+        let run_path = paths.partition_run_path(shard_idx);
         let progress = Arc::clone(&progress);
         let handle = runtime.spawn_with_handle_named_on(
             ShardId(shard_idx),
             format!("index-partition-{shard_idx}"),
-            async move { build_sorted_run(data_path, partition, progress) },
+            async move { build_sorted_run(data_path, run_path, partition, progress) },
         )?;
         handles.push(handle);
     }
@@ -51,23 +54,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for run in &runs {
         println!(
-            "shard {} scanned {} records, sorted {} entries, observed {}",
+            "shard {} scanned {} records, sorted {} entries, observed {}, run {}",
             run.shard_id.0,
             run.records_scanned,
             run.entries.len(),
-            run.cpu_placement
+            run.cpu_placement,
+            run.path.display()
         );
     }
 
     runs.sort_by_key(|run| run.shard_id.0);
-    let final_run = merge_runs_on_shards(&runtime, &progress, runs)?;
+    let final_run = merge_runs_on_shards(&runtime, &progress, &paths.run_dir, runs)?;
     write_index_file(&paths.index, &final_run.entries)?;
     verify_index_file(&paths.data, &paths.index, RECORD_COUNT)?;
 
     println!(
-        "wrote {} sorted index entries ({} bytes)",
+        "wrote {} sorted index entries ({} bytes) from {}",
         final_run.entries.len(),
-        final_run.entries.len() * INDEX_ENTRY_SIZE
+        final_run.entries.len() * INDEX_ENTRY_SIZE,
+        final_run.path.display()
     );
 
     runtime.stop()?;
@@ -76,6 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn build_sorted_run(
     data_path: PathBuf,
+    run_path: PathBuf,
     partition: Partition,
     progress: Arc<Mutex<Vec<ShardProgress>>>,
 ) -> io::Result<ShardRun> {
@@ -103,12 +109,14 @@ fn build_sorted_run(
 
     set_progress(&progress, shard_id, Phase::Sorting, entries.len());
     entries.sort_unstable();
+    write_index_file(&run_path, &entries)?;
     set_progress(&progress, shard_id, Phase::Sorted, entries.len());
 
     Ok(ShardRun {
         shard_id,
         cpu_placement,
         records_scanned: entries.len(),
+        path: run_path,
         entries,
     })
 }
@@ -187,6 +195,7 @@ fn verify_index_file(
 fn merge_runs_on_shards(
     runtime: &ShardedExecutor,
     progress: &Arc<Mutex<Vec<ShardProgress>>>,
+    run_dir: &Path,
     mut runs: Vec<ShardRun>,
 ) -> Result<ShardRun, Box<dyn std::error::Error>> {
     let mut round = 0usize;
@@ -203,6 +212,10 @@ fn merge_runs_on_shards(
             };
 
             let target_shard = left.shard_id;
+            let output_path = run_dir.join(format!(
+                "merge-r{round}-s{}-s{}.run",
+                left.shard_id.0, right.shard_id.0
+            ));
             let progress = Arc::clone(progress);
             let handle = runtime.spawn_with_handle_named_on(
                 target_shard,
@@ -210,7 +223,7 @@ fn merge_runs_on_shards(
                     "index-merge-round-{round}-{}-{}",
                     left.shard_id.0, right.shard_id.0
                 ),
-                async move { merge_pair(left, right, progress) },
+                async move { merge_pair(left, right, output_path, progress) },
             )?;
             handles.push(handle);
         }
@@ -233,6 +246,7 @@ fn merge_runs_on_shards(
 fn merge_pair(
     left: ShardRun,
     right: ShardRun,
+    output_path: PathBuf,
     progress: Arc<Mutex<Vec<ShardProgress>>>,
 ) -> io::Result<ShardRun> {
     let shard_id = current_executor_shard().expect("merge task runs on a shard");
@@ -243,6 +257,7 @@ fn merge_pair(
     set_progress(&progress, shard_id, Phase::Merging, total_entries);
 
     let entries = merge_entries(left.entries, right.entries);
+    write_index_file(&output_path, &entries)?;
 
     set_progress(&progress, shard_id, Phase::Merged, entries.len());
 
@@ -250,6 +265,7 @@ fn merge_pair(
         shard_id,
         cpu_placement,
         records_scanned: left.records_scanned + right.records_scanned,
+        path: output_path,
         entries,
     })
 }
@@ -376,6 +392,7 @@ fn record_offset(record_idx: usize) -> u64 {
 struct DemoPaths {
     data: PathBuf,
     index: PathBuf,
+    run_dir: PathBuf,
 }
 
 impl DemoPaths {
@@ -384,7 +401,12 @@ impl DemoPaths {
         Self {
             data: base.with_extension("data"),
             index: base.with_extension("index"),
+            run_dir: base.with_extension("runs"),
         }
+    }
+
+    fn partition_run_path(&self, shard_idx: usize) -> PathBuf {
+        self.run_dir.join(format!("partition-s{shard_idx}.run"))
     }
 }
 
@@ -412,6 +434,7 @@ struct ShardRun {
     shard_id: ShardId,
     cpu_placement: sitas::CpuPlacementStatus,
     records_scanned: usize,
+    path: PathBuf,
     entries: Vec<IndexEntry>,
 }
 
