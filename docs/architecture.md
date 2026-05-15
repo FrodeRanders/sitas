@@ -164,6 +164,7 @@ Current responsibilities:
 - `spawn_named_on` gives observable task names;
 - `spawn_with_handle_on` returns awaitable join handles;
 - `current_executor_shard` exposes the current shard identity from code running on a shard;
+- `current_executor_cpu_placement` exposes that shard thread's observed CPU placement status from code running on a shard;
 - `available_cpu_ids` reports the CPU ids used by sequential placement;
 - `snapshot` returns owned per-shard executor snapshots;
 - `observer` creates a weak monitoring handle;

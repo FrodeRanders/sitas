@@ -28,12 +28,21 @@ pub use join::{
 
 thread_local! {
     static CURRENT_EXECUTOR_SHARD: std::cell::Cell<Option<ShardId>> = const { std::cell::Cell::new(None) };
+    static CURRENT_EXECUTOR_CPU_PLACEMENT: std::cell::RefCell<Option<CpuPlacementStatus>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Returns the shard currently polling this task, if the caller is running on a
 /// [`ShardedExecutor`] shard thread.
 pub fn current_executor_shard() -> Option<ShardId> {
     CURRENT_EXECUTOR_SHARD.with(std::cell::Cell::get)
+}
+
+/// Returns the CPU placement status observed when the current
+/// [`ShardedExecutor`] shard thread started.
+///
+/// This returns `None` outside sharded executor threads.
+pub fn current_executor_cpu_placement() -> Option<CpuPlacementStatus> {
+    CURRENT_EXECUTOR_CPU_PLACEMENT.with(|placement| placement.borrow().clone())
 }
 
 /// Configuration for starting a [`ShardedExecutor`].
@@ -239,8 +248,11 @@ impl ShardedExecutor {
                 .spawn(move || {
                     let cpu_placement = affinity::apply_to_current_thread(requested_cpu);
                     CURRENT_EXECUTOR_SHARD.with(|current| current.set(Some(shard_id)));
+                    CURRENT_EXECUTOR_CPU_PLACEMENT
+                        .with(|current| current.replace(Some(cpu_placement.clone())));
                     let _ = started_sender.send(cpu_placement);
                     executor.run();
+                    CURRENT_EXECUTOR_CPU_PLACEMENT.with(|current| current.replace(None));
                     CURRENT_EXECUTOR_SHARD.with(|current| current.set(None));
                 }) {
                 Ok(join) => join,
@@ -758,7 +770,8 @@ impl Drop for ShardedExecutor {
 mod tests {
     use super::{
         CpuId, CpuPlacement, CpuPlacementStatus, ShardedExecutor, ShardedExecutorConfig,
-        ShardedSpawnError, available_cpu_ids, available_parallelism, current_executor_shard,
+        ShardedSpawnError, available_cpu_ids, available_parallelism,
+        current_executor_cpu_placement, current_executor_shard,
     };
     use crate::ShardId;
     use crate::error::ShardError;
@@ -891,6 +904,49 @@ mod tests {
         }
 
         runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn current_executor_cpu_placement_reports_shard_thread_status() {
+        assert_eq!(current_executor_cpu_placement(), None);
+
+        let runtime = ShardedExecutor::start_with_config(
+            ShardedExecutorConfig::new(2).with_cpu_placement(CpuPlacement::Sequential),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::sync_channel(2);
+
+        for shard_idx in 0..runtime.shard_count() {
+            let sender = sender.clone();
+            runtime
+                .spawn_on(ShardId(shard_idx), async move {
+                    sender
+                        .send((
+                            ShardId(shard_idx),
+                            current_executor_shard(),
+                            current_executor_cpu_placement(),
+                        ))
+                        .unwrap();
+                })
+                .unwrap();
+        }
+
+        drop(sender);
+
+        let snapshot = runtime.snapshot();
+        let mut observed = receiver.into_iter().collect::<Vec<_>>();
+        observed.sort_by_key(|(shard_id, _, _)| shard_id.0);
+
+        for (shard_id, current_shard, cpu_placement) in observed {
+            assert_eq!(current_shard, Some(shard_id));
+            assert_eq!(
+                cpu_placement,
+                Some(snapshot.shards[shard_id.0].cpu_placement.clone())
+            );
+        }
+
+        runtime.stop().unwrap();
+        assert_eq!(current_executor_cpu_placement(), None);
     }
 
     #[cfg(not(target_os = "linux"))]
