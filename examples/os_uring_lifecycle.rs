@@ -1,0 +1,91 @@
+#[cfg(target_os = "linux")]
+fn main() -> std::io::Result<()> {
+    use sitas::os::{
+        IoUringDispatcher, IoUringOperationFuture, IoUringOperationKind, available_io_uring,
+        report_io_uring_unavailable,
+    };
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::time::Duration;
+
+    let Some(ring) = available_io_uring(8)? else {
+        report_io_uring_unavailable();
+        return Ok(());
+    };
+
+    let dispatcher = IoUringDispatcher::new(ring).into_shared();
+    let waker: std::task::Waker = Arc::new(NoopWake).into();
+    let mut context = Context::from_waker(&waker);
+
+    let mut normal = IoUringOperationFuture::queue_nop(Rc::clone(&dispatcher))?;
+    let normal_operation = normal.operation();
+    assert!(Pin::new(&mut normal).poll(&mut context).is_pending());
+    print_snapshot("normal pending", &dispatcher.borrow().snapshot());
+
+    assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(1)?, 1);
+    let ready = dispatcher.borrow().snapshot();
+    print_snapshot("normal dispatched", &ready);
+    assert_eq!(ready.completed_operations, 1);
+    assert_eq!(ready.total_woken_operations, 1);
+    assert_eq!(ready.total_buffered_operation_kinds.nops, 1);
+
+    let completion = match Pin::new(&mut normal).poll(&mut context) {
+        std::task::Poll::Ready(completion) => completion,
+        std::task::Poll::Pending => panic!("normal completion should be ready after dispatch"),
+    };
+    assert_eq!(completion.operation, normal_operation);
+    assert_eq!(completion.kind, IoUringOperationKind::Nop);
+    print_snapshot("normal consumed", &dispatcher.borrow().snapshot());
+
+    let mut abandoned =
+        IoUringOperationFuture::queue_timeout(Rc::clone(&dispatcher), Duration::from_secs(30))?;
+    assert!(Pin::new(&mut abandoned).poll(&mut context).is_pending());
+    drop(abandoned);
+    let dropped = dispatcher.borrow().snapshot();
+    print_snapshot("abandoned pending", &dropped);
+    assert_eq!(dropped.abandoned_operations, 2);
+    assert_eq!(dropped.abandoned_operation_kinds.timeouts, 1);
+    assert_eq!(dropped.abandoned_operation_kinds.cancellations, 1);
+
+    dispatcher.borrow_mut().drain_until_idle(8)?;
+    let drained = dispatcher.borrow().snapshot();
+    print_snapshot("abandoned drained", &drained);
+    assert_eq!(drained.abandoned_operations, 0);
+    assert_eq!(drained.total_discarded_operation_kinds.timeouts, 1);
+    assert_eq!(drained.total_discarded_operation_kinds.cancellations, 1);
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn print_snapshot(label: &str, snapshot: &sitas::os::IoUringDispatcherSnapshot) {
+    println!(
+        "{label}: pending={} tracked={} wakers={} completed={} abandoned={} deferred={} total_dispatched={} total_buffered={} total_woken={} total_discarded={}",
+        snapshot.ring.pending_submissions,
+        snapshot.ring.tracked_operations,
+        snapshot.registered_wakers,
+        snapshot.completed_operations,
+        snapshot.abandoned_operations,
+        snapshot.deferred_buffers,
+        snapshot.total_dispatched_operations,
+        snapshot.total_buffered_operations,
+        snapshot.total_woken_operations,
+        snapshot.total_discarded_operations
+    );
+}
+
+#[cfg(target_os = "linux")]
+struct NoopWake;
+
+#[cfg(target_os = "linux")]
+impl std::task::Wake for NoopWake {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    println!("io_uring is Linux-only");
+}

@@ -271,6 +271,8 @@ The dispatcher keeps abandoned owned read/write buffers alive in
 `deferred_buffers` until the matching kernel completion is dispatched. This is
 the safety boundary for owned-buffer futures: dropping the future does not drop
 the allocation while the kernel may still read from or write to it.
+`examples/os_uring_lifecycle.rs` prints the normal and abandoned paths as live
+snapshots when run on a Linux host with `io_uring` enabled.
 
 The snapshot fields map to these states:
 
