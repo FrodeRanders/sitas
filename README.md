@@ -211,6 +211,12 @@ Run the shard map-reduce example:
 cargo run --example sharded_map_reduce
 ```
 
+Run the sharded fixed-record index build example:
+
+```sh
+cargo run --example sharded_index_build
+```
+
 Run the shard-local state example:
 
 ```sh

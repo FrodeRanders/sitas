@@ -175,6 +175,8 @@ CPU placement is an explicit runtime request. Linux applies hard affinity with `
 
 This layer is not yet load balancing or scheduling classes. It establishes the shared-nothing async shape: work is owned by a shard thread and moves only through explicit submission.
 
+The `sharded_index_build` example demonstrates this shape on a fixed-record file: each shard scans and sorts one data-file partition into a local index run, then the coordinator merges those runs into one sorted offset index.
+
 ### `ShardedSubmitter`
 
 `ShardedSubmitter` is the first explicit cross-shard async mechanism.
