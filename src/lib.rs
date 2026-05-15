@@ -73,4 +73,5 @@ pub use sharded_executor::{
     ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
     ShardedSpawnError, ShardedSubmitter, available_cpu_ids, available_parallelism,
     current_executor_cpu_placement, current_executor_shard, join_all_shards,
+    join_all_shards_timeout,
 };

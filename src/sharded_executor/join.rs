@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
@@ -237,4 +238,41 @@ pub async fn join_all_shards<T>(
     }
 
     Ok(outputs)
+}
+
+/// Awaits shard-tagged join handles in input order, aborting still-owned
+/// handles if a join fails or the timeout elapses.
+pub async fn join_all_shards_timeout<T>(
+    handles: Vec<ShardedJoinHandle<T>>,
+    duration: Duration,
+) -> Result<Vec<(ShardId, T)>, ShardedJoinTimeoutError> {
+    let deadline = std::time::Instant::now() + duration;
+    let mut handles = VecDeque::from(handles);
+    let mut outputs = Vec::with_capacity(handles.len());
+
+    while let Some(handle) = handles.pop_front() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            let shard_id = handle.shard_id();
+            handle.abort();
+            abort_all(handles);
+            return Err(ShardedJoinTimeoutError::TimedOut { shard_id });
+        }
+
+        match handle.join_timeout(remaining).await {
+            Ok(output) => outputs.push(output),
+            Err(error) => {
+                abort_all(handles);
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(outputs)
+}
+
+fn abort_all<T>(handles: VecDeque<ShardedJoinHandle<T>>) {
+    for handle in handles {
+        handle.abort();
+    }
 }

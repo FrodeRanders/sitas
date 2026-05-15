@@ -9,13 +9,14 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::executor::{StopSource, StopToken, stop_pair};
 use crate::shard::ShardId;
 use crate::sharded_executor::{
     ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
     ShardedSpawnError, ShardedSubmitter, current_executor_shard, join_all_shards,
+    join_all_shards_timeout,
 };
 
 /// One value per shard, accessed only on the owning shard executor.
@@ -367,39 +368,12 @@ impl<T> ShardLocalWorkers<T> {
     /// Waits up to `duration` for all workers to finish, aborting still-owned
     /// workers if the deadline elapses.
     pub async fn join_timeout(
-        mut self,
+        self,
         duration: Duration,
     ) -> Result<Vec<(ShardId, T)>, ShardLocalWorkerTimeoutError> {
-        let deadline = Instant::now() + duration;
-        let mut outputs = Vec::with_capacity(self.handles.len());
-
-        while let Some(handle) = self.handles.pop() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let shard_id = handle.shard_id();
-                handle.abort();
-                self.abort_all();
-                return Err(ShardLocalWorkerTimeoutError::TimedOut { shard_id });
-            }
-
-            match handle.join_timeout(remaining).await {
-                Ok(output) => outputs.push(output),
-                Err(error) if error.is_timed_out() => {
-                    self.abort_all();
-                    return Err(ShardLocalWorkerTimeoutError::TimedOut {
-                        shard_id: error.shard_id(),
-                    });
-                }
-                Err(ShardedJoinTimeoutError::Join(error)) => {
-                    self.abort_all();
-                    return Err(ShardLocalWorkerTimeoutError::Join(error));
-                }
-                Err(ShardedJoinTimeoutError::TimedOut { .. }) => unreachable!(),
-            }
-        }
-
-        outputs.reverse();
-        Ok(outputs)
+        join_all_shards_timeout(self.handles, duration)
+            .await
+            .map_err(ShardLocalWorkerTimeoutError::from)
     }
 
     /// Waits for every worker and reduces the shard-tagged outputs into one
@@ -483,6 +457,15 @@ impl ShardLocalWorkerTimeoutError {
     /// Returns true if a worker failed while being joined.
     pub fn is_join_error(&self) -> bool {
         matches!(self, ShardLocalWorkerTimeoutError::Join(_))
+    }
+}
+
+impl From<ShardedJoinTimeoutError> for ShardLocalWorkerTimeoutError {
+    fn from(error: ShardedJoinTimeoutError) -> Self {
+        match error {
+            ShardedJoinTimeoutError::Join(error) => Self::Join(error),
+            ShardedJoinTimeoutError::TimedOut { shard_id } => Self::TimedOut { shard_id },
+        }
     }
 }
 

@@ -193,6 +193,7 @@ Supported higher-level forms:
 - submit to all shards;
 - named submit to all shards;
 - `join_all_shards` returning shard-tagged outputs;
+- `join_all_shards_timeout` for bounded joins that abort still-owned shard work on timeout or join failure;
 - `map_all` and `map_named_all`;
 - `map_reduce_all`.
 

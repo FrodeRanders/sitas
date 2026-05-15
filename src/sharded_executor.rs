@@ -23,7 +23,7 @@ mod join;
 pub use affinity::{CpuId, CpuPlacement, CpuPlacementStatus, available_cpu_ids};
 pub use join::{
     ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
-    ShardedSpawnError, join_all_shards,
+    ShardedSpawnError, join_all_shards, join_all_shards_timeout,
 };
 
 thread_local! {
@@ -960,6 +960,10 @@ mod tests {
     use crate::executor::block_on;
     use crate::executor::{TaskStatus, TaskWait, sleep};
     use std::sync::mpsc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1357,6 +1361,61 @@ mod tests {
                 (ShardId(3), 30)
             ]
         );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn join_all_shards_timeout_collects_outputs_in_input_order() {
+        let runtime = ShardedExecutor::start(3).unwrap();
+        let handles = runtime
+            .spawn_with_handle_on_all(|shard_id| async move {
+                assert_eq!(current_executor_shard(), Some(shard_id));
+                shard_id.0 + 10
+            })
+            .unwrap();
+
+        let outputs = block_on(super::join_all_shards_timeout(
+            handles,
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            outputs,
+            vec![(ShardId(0), 10), (ShardId(1), 11), (ShardId(2), 12)]
+        );
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn join_all_shards_timeout_aborts_remaining_handles() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let second_completed = Arc::new(AtomicBool::new(false));
+        let second_completed_for_task = Arc::clone(&second_completed);
+        let handles = runtime
+            .spawn_with_handle_on_all(move |shard_id| {
+                let second_completed = Arc::clone(&second_completed_for_task);
+                async move {
+                    sleep(Duration::from_millis(100)).await;
+                    if shard_id == ShardId(1) {
+                        second_completed.store(true, Ordering::SeqCst);
+                    }
+                    shard_id.0
+                }
+            })
+            .unwrap();
+
+        let error = block_on(super::join_all_shards_timeout(
+            handles,
+            Duration::from_millis(5),
+        ))
+        .expect_err("slow fan-out should time out");
+
+        assert!(error.is_timed_out());
+        assert_eq!(error.shard_id(), ShardId(0));
+        thread::sleep(Duration::from_millis(150));
+        assert!(!second_completed.load(Ordering::SeqCst));
 
         runtime.stop().unwrap();
     }
