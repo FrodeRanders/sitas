@@ -22,11 +22,18 @@ fn main() -> std::io::Result<()> {
     assert_eq!(dispatcher.borrow_mut().wait_and_dispatch(3)?, 3);
     let ready = dispatcher.borrow().snapshot();
     println!(
-        "buffered completions: total={} nops={}",
-        ready.completed_operations, ready.completed_operation_kinds.nops
+        "buffered completions: total={} nops={} dispatched={} buffered={} woken={}",
+        ready.completed_operations,
+        ready.completed_operation_kinds.nops,
+        ready.total_dispatched_operations,
+        ready.total_buffered_operations,
+        ready.total_woken_operations
     );
     assert_eq!(ready.completed_operations, 3);
     assert_eq!(ready.completed_operation_kinds.nops, 3);
+    assert_eq!(ready.total_dispatched_operations, 3);
+    assert_eq!(ready.total_buffered_operations, 3);
+    assert_eq!(ready.total_woken_operations, 0);
 
     let completions = block_on_io_uring_all(Rc::clone(&dispatcher), futures)?;
 

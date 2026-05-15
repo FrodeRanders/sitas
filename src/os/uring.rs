@@ -895,6 +895,10 @@ pub struct IoUringDispatcher {
     completions: HashMap<IoUringOperationId, IoUringOperationCompletion>,
     abandoned_operations: HashMap<IoUringOperationId, IoUringOperationKind>,
     deferred_buffers: HashMap<IoUringOperationId, Vec<u8>>,
+    total_dispatched_operations: usize,
+    total_buffered_operations: usize,
+    total_woken_operations: usize,
+    total_discarded_operations: usize,
 }
 
 impl IoUringDispatcher {
@@ -906,6 +910,10 @@ impl IoUringDispatcher {
             completions: HashMap::new(),
             abandoned_operations: HashMap::new(),
             deferred_buffers: HashMap::new(),
+            total_dispatched_operations: 0,
+            total_buffered_operations: 0,
+            total_woken_operations: 0,
+            total_discarded_operations: 0,
         }
     }
 
@@ -995,14 +1003,18 @@ impl IoUringDispatcher {
         let mut dispatched = 0;
         while let Some(completion) = self.ring.try_operation_completion() {
             let operation = completion.operation;
+            self.total_dispatched_operations += 1;
             if self.abandoned_operations.remove(&operation).is_some() {
                 self.deferred_buffers.remove(&operation);
+                self.total_discarded_operations += 1;
                 dispatched += 1;
                 continue;
             }
 
             self.completions.insert(operation, completion);
+            self.total_buffered_operations += 1;
             if let Some(waker) = self.waiters.remove(&operation) {
+                self.total_woken_operations += 1;
                 waker.wake();
             }
             dispatched += 1;
@@ -1078,6 +1090,10 @@ impl IoUringDispatcher {
             abandoned_operations: self.abandoned_operations.len(),
             abandoned_operation_kinds,
             deferred_buffers: self.deferred_buffers.len(),
+            total_dispatched_operations: self.total_dispatched_operations,
+            total_buffered_operations: self.total_buffered_operations,
+            total_woken_operations: self.total_woken_operations,
+            total_discarded_operations: self.total_discarded_operations,
         }
     }
 }
@@ -1458,6 +1474,14 @@ pub struct IoUringDispatcherSnapshot {
     pub abandoned_operation_kinds: IoUringOperationKindCounts,
     /// Number of abandoned owned buffers waiting for kernel completion.
     pub deferred_buffers: usize,
+    /// Total tracked completions dispatched since this dispatcher was created.
+    pub total_dispatched_operations: usize,
+    /// Total tracked completions buffered for future consumption.
+    pub total_buffered_operations: usize,
+    /// Total registered wakers woken by dispatched completions.
+    pub total_woken_operations: usize,
+    /// Total abandoned completions discarded by the dispatcher.
+    pub total_discarded_operations: usize,
 }
 
 /// One `io_uring` completion queue entry.
@@ -1926,8 +1950,13 @@ mod tests {
         assert_eq!(completion.operation, operation);
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(completion.result, 0);
-        assert_eq!(dispatcher.snapshot().registered_wakers, 0);
-        assert_eq!(dispatcher.snapshot().completed_operations, 0);
+        let snapshot = dispatcher.snapshot();
+        assert_eq!(snapshot.registered_wakers, 0);
+        assert_eq!(snapshot.completed_operations, 0);
+        assert_eq!(snapshot.total_dispatched_operations, 1);
+        assert_eq!(snapshot.total_buffered_operations, 1);
+        assert_eq!(snapshot.total_woken_operations, 1);
+        assert_eq!(snapshot.total_discarded_operations, 0);
     }
 
     #[test]
@@ -1947,11 +1976,17 @@ mod tests {
         assert_eq!(dispatcher.snapshot().registered_wakers, 0);
         assert_eq!(dispatcher.snapshot().completed_operations, 1);
         assert_eq!(dispatcher.snapshot().completed_operation_kinds.nops, 1);
+        assert_eq!(dispatcher.snapshot().total_dispatched_operations, 1);
+        assert_eq!(dispatcher.snapshot().total_buffered_operations, 1);
+        assert_eq!(dispatcher.snapshot().total_woken_operations, 0);
+        assert_eq!(dispatcher.snapshot().total_discarded_operations, 0);
 
         let completion = dispatcher.take_completion(operation).unwrap();
         assert_eq!(completion.kind, IoUringOperationKind::Nop);
         assert_eq!(dispatcher.snapshot().completed_operations, 0);
         assert_eq!(dispatcher.snapshot().completed_operation_kinds.nops, 0);
+        assert_eq!(dispatcher.snapshot().total_dispatched_operations, 1);
+        assert_eq!(dispatcher.snapshot().total_buffered_operations, 1);
     }
 
     #[test]
@@ -2360,8 +2395,13 @@ mod tests {
             1
         );
         dispatcher.borrow_mut().drain_until_idle(8).unwrap();
-        assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
-        assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
+        let drained = dispatcher.borrow().snapshot();
+        assert_eq!(drained.abandoned_operations, 0);
+        assert_eq!(drained.completed_operations, 0);
+        assert_eq!(drained.total_dispatched_operations, 2);
+        assert_eq!(drained.total_buffered_operations, 0);
+        assert_eq!(drained.total_woken_operations, 0);
+        assert_eq!(drained.total_discarded_operations, 2);
     }
 
     #[test]
