@@ -276,6 +276,9 @@ Executor snapshots expose:
 - task count;
 - timer count;
 - I/O interest counts;
+- Linux `io_uring` dispatcher snapshots when installed, including pending
+  submissions, tracked operations, buffered completions, registered wakers,
+  abandoned buffers, and cumulative operation-kind counters;
 - shard thread names;
 - CPU placement status;
 - named task states.

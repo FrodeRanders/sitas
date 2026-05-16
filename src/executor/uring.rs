@@ -9,7 +9,8 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::os::{
-    IoUringDispatcher, IoUringOperationCompletion, IoUringOperationId, available_io_uring,
+    IoUringDispatcher, IoUringDispatcherSnapshot, IoUringOperationCompletion, IoUringOperationId,
+    available_io_uring,
 };
 
 type SharedDispatcher = crate::os::SharedIoUringDispatcher;
@@ -332,6 +333,15 @@ pub(super) fn wait_and_dispatch() -> io::Result<usize> {
             return Ok(0);
         };
         dispatcher.borrow_mut().wait_and_dispatch(1)
+    })
+}
+
+pub(super) fn snapshot() -> Option<IoUringDispatcherSnapshot> {
+    CURRENT_IO_URING.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .map(|dispatcher| dispatcher.borrow().snapshot())
     })
 }
 

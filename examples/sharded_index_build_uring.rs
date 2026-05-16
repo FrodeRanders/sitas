@@ -12,8 +12,8 @@ use sitas::executor::{read_at_uring, write_all_at_uring};
 #[cfg(target_os = "linux")]
 use sitas::os::{available_io_uring, report_io_uring_unavailable};
 use sitas::{
-    CpuPlacement, ShardId, ShardedExecutor, ShardedExecutorConfig, available_cpu_ids,
-    current_executor_cpu_placement, current_executor_shard, executor::block_on,
+    CpuPlacement, ExecutorSnapshot, ShardId, ShardedExecutor, ShardedExecutorConfig,
+    available_cpu_ids, current_executor_cpu_placement, current_executor_shard, executor::block_on,
 };
 use std::cmp::Ordering;
 use std::env;
@@ -538,17 +538,41 @@ fn print_progress(
             .executor
             .as_ref()
             .map_or(0, |executor| executor.task_count);
+        let io_uring = shard
+            .executor
+            .as_ref()
+            .map_or_else(String::new, io_uring_summary);
         println!(
-            "  shard {} {} phase={} records={} read={}B wrote={}B tasks={}",
+            "  shard {} {} phase={} records={} read={}B wrote={}B tasks={}{}",
             shard.shard_id.0,
             shard.cpu_placement,
             progress.phase.name(),
             progress.records,
             progress.bytes_read,
             progress.bytes_written,
-            task_count
+            task_count,
+            io_uring
         );
     }
+}
+
+fn io_uring_summary(executor: &ExecutorSnapshot) -> String {
+    #[cfg(target_os = "linux")]
+    if let Some(io_uring) = &executor.io_uring {
+        return format!(
+            " uring(submit={} tracked={} buffered={} wakers={} dispatched={} reads={} writes={})",
+            io_uring.ring.pending_submissions,
+            io_uring.ring.tracked_operations,
+            io_uring.completed_operations,
+            io_uring.registered_wakers,
+            io_uring.total_dispatched_operations,
+            io_uring.total_dispatched_operation_kinds.reads,
+            io_uring.total_dispatched_operation_kinds.writes
+        );
+    }
+
+    let _ = executor;
+    String::new()
 }
 
 fn set_progress(

@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 
+#[cfg(target_os = "linux")]
+use crate::os::IoUringDispatcherSnapshot;
 #[cfg(unix)]
 use crate::os::OsWaker;
 
@@ -33,6 +35,8 @@ pub(super) struct SchedulerState {
     pub(super) read_interests: InterestSet,
     #[cfg(unix)]
     pub(super) write_interests: InterestSet,
+    #[cfg(target_os = "linux")]
+    io_uring: Option<IoUringDispatcherSnapshot>,
     accepting: bool,
     spawner_count: usize,
     task_count: usize,
@@ -156,6 +160,8 @@ impl Scheduler {
                 read_interests: InterestSet::new(),
                 #[cfg(unix)]
                 write_interests: InterestSet::new(),
+                #[cfg(target_os = "linux")]
+                io_uring: None,
                 accepting: true,
                 spawner_count: 1,
                 task_count: 0,
@@ -298,6 +304,8 @@ impl Scheduler {
         let read_interest_count = state.read_interests.len();
         #[cfg(unix)]
         let write_interest_count = state.write_interests.len();
+        #[cfg(target_os = "linux")]
+        let io_uring = state.io_uring;
         let tasks = state.tasks.clone();
         drop(state);
 
@@ -318,6 +326,8 @@ impl Scheduler {
             read_interest_count,
             #[cfg(unix)]
             write_interest_count,
+            #[cfg(target_os = "linux")]
+            io_uring,
             ready_poll_budget: READY_POLL_BUDGET,
             total_spawned_tasks,
             total_completed_tasks,
@@ -346,6 +356,12 @@ impl Scheduler {
         if exhausted_budget {
             state.ready_poll_budget_exhaustions += 1;
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn record_io_uring_snapshot(&self, snapshot: Option<IoUringDispatcherSnapshot>) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.io_uring = snapshot;
     }
 
     pub(super) fn allocate_timer_id(&self) -> usize {

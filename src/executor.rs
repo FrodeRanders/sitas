@@ -17,6 +17,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use crate::os::IoUringDispatcherSnapshot;
 #[cfg(unix)]
 use crate::os::OsReactor;
 
@@ -155,6 +157,9 @@ pub struct ExecutorSnapshot {
     /// Number of registered write-readiness interests.
     #[cfg(unix)]
     pub write_interest_count: usize,
+    /// Snapshot of the executor-owned Linux `io_uring` dispatcher, if installed.
+    #[cfg(target_os = "linux")]
+    pub io_uring: Option<IoUringDispatcherSnapshot>,
     /// Maximum number of ready tasks polled before timers and readiness are checked.
     pub ready_poll_budget: usize,
     /// Number of tasks accepted by this executor since startup.
@@ -359,6 +364,7 @@ impl Executor {
     pub fn run(&self) {
         #[cfg(target_os = "linux")]
         let _io_uring_scope = IoUringScope::enter();
+        self.refresh_io_uring_snapshot();
 
         loop {
             self.poll_ready_tasks();
@@ -404,6 +410,7 @@ impl Executor {
     {
         #[cfg(target_os = "linux")]
         let _io_uring_scope = IoUringScope::enter();
+        self.refresh_io_uring_snapshot();
 
         let root = Arc::new(RootWaker::new(Arc::clone(&self.scheduler)));
         let waker = Waker::from(Arc::clone(&root));
@@ -479,6 +486,7 @@ impl Executor {
         #[cfg(target_os = "linux")]
         {
             uring::dispatch_available();
+            self.refresh_io_uring_snapshot();
         }
     }
 
@@ -498,11 +506,17 @@ impl Executor {
 
             if uring::should_wait() {
                 uring::wait_and_dispatch().expect("io_uring wait failed while running executor");
+                self.refresh_io_uring_snapshot();
                 return true;
             }
         }
 
         false
+    }
+
+    fn refresh_io_uring_snapshot(&self) {
+        #[cfg(target_os = "linux")]
+        self.scheduler.record_io_uring_snapshot(uring::snapshot());
     }
 }
 

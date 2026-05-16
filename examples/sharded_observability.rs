@@ -3,7 +3,8 @@
 //! This is the lightweight alternative to a tracing UI for now: owned snapshots
 //! expose queues, waits, polls, and counters without keeping shards alive.
 use sitas::{
-    ShardedExecutor, TaskSnapshot, TaskStatus, TaskWait, current_executor_shard, executor::sleep,
+    ExecutorSnapshot, ShardedExecutor, TaskSnapshot, TaskStatus, TaskWait, current_executor_shard,
+    executor::sleep,
 };
 use std::time::Duration;
 
@@ -44,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 executor.total_completed_tasks,
                 executor.ready_poll_budget_exhaustions
             );
+            print_io_uring(executor);
 
             for task in &executor.tasks {
                 println!(
@@ -60,6 +62,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     runtime.stop()?;
     Ok(())
+}
+
+fn print_io_uring(executor: &ExecutorSnapshot) {
+    #[cfg(target_os = "linux")]
+    if let Some(io_uring) = &executor.io_uring {
+        println!(
+            "      uring: submit={} tracked={} buffered={} wakers={} dispatched={} reads={} writes={}",
+            io_uring.ring.pending_submissions,
+            io_uring.ring.tracked_operations,
+            io_uring.completed_operations,
+            io_uring.registered_wakers,
+            io_uring.total_dispatched_operations,
+            io_uring.total_dispatched_operation_kinds.reads,
+            io_uring.total_dispatched_operation_kinds.writes
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = executor;
 }
 
 fn status_name(status: TaskStatus) -> &'static str {
