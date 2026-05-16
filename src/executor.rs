@@ -57,7 +57,7 @@ pub use unix_io::{
     write_all_async, write_all_timeout_async,
 };
 #[cfg(target_os = "linux")]
-pub use uring::{ReadAtUring, read_at_uring, write_all_at_uring};
+pub use uring::{ReadAtUring, read_at_uring, read_exact_at_uring, write_all_at_uring};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type PanicPayload = Box<dyn std::any::Any + Send + 'static>;

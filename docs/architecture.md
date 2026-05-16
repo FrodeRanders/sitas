@@ -126,8 +126,8 @@ Responsibilities:
 - timer registration, timeout futures, and cancellation cleanup;
 - readiness futures for read/write interests;
 - Unix reactor sleep when no tasks are ready;
-- Linux executor-owned `io_uring` read/write-at futures driven from the
-  executor loop when a shard has no ready tasks;
+- Linux executor-owned `io_uring` read-at, read-exact-at, and write-at helpers
+  driven from the executor loop when a shard has no ready tasks;
 - cumulative executor counters for spawned tasks, completed tasks, task polls,
   and ready-poll budget exhaustion events.
 
@@ -333,10 +333,10 @@ This is readiness-based, not completion-based. It is separate from the experimen
 ## 10. Linux `io_uring` model
 
 The Linux `io_uring` backend is experimental. It now has a narrow executor
-integration for owned-buffer `read_at` and `write_at` style file I/O. This is
-enough for shard tasks to await completion-based file operations without using
-the separate `block_on_io_uring` bridge. It is still not the production I/O
-engine for all sharded executor work.
+integration for owned-buffer `read_at`, `read_exact_at`, and `write_at` style
+file I/O. This is enough for shard tasks to await completion-based file
+operations without using the separate `block_on_io_uring` bridge. It is still
+not the production I/O engine for all sharded executor work.
 
 Each Linux executor run loop installs a thread-local `IoUringDispatcher` when
 the host allows `io_uring_setup`. Executor-backed `io_uring` futures store only

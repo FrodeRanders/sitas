@@ -36,6 +36,30 @@ pub fn read_at_uring(fd: RawFd, offset: u64, buffer: Vec<u8>) -> ReadAtUring {
     }
 }
 
+/// Reads exactly `len` bytes from `fd` at `offset` through the current
+/// executor's Linux `io_uring` backend.
+///
+/// This retries short reads with updated offsets. Reaching EOF before `len`
+/// bytes have been read returns [`io::ErrorKind::UnexpectedEof`].
+pub async fn read_exact_at_uring(fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(len);
+
+    while output.len() < len {
+        let read_offset = offset + output.len() as u64;
+        let remaining = len - output.len();
+        let buffer = read_at_uring(fd, read_offset, vec![0; remaining]).await?;
+        if buffer.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "io_uring read reached EOF before filling the requested buffer",
+            ));
+        }
+        output.extend_from_slice(&buffer);
+    }
+
+    Ok(output)
+}
+
 /// Returns a future that writes `buffer` to `fd` at `offset` through the
 /// current executor's Linux `io_uring` backend.
 ///

@@ -12,7 +12,7 @@ use super::{
     write_all_async, write_all_timeout_async,
 };
 #[cfg(target_os = "linux")]
-use super::{read_at_uring, write_all_at_uring};
+use super::{read_at_uring, read_exact_at_uring, write_all_at_uring};
 #[cfg(target_os = "linux")]
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
@@ -341,7 +341,7 @@ fn io_uring_read_and_write_are_driven_by_executor_loop() -> io::Result<()> {
 
     let (bytes, snapshot) = block_on(async {
         write_all_at_uring(file.as_raw_fd(), 0, b"abcdef".to_vec()).await?;
-        let bytes = read_at_uring(file.as_raw_fd(), 2, vec![0; 3]).await?;
+        let bytes = read_exact_at_uring(file.as_raw_fd(), 2, 3).await?;
         Ok::<_, io::Error>((bytes, super::uring::snapshot()))
     })?;
 
@@ -351,6 +351,37 @@ fn io_uring_read_and_write_are_driven_by_executor_loop() -> io::Result<()> {
     assert_eq!(snapshot.total_dispatched_operation_kinds.writes, 1);
     assert_eq!(snapshot.total_dispatched_operations, 2);
     assert!(snapshot.is_idle());
+    drop(file);
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn io_uring_read_exact_reports_unexpected_eof() -> io::Result<()> {
+    if crate::os::available_io_uring(8)?.is_none() {
+        return Ok(());
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "sitas-executor-uring-eof-{}-{:?}.dat",
+        std::process::id(),
+        thread::current().id()
+    ));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+
+    let error = block_on(async {
+        write_all_at_uring(file.as_raw_fd(), 0, b"abc".to_vec()).await?;
+        read_exact_at_uring(file.as_raw_fd(), 0, 4).await
+    })
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     drop(file);
     fs::remove_file(path)?;
     Ok(())

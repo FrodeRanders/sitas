@@ -14,8 +14,8 @@ completion path.
 \section{\texttt{io\_uring}}
 
 The Linux \texttt{io\_uring} backend is experimental. It currently supports a
-narrow executor integration for owned-buffer \texttt{read\_at} and
-\texttt{write\_at} style file I/O.
+narrow executor integration for owned-buffer \texttt{read\_at},
+\texttt{read\_exact\_at}, and \texttt{write\_at} style file I/O.
 
 Each Linux executor run loop installs a thread-local dispatcher when the host
 allows ring setup. Executor-backed \texttt{io\_uring} futures store operation

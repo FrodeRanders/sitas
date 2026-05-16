@@ -8,7 +8,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 #[cfg(target_os = "linux")]
-use sitas::executor::{read_at_uring, write_all_at_uring};
+use sitas::executor::{read_exact_at_uring, write_all_at_uring};
 #[cfg(target_os = "linux")]
 use sitas::os::{available_io_uring, report_io_uring_unavailable};
 use sitas::{
@@ -222,7 +222,7 @@ async fn read_partition_entries_uring(
     while next_record < partition.end_record {
         let chunk_records = PARTITION_READ_CHUNK_RECORDS.min(partition.end_record - next_record);
         let buffer =
-            uring_read_exact_at(fd, record_offset(next_record), chunk_records * RECORD_SIZE)
+            read_exact_at_uring(fd, record_offset(next_record), chunk_records * RECORD_SIZE)
                 .await?;
 
         for (chunk_idx, record_bytes) in buffer.chunks_exact(RECORD_SIZE).enumerate() {
@@ -260,26 +260,6 @@ async fn write_index_file_uring(path: &Path, entries: &[IndexEntry]) -> io::Resu
     write_all_at_uring(file.as_raw_fd(), 0, buffer).await?;
 
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn uring_read_exact_at(fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(len);
-
-    while output.len() < len {
-        let read_offset = offset + output.len() as u64;
-        let remaining = len - output.len();
-        let buffer = read_at_uring(fd, read_offset, vec![0; remaining]).await?;
-        if buffer.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "io_uring read returned EOF before the requested record was complete",
-            ));
-        }
-        output.extend_from_slice(&buffer);
-    }
-
-    Ok(output)
 }
 
 fn create_data_file(path: &Path, record_count: usize, seed: u64) -> io::Result<()> {
