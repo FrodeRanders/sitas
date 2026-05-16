@@ -3,12 +3,16 @@
 //! This module is the first step outside the pure standard-library runtime.
 //! It uses direct Unix FFI for a small reactor wake primitive and descriptor
 //! readiness waiting. A non-blocking pipe provides the wake source. Linux uses
-//! `epoll(7)` for readiness waits; other Unix targets currently use `poll(2)`.
+//! `epoll(7)`, macOS/iOS uses `kqueue(2)`, and other Unix targets currently
+//! use `poll(2)`.
 
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 use std::os::raw::c_short;
 use std::os::raw::{c_int, c_void};
 use std::os::unix::io::{FromRawFd, RawFd};
@@ -17,6 +21,8 @@ use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 mod epoll;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod kqueue;
 #[cfg(target_os = "linux")]
 mod uring;
 
@@ -70,13 +76,22 @@ pub fn report_io_uring_unavailable() {
     println!("set SITAS_REQUIRE_IO_URING=1 to fail instead of skipping");
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 type Nfds = u32;
 type SockLen = u32;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 const POLLIN: c_short = 0x0001;
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 const POLLOUT: c_short = 0x0004;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
@@ -101,7 +116,10 @@ const EINPROGRESS: c_int = 36;
 #[cfg(not(target_os = "linux"))]
 const EWOULDBLOCK: c_int = 35;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 #[repr(C)]
 struct PollFd {
     fd: c_int,
@@ -159,7 +177,10 @@ struct SockAddrIn {
     sin_zero: [u8; 8],
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(
+    not(target_os = "linux"),
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 impl PollFd {
     fn readable(fd: RawFd) -> Self {
         Self {
@@ -183,7 +204,10 @@ unsafe extern "C" {
     fn connect(fd: c_int, address: *const c_void, length: SockLen) -> c_int;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
     fn pipe(fds: *mut c_int) -> c_int;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(
+        not(target_os = "linux"),
+        not(any(target_os = "macos", target_os = "ios"))
+    ))]
     fn poll(fds: *mut PollFd, nfds: Nfds, timeout: c_int) -> c_int;
     fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
     fn socket(domain: c_int, socket_type: c_int, protocol: c_int) -> c_int;
@@ -209,6 +233,8 @@ pub struct OsReactor {
     write_fd: Arc<OwnedFd>,
     #[cfg(target_os = "linux")]
     epoll: epoll::EpollBackend,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    kqueue: kqueue::KqueueBackend,
 }
 
 impl OsReactor {
@@ -217,12 +243,16 @@ impl OsReactor {
         let (read_fd, write_fd) = create_pipe()?;
         #[cfg(target_os = "linux")]
         let epoll = epoll::EpollBackend::new(read_fd.raw())?;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let kqueue = kqueue::KqueueBackend::new(read_fd.raw())?;
 
         Ok(Self {
             read_fd,
             write_fd: Arc::new(write_fd),
             #[cfg(target_os = "linux")]
             epoll,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            kqueue,
         })
     }
 
@@ -280,7 +310,21 @@ impl OsReactor {
             .wait_io(read_fds, write_fds, timeout, || self.drain_wakes())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn wait_io_backend(
+        &self,
+        read_fds: &[RawFd],
+        write_fds: &[RawFd],
+        timeout: Option<Duration>,
+    ) -> io::Result<OsEvent> {
+        self.kqueue
+            .wait_io(read_fds, write_fds, timeout, || self.drain_wakes())
+    }
+
+    #[cfg(all(
+        not(target_os = "linux"),
+        not(any(target_os = "macos", target_os = "ios"))
+    ))]
     fn wait_io_backend(
         &self,
         read_fds: &[RawFd],
@@ -615,6 +659,13 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     }
 }
 
+#[cfg(any(
+    target_os = "linux",
+    all(
+        not(target_os = "linux"),
+        not(any(target_os = "macos", target_os = "ios"))
+    )
+))]
 fn timeout_to_wait_ms(timeout: Option<Duration>) -> c_int {
     match timeout {
         Some(duration) => {

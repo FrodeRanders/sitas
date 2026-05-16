@@ -92,12 +92,13 @@ Current responsibilities:
 - direct Unix FFI for pipe, read, write, fcntl, close, socket operations, readiness backends, and platform error access;
 - non-blocking pipe wakeups for cross-thread reactor notification;
 - Linux `epoll` readiness waiting;
-- non-Linux Unix `poll` readiness waiting;
+- macOS/iOS `kqueue` readiness waiting;
+- fallback non-Linux Unix `poll` readiness waiting;
 - cloneable `OsWaker`;
 - blocking `OsReactor::wait` that can be woken by the pipe;
 - experimental Linux `io_uring` operations and dispatcher support.
 
-This layer is intentionally smaller than a full production reactor. It establishes the FFI boundary and wake/readiness mechanisms before deeper backends such as `kqueue` or production `io_uring` integration.
+This layer is intentionally smaller than a full production reactor. It establishes the FFI boundary and wake/readiness mechanisms before deeper production `io_uring` integration.
 
 Because the project uses Rust edition 2024, C FFI declarations must use `unsafe extern "C" { ... }`.
 
@@ -322,13 +323,15 @@ The readiness path is intentionally small:
 - file descriptors are set non-blocking where required;
 - operations attempt normal read/write/accept/connect work first;
 - `WouldBlock` registers interest and yields to the executor;
-- the Unix reactor sleeps using `poll` or `epoll` plus a wake pipe;
+- the Unix reactor sleeps using `epoll`, `kqueue`, or fallback `poll` plus a
+  wake pipe;
 - readiness wakes the interested task;
 - the operation retries.
 
 This is readiness-based, not completion-based. It is separate from the experimental `io_uring` path.
 
-`kqueue` support is not implemented yet. Non-Linux Unix currently uses `poll`.
+Linux uses `epoll`. macOS and iOS use `kqueue`. Other non-Linux Unix targets
+currently use `poll`.
 
 ## 10. Linux `io_uring` model
 
@@ -453,7 +456,7 @@ The current architecture does not yet aim to provide:
 - procedural macro service generation;
 - production-grade unified `io_uring`/timer/readiness integration for the
   sharded executor;
-- `kqueue` support on macOS/BSD;
+- broader BSD `kqueue` support beyond macOS/iOS;
 - generic load balancing;
 - Seastar-like scheduling/resource classes;
 - a stable public runtime API;
@@ -485,7 +488,8 @@ CPU placement exists as an experimental Linux-supported runtime request. Portabl
 2. Explore procedural macros for generating command enums, client stubs, routing, and reply plumbing from service traits.
 3. Unify executor `io_uring` waits with timers and readiness into a single
    deadline-aware wait path instead of the current priority-based integration.
-4. Add `kqueue` or another stronger macOS/BSD readiness backend.
+4. Generalize the `kqueue` backend beyond macOS/iOS where the platform ABI is
+   known.
 5. Add scheduling/resource classes only after the executor and service semantics are stable.
 6. Explore network-facing sharded services with explicit key routing.
 

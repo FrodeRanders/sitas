@@ -4,8 +4,8 @@
 
 The readiness path is intentionally small. A future registers interest in a
 file descriptor, the scheduler records the waker, the Unix reactor sleeps using
-\texttt{poll} or Linux \texttt{epoll} plus a wake pipe, and readiness wakes the
-interested task.
+Linux \texttt{epoll}, macOS/iOS \texttt{kqueue}, or fallback \texttt{poll} plus
+a wake pipe, and readiness wakes the interested task.
 
 This path is readiness-based, not completion-based. It is used by the current
 TCP helpers and remains separate from the experimental \texttt{io\_uring}
