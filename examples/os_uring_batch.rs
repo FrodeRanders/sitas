@@ -1,3 +1,7 @@
+//! Dispatches several `io_uring` completions as a batch.
+//!
+//! Batching matters for a shard-per-core runtime because a shard should be able
+//! to harvest multiple kernel completions before returning to application work.
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
     use sitas::os::{

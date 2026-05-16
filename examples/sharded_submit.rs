@@ -1,3 +1,7 @@
+//! Submits work from one shard to another and awaits the remote result.
+//!
+//! The awaiting task resumes on its original shard, which is the key affinity
+//! rule that keeps shard-local reasoning tractable.
 use sitas::{ShardId, ShardedExecutor, current_executor_shard};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

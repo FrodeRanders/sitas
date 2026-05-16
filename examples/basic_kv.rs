@@ -1,3 +1,7 @@
+//! Minimal key-value service usage.
+//!
+//! The example uses blocking calls on purpose: this is the baseline service
+//! API before async reply handles or the custom executor enter the picture.
 use sitas::{ShardId, ShardedKv};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

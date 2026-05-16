@@ -1,3 +1,7 @@
+//! Runs one cooperative worker per shard-local value.
+//!
+//! The stop token gives each worker a normal async way to leave its loop before
+//! the owning runtime is stopped.
 use sitas::{ShardLocal, ShardedExecutor, executor::sleep};
 use std::time::Duration;
 

@@ -1,3 +1,7 @@
+//! Requests CPU placement for shard executor threads.
+//!
+//! Linux can apply affinity, while other platforms report unsupported status;
+//! the example prints both requested placement and what tasks observe.
 use sitas::{
     ShardId, ShardedExecutor, available_cpu_ids, current_executor_cpu_placement,
     current_executor_shard, executor::block_on,

@@ -1,3 +1,7 @@
+//! Copies bytes between Unix streams through a readiness-driven future.
+//!
+//! The small buffer is intentional: it forces `copy_async` to make progress in
+//! chunks, which is the interesting part for executor wakeups.
 use sitas::executor::{block_on, copy_async};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

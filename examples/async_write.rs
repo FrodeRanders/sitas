@@ -1,3 +1,7 @@
+//! Writes asynchronously to a non-blocking Unix stream.
+//!
+//! The read side stays blocking because the lesson is only that executor
+//! write readiness can drive `write_all_async` to completion.
 use sitas::executor::{block_on, write_all_async};
 use std::io::Read;
 use std::os::unix::net::UnixStream;

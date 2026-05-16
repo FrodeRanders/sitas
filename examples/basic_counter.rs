@@ -1,3 +1,7 @@
+//! Minimal counter service usage.
+//!
+//! This keeps the focus on the original std-only shard service model: calls
+//! are routed to owning shard threads, and aggregation returns owned values.
 use sitas::{ShardId, ShardedCounter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

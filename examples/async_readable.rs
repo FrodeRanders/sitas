@@ -1,3 +1,7 @@
+//! Waits for read readiness on a Unix stream.
+//!
+//! A helper thread writes later so the executor must register interest and
+//! sleep until the OS reactor wakes it.
 use sitas::executor::{block_on, read_exact_async};
 use std::io::Write;
 use std::os::unix::net::UnixStream;

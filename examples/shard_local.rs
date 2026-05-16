@@ -1,3 +1,7 @@
+//! Creates one value per executor shard and mutates it through routed access.
+//!
+//! `ShardLocal` is the core shared-nothing pattern: each shard owns its value,
+//! and callers interact with it by submitting synchronous closures to the owner.
 use sitas::{ShardLocal, ShardedExecutor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

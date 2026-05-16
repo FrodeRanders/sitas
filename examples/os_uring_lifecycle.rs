@@ -1,3 +1,7 @@
+//! Walks through normal and abandoned `io_uring` future lifecycles.
+//!
+//! The snapshots make the internal state transitions visible: pending kernel
+//! work, dispatched completions, consumed futures, and abandoned operations.
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
     use sitas::os::{

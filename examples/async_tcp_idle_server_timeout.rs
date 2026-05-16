@@ -1,3 +1,7 @@
+//! Demonstrates bounded shutdown for an idle TCP server.
+//!
+//! The handler intentionally sleeps too long, so the timeout path proves that
+//! uncooperative connection work can be aborted instead of hanging shutdown.
 use sitas::executor::{executor_and_spawner, serve_tcp_until_idle_timeout, sleep};
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};

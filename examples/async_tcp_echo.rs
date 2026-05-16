@@ -1,3 +1,7 @@
+//! Builds one TCP echo exchange from primitive async accept/read/write calls.
+//!
+//! The blocking client is deliberately outside the executor so the example
+//! focuses on the server-side readiness path.
 use sitas::executor::{accept_async, block_on, read_exact_async, write_all_async};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

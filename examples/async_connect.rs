@@ -1,3 +1,7 @@
+//! Opens a TCP client connection with the custom executor.
+//!
+//! The server stays on a plain blocking thread so the example isolates the
+//! async client-side connect/read/write path without needing a second executor.
 use sitas::executor::{block_on, connect_async, read_exact_async, write_all_async};
 use std::io::{Read, Write};
 use std::net::TcpListener;

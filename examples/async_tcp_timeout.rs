@@ -1,3 +1,7 @@
+//! Wraps `accept_async` in a timeout.
+//!
+//! The listener has no client, so the expected result is the timeout branch;
+//! this makes timer integration visible without any networking noise.
 use std::net::TcpListener;
 use std::time::Duration;
 

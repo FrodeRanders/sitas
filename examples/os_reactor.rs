@@ -1,3 +1,7 @@
+//! Uses the OS reactor wake source directly.
+//!
+//! Most code should go through executor futures; this lower-level example shows
+//! the pipe/poll/epoll wake mechanism that lets another thread unpark waiting.
 use sitas::os::OsReactor;
 use std::thread;
 use std::time::Duration;

@@ -1,3 +1,7 @@
+//! Starts one async executor per shard and submits explicit shard work.
+//!
+//! The channel is only for demonstration output; actual application state
+//! should live on the shard and be accessed through typed submissions.
 use sitas::{ShardId, ShardedExecutor, current_executor_shard};
 use std::sync::mpsc;
 use std::thread;

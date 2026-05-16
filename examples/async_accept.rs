@@ -1,3 +1,7 @@
+//! Shows the lowest-level async accept pattern.
+//!
+//! The listener is made non-blocking because sitas readiness futures expect OS
+//! operations to return `WouldBlock` instead of parking the executor thread.
 use sitas::executor::{accept_async, block_on, read_exact_async};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};

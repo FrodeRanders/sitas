@@ -1,3 +1,8 @@
+//! Builds a sorted index by partitioning file work across executor shards.
+//!
+//! This is intentionally more application-like than the tiny examples. It
+//! demonstrates how sitas keeps work shard-affine, returns owned metadata, and
+//! uses explicit merge submissions instead of sharing mutable index state.
 use sitas::{
     CpuPlacement, ShardId, ShardedExecutor, ShardedExecutorConfig, available_cpu_ids,
     current_executor_cpu_placement, current_executor_shard, executor::block_on,
@@ -42,6 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ShardedExecutorConfig::new(config.shard_count).with_cpu_placement(CpuPlacement::Sequential),
     )?;
     let shard_count = runtime.shard_count();
+    // This mutex protects demo progress reporting, not service state. The
+    // actual index-building work remains partitioned by shard and communicates
+    // through owned `ShardRun` values.
     let progress = Arc::new(Mutex::new(vec![ShardProgress::default(); shard_count]));
     let mut handles = Vec::with_capacity(shard_count);
 
@@ -64,6 +72,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data_path = paths.data.clone();
         let run_path = paths.partition_run_path(shard_idx);
         let progress = Arc::clone(&progress);
+        // The file I/O here is ordinary blocking std I/O. That is acceptable
+        // for this demo because each shard owns a coarse partition task; a
+        // later io_uring-backed variant could replace this inner implementation
+        // without changing the shard ownership shape.
         let handle = runtime.spawn_with_handle_named_on(
             ShardId(shard_idx),
             format!("index-partition-{shard_idx}"),
@@ -321,7 +333,9 @@ fn merge_runs_on_shards(
             ));
 
             // Merge work is explicit cross-shard work: the new task is placed
-            // on the shard that owned the left input run.
+            // on the shard that owned the left input run. That policy is simple
+            // rather than load-balanced; its purpose is to keep placement
+            // decisions visible while the runtime mechanics are still evolving.
             let progress = Arc::clone(progress);
             let handle = runtime.spawn_with_handle_named_on(
                 target_shard,

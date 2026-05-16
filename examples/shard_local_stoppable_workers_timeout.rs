@@ -1,3 +1,7 @@
+//! Stops shard-local workers with a bounded join.
+//!
+//! The timeout variant is important for service shutdown because cooperative
+//! stop requests should not be able to hang the caller forever.
 use sitas::{ShardLocal, ShardedExecutor, executor::sleep};
 use std::time::Duration;
 

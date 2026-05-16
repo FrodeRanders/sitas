@@ -1,3 +1,7 @@
+//! Shows timeout-protected shutdown of a fixed-count TCP server.
+//!
+//! The handler never replies before the deadline, so the example exercises the
+//! abort path that keeps shutdown bounded.
 use sitas::executor::{executor_and_spawner, serve_tcp_n_timeout, sleep};
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};

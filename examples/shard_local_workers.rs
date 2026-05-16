@@ -1,3 +1,7 @@
+//! Spawns one worker per shard-local value and joins their outputs.
+//!
+//! Each worker runs on the shard that owns the value it mutates, preserving the
+//! no-shared-service-state invariant while still collecting results centrally.
 use sitas::{ShardLocal, ShardedExecutor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

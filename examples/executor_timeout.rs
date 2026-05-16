@@ -1,3 +1,7 @@
+//! Applies a timer deadline to an arbitrary future.
+//!
+//! This demonstrates timeout as composition: the inner future is not special,
+//! it is raced against executor timer wakeup.
 use std::time::Duration;
 
 use sitas::executor::{block_on, sleep, timeout};

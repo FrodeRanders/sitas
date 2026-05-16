@@ -1,3 +1,7 @@
+//! Accepts several clients and spawns one task per connection.
+//!
+//! This is the basic server shape: the accept loop owns the listener, while
+//! each accepted stream moves into independent executor work.
 use sitas::executor::{
     Spawner, accept_async, executor_and_spawner, read_exact_async, write_all_async,
 };

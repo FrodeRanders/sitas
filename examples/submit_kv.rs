@@ -1,3 +1,7 @@
+//! Uses submit/wait-later key-value operations.
+//!
+//! Submit handles decouple enqueueing from waiting, which is the std-only
+//! precursor to awaiting replies on the custom executor.
 use sitas::ShardedKv;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

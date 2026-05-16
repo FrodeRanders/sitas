@@ -1,3 +1,7 @@
+//! Groups child tasks with `TaskScope`.
+//!
+//! Scope shutdown gives a structured place to ask children to stop and then
+//! await them, instead of leaving detached work behind.
 use sitas::executor::{TaskScope, executor_and_spawner, sleep};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -1,3 +1,7 @@
+//! Shows the executor timer path with `sleep`.
+//!
+//! A timer future registers a deadline, yields, and is later woken by the
+//! executor rather than by an OS thread sleeping inside the task.
 use sitas::executor::{block_on, sleep};
 use std::time::{Duration, Instant};
 

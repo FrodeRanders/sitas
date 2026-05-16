@@ -1,3 +1,7 @@
+//! Exercises the blocking key-value API from several OS threads.
+//!
+//! The service state is still shard-owned; concurrency here means many callers
+//! enqueue typed commands, not that the map itself is shared behind a mutex.
 use std::thread;
 
 use sitas::ShardedKv;

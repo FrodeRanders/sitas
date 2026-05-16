@@ -1,3 +1,7 @@
+//! Runs both sides of a TCP echo exchange on one executor.
+//!
+//! This proves the reactor can interleave accept, connect, read, and write
+//! futures without helper threads driving either side.
 use sitas::executor::{
     accept_async, connect_async, executor_and_spawner, read_exact_async, write_all_async,
 };

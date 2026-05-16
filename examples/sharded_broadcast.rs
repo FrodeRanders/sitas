@@ -1,3 +1,7 @@
+//! Broadcasts work from one shard to every shard.
+//!
+//! The origin task submits explicit remote futures instead of reaching into
+//! other shards, making cross-shard fan-out visible in the code.
 use sitas::{ShardId, ShardedExecutor, current_executor_shard, join_all_shards};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

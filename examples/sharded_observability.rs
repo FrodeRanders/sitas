@@ -1,3 +1,7 @@
+//! Samples runtime snapshots while named shard tasks are sleeping and waking.
+//!
+//! This is the lightweight alternative to a tracing UI for now: owned snapshots
+//! expose queues, waits, polls, and counters without keeping shards alive.
 use sitas::{
     ShardedExecutor, TaskSnapshot, TaskStatus, TaskWait, current_executor_shard, executor::sleep,
 };

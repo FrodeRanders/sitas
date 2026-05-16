@@ -1,3 +1,7 @@
+//! Uses scoped TCP handler shutdown with a stop token.
+//!
+//! The handler receives its own stop future so server shutdown can first ask
+//! children to finish cooperatively, then bound that wait with a timeout.
 use sitas::executor::{
     executor_and_spawner, serve_tcp_until_stopped_scoped_timeout, sleep, stop_pair, write_all_async,
 };

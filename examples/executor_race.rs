@@ -1,3 +1,7 @@
+//! Races two futures and keeps the first result.
+//!
+//! The slower branch is dropped when the faster branch completes, which is the
+//! cancellation behavior higher-level timeout helpers build on.
 use std::time::Duration;
 
 use sitas::executor::{RaceOutput, block_on, race, sleep};

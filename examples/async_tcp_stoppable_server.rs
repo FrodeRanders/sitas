@@ -1,3 +1,7 @@
+//! Runs a TCP server until a cooperative stop token fires.
+//!
+//! This is closer to a service lifecycle than the fixed-count examples: work
+//! continues until another task decides the runtime should stop accepting.
 use sitas::executor::{
     executor_and_spawner, read_exact_async, serve_tcp_until_stopped_timeout, sleep, stop_pair,
     write_all_async,

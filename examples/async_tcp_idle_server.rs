@@ -1,3 +1,7 @@
+//! Runs a TCP server until no new clients arrive for an idle window.
+//!
+//! The idle timeout is useful for demos and tests: it gives the accept loop a
+//! deterministic stopping condition without an explicit stop token.
 use sitas::executor::{
     executor_and_spawner, read_exact_async, serve_tcp_until_idle, write_all_async,
 };

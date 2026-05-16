@@ -1,3 +1,7 @@
+//! Drops an `io_uring` future before its kernel operation completes.
+//!
+//! The dispatcher must keep ownership bookkeeping for abandoned operations so
+//! later completions can be drained without waking a task that no longer exists.
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
     use sitas::os::{

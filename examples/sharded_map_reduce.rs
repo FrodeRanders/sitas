@@ -1,3 +1,7 @@
+//! Runs map-reduce work across all executor shards.
+//!
+//! This is a higher-level fan-out helper over explicit shard submission: each
+//! shard computes locally, then owned outputs are reduced by the caller.
 use sitas::{ShardId, ShardedExecutor, current_executor_shard};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

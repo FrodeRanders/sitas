@@ -1,3 +1,7 @@
+//! Uses direct shard-local access from code already running on the owner shard.
+//!
+//! `with_current` avoids a round-trip through the submitter, but only works
+//! because the task is already executing on the shard that owns the value.
 use sitas::{ShardId, ShardLocal, ShardedExecutor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,3 +1,7 @@
+//! Demonstrates task abortion through a join handle.
+//!
+//! The task yields in a loop so cancellation can be observed at an executor
+//! polling boundary instead of relying on a blocking sleep.
 use std::time::Duration;
 
 use sitas::executor::{block_on, executor_and_spawner, sleep, yield_now};

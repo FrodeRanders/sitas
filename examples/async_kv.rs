@@ -1,3 +1,7 @@
+//! Awaits the std-only key-value reply handles on the custom executor.
+//!
+//! This bridges the original shard mailbox service model into async code
+//! without replacing the service with an async runtime.
 use sitas::executor::block_on;
 use sitas::{ShardError, ShardedKv};
 

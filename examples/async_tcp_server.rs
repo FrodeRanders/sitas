@@ -1,3 +1,7 @@
+//! Serves a fixed number of TCP clients.
+//!
+//! A fixed accept count is a simple way to exercise handler spawning while
+//! keeping the example deterministic and self-terminating.
 use sitas::executor::{executor_and_spawner, read_exact_async, serve_tcp_n, write_all_async};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

@@ -1,3 +1,7 @@
+//! Clones a `ShardLocal` handle and moves it into remote shard work.
+//!
+//! The handle is cheap to clone; the underlying values are not cloned and still
+//! remain owned by their respective executor shards.
 use sitas::{ShardId, ShardLocal, ShardedExecutor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

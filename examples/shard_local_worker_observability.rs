@@ -1,3 +1,7 @@
+//! Observes named shard-local worker tasks while they run.
+//!
+//! The names and snapshot counters show why observability is owned data: a
+//! monitoring thread can inspect progress without borrowing runtime internals.
 use sitas::{ShardLocal, ShardedExecutor, TaskSnapshot, TaskStatus, TaskWait, executor::sleep};
 use std::time::Duration;
 

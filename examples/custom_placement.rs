@@ -1,3 +1,7 @@
+//! Supplies a custom key-to-shard placement policy.
+//!
+//! Placement is explicit in sitas so routing decisions can be reasoned about
+//! independently from the service implementation.
 use sitas::placement::Placement;
 use sitas::{ShardId, ShardedKv, ShardedKvConfig};
 

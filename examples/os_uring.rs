@@ -1,3 +1,7 @@
+//! Queues and completes raw `io_uring` operations.
+//!
+//! This deliberately stays below the executor: it shows the kernel submission
+//! and completion lifecycle before those operations are wrapped as futures.
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
     use sitas::os::{IoUringOperationKind, available_io_uring, report_io_uring_unavailable};
