@@ -709,8 +709,11 @@ fn errno() -> c_int {
 #[cfg(test)]
 mod tests {
     use super::{OsReactor, create_pipe};
+    use std::io::Write;
     use std::os::raw::c_void;
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::io::RawFd;
+    use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -839,6 +842,24 @@ mod tests {
         assert!(!event.woke);
         assert_eq!(event.readable, vec![read_fd.raw()]);
         assert_eq!(event.writable, vec![second_write_fd.raw()]);
+    }
+
+    #[test]
+    fn wait_io_reports_same_fd_readable_and_writable_once() {
+        let reactor = OsReactor::new().unwrap();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let fd = stream.as_raw_fd();
+
+        peer.write_all(b"x").unwrap();
+
+        let event = reactor
+            .wait_io(&[fd, fd], &[fd, fd], Some(Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(!event.woke);
+        assert_eq!(event.readable, vec![fd]);
+        assert_eq!(event.writable, vec![fd]);
     }
 
     fn write_one(fd: RawFd) {

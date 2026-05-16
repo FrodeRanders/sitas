@@ -117,18 +117,19 @@ impl KqueueBackend {
                     let interest = registration
                         .interest(token)
                         .expect("kqueue returned an unknown interest token");
-                    if interest.read && event.filter == EVFILT_READ {
-                        readable.push(interest.fd);
+                    if interest.read && event.filter == EVFILT_READ && event.flags & EV_ERROR == 0 {
+                        push_unique_fd(&mut readable, interest.fd);
                     }
-                    if interest.write && event.filter == EVFILT_WRITE {
-                        writable.push(interest.fd);
+                    if interest.write && event.filter == EVFILT_WRITE && event.flags & EV_ERROR == 0
+                    {
+                        push_unique_fd(&mut writable, interest.fd);
                     }
                     if event.flags & (EV_ERROR | EV_EOF) != 0 {
-                        if interest.read {
-                            readable.push(interest.fd);
+                        if interest.read && event.filter == EVFILT_READ {
+                            push_unique_fd(&mut readable, interest.fd);
                         }
-                        if interest.write {
-                            writable.push(interest.fd);
+                        if interest.write && event.filter == EVFILT_WRITE {
+                            push_unique_fd(&mut writable, interest.fd);
                         }
                     }
                 }
@@ -394,5 +395,11 @@ fn duration_to_timespec(duration: Duration) -> Timespec {
     Timespec {
         tv_sec: duration.as_secs().min(i64::MAX as u64) as i64,
         tv_nsec: i64::from(duration.subsec_nanos()),
+    }
+}
+
+fn push_unique_fd(fds: &mut Vec<RawFd>, fd: RawFd) {
+    if !fds.contains(&fd) {
+        fds.push(fd);
     }
 }

@@ -96,10 +96,10 @@ impl EpollBackend {
                         .interest(event.data)
                         .expect("epoll returned an unknown interest index");
                     if interest.read && event.events & (EPOLLIN | EPOLLERR | EPOLLHUP) != 0 {
-                        readable.push(interest.fd);
+                        push_unique_fd(&mut readable, interest.fd);
                     }
                     if interest.write && event.events & (EPOLLOUT | EPOLLERR | EPOLLHUP) != 0 {
-                        writable.push(interest.fd);
+                        push_unique_fd(&mut writable, interest.fd);
                     }
                 }
 
@@ -315,5 +315,11 @@ fn register_epoll_fd(epoll_fd: RawFd, fd: RawFd, events: u32, data: u64) -> io::
         Err(last_os_error())
     } else {
         Ok(())
+    }
+}
+
+fn push_unique_fd(fds: &mut Vec<RawFd>, fd: RawFd) {
+    if !fds.contains(&fd) {
+        fds.push(fd);
     }
 }
