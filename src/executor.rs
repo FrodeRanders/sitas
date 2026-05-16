@@ -493,17 +493,6 @@ impl Executor {
     fn wait_io_uring_when_idle(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            if self.scheduler.time_until_next_timer().is_some() {
-                return false;
-            }
-
-            #[cfg(unix)]
-            if !self.scheduler.read_interest_fds().is_empty()
-                || !self.scheduler.write_interest_fds().is_empty()
-            {
-                return false;
-            }
-
             if uring::should_wait() {
                 uring::wait_and_dispatch().expect("io_uring wait failed while running executor");
                 self.refresh_io_uring_snapshot();

@@ -125,9 +125,9 @@ Responsibilities:
 - `race` for composing two futures and dropping the losing future;
 - timer registration, timeout futures, and cancellation cleanup;
 - readiness futures for read/write interests;
-- Unix reactor sleep when no tasks are ready.
+- Unix reactor sleep when no tasks are ready;
 - Linux executor-owned `io_uring` read/write-at futures driven from the
-  executor loop when a shard has no ready tasks or timers;
+  executor loop when a shard has no ready tasks;
 - cumulative executor counters for spawned tasks, completed tasks, task polls,
   and ready-poll budget exhaustion events.
 
@@ -344,16 +344,18 @@ operation ids and owned buffers, not `Rc` dispatcher handles, so they can remain
 `Send` before being moved onto a shard thread. When polled on the shard, they
 queue operations against the thread-local dispatcher and register their task
 waker. The executor dispatches locally available completions after ready-task
-polling and waits for an `io_uring` completion when the shard has no ready
-tasks, no timers, and no readiness interests.
+polling and gives pending `io_uring` work the executor wait slot when the shard
+has no ready tasks. This avoids hiding completion work behind an unrelated
+timer or readiness wait, but it is still a staged integration rather than one
+combined production wait primitive.
 
 This integration deliberately keeps some limits visible:
 
 - it is Linux-only and reports normal unsupported behavior when `io_uring` is
   unavailable;
 - the dispatcher is per executor thread, not shared across shards;
-- timers and readiness waits are not yet unified with `io_uring` waits into one
-  production event source;
+- timers, readiness waits, and `io_uring` waits are not yet unified into one
+  production event source with deadline-aware completion waiting;
 - merge I/O in the index example still uses std file I/O.
 
 It has two layers of completion state:
@@ -481,8 +483,8 @@ CPU placement exists as an experimental Linux-supported runtime request. Portabl
 
 1. Evaluate whether a generic `Sharded<T>` abstraction is useful or whether typed service generation is better.
 2. Explore procedural macros for generating command enums, client stubs, routing, and reply plumbing from service traits.
-3. Unify executor `io_uring` waits with timers and readiness instead of the
-   current narrow idle-wait integration.
+3. Unify executor `io_uring` waits with timers and readiness into a single
+   deadline-aware wait path instead of the current priority-based integration.
 4. Add `kqueue` or another stronger macOS/BSD readiness backend.
 5. Add scheduling/resource classes only after the executor and service semantics are stable.
 6. Explore network-facing sharded services with explicit key routing.

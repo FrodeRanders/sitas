@@ -356,6 +356,41 @@ fn io_uring_read_and_write_are_driven_by_executor_loop() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn io_uring_completion_is_not_delayed_by_unexpired_timer() -> io::Result<()> {
+    if crate::os::available_io_uring(8)?.is_none() {
+        return Ok(());
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "sitas-executor-uring-timer-{}-{:?}.dat",
+        std::process::id(),
+        thread::current().id()
+    ));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    let (executor, _spawner) = executor_and_spawner();
+
+    let started = Instant::now();
+    let bytes = executor
+        .run_until(timeout(Duration::from_millis(250), async {
+            write_all_at_uring(file.as_raw_fd(), 0, b"abcdef".to_vec()).await?;
+            read_at_uring(file.as_raw_fd(), 2, vec![0; 3]).await
+        }))
+        .expect("io_uring read/write should complete before timeout")?;
+
+    assert_eq!(bytes, b"cde");
+    assert!(started.elapsed() < Duration::from_millis(150));
+    drop(file);
+    fs::remove_file(path)?;
+    Ok(())
+}
+
 #[test]
 fn timeout_returns_future_output_before_deadline() {
     let output = block_on(async { timeout(Duration::from_secs(1), async { 7 }).await });
