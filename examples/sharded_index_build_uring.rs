@@ -41,6 +41,7 @@ const DEFAULT_SEED: u64 = 0x517a_5eed;
 const PAYLOAD_SIZE: usize = 24;
 const RECORD_SIZE: usize = 8 + PAYLOAD_SIZE;
 const INDEX_ENTRY_SIZE: usize = 16;
+const PARTITION_READ_CHUNK_RECORDS: usize = 256;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -177,31 +178,13 @@ fn build_sorted_run_uring(
     let dispatcher = IoUringDispatcher::new(ring).into_shared();
     let data = File::open(data_path)?;
 
-    let mut entries = Vec::with_capacity(partition.record_count);
-    for record_idx in partition.start_record..partition.end_record {
-        let buffer = uring_read_exact_at(
-            Rc::clone(&dispatcher),
-            data.as_raw_fd(),
-            record_offset(record_idx),
-            RECORD_SIZE,
-        )?;
-        let record = record_from_bytes(&buffer)?;
-        entries.push(IndexEntry {
-            key: record.key,
-            offset: record_offset(record_idx),
-        });
-
-        if entries.len() % 512 == 0 || record_idx + 1 == partition.end_record {
-            set_progress(
-                &progress,
-                shard_id,
-                Phase::Scanning,
-                entries.len(),
-                entries.len() * RECORD_SIZE,
-                0,
-            );
-        }
-    }
+    let mut entries = read_partition_entries_uring(
+        Rc::clone(&dispatcher),
+        data.as_raw_fd(),
+        partition,
+        shard_id,
+        &progress,
+    )?;
 
     let bytes_read = entries.len() * RECORD_SIZE;
     let bytes_written = entries.len() * INDEX_ENTRY_SIZE;
@@ -237,22 +220,62 @@ fn build_sorted_run_uring(
 }
 
 #[cfg(target_os = "linux")]
+fn read_partition_entries_uring(
+    dispatcher: sitas::os::SharedIoUringDispatcher,
+    fd: RawFd,
+    partition: Partition,
+    shard_id: ShardId,
+    progress: &Arc<Mutex<Vec<ShardProgress>>>,
+) -> io::Result<Vec<IndexEntry>> {
+    let mut entries = Vec::with_capacity(partition.record_count);
+    let mut next_record = partition.start_record;
+
+    while next_record < partition.end_record {
+        let chunk_records = PARTITION_READ_CHUNK_RECORDS.min(partition.end_record - next_record);
+        let buffer = uring_read_exact_at(
+            Rc::clone(&dispatcher),
+            fd,
+            record_offset(next_record),
+            chunk_records * RECORD_SIZE,
+        )?;
+
+        for (chunk_idx, record_bytes) in buffer.chunks_exact(RECORD_SIZE).enumerate() {
+            let record_idx = next_record + chunk_idx;
+            let record = record_from_bytes(record_bytes)?;
+            entries.push(IndexEntry {
+                key: record.key,
+                offset: record_offset(record_idx),
+            });
+        }
+        next_record += chunk_records;
+
+        if entries.len() % 512 == 0 || next_record == partition.end_record {
+            set_progress(
+                progress,
+                shard_id,
+                Phase::Scanning,
+                entries.len(),
+                entries.len() * RECORD_SIZE,
+                0,
+            );
+        }
+    }
+
+    Ok(entries)
+}
+
+#[cfg(target_os = "linux")]
 fn write_index_file_uring(
     dispatcher: sitas::os::SharedIoUringDispatcher,
     path: &Path,
     entries: &[IndexEntry],
 ) -> io::Result<()> {
     let file = File::create(path)?;
-
-    for (entry_idx, entry) in entries.iter().enumerate() {
-        let offset = (entry_idx * INDEX_ENTRY_SIZE) as u64;
-        uring_write_all_at(
-            Rc::clone(&dispatcher),
-            file.as_raw_fd(),
-            offset,
-            encode_index_entry(*entry),
-        )?;
+    let mut buffer = Vec::with_capacity(entries.len() * INDEX_ENTRY_SIZE);
+    for entry in entries {
+        encode_index_entry(*entry, &mut buffer);
     }
+    uring_write_all_at(dispatcher, file.as_raw_fd(), 0, buffer)?;
 
     Ok(())
 }
@@ -375,11 +398,9 @@ fn write_index_entry(file: &mut File, entry: IndexEntry) -> io::Result<()> {
     Ok(())
 }
 
-fn encode_index_entry(entry: IndexEntry) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(INDEX_ENTRY_SIZE);
+fn encode_index_entry(entry: IndexEntry, buffer: &mut Vec<u8>) {
     buffer.extend_from_slice(&entry.key.to_le_bytes());
     buffer.extend_from_slice(&entry.offset.to_le_bytes());
-    buffer
 }
 
 // Verification is intentionally outside the sharded runtime: it checks the
