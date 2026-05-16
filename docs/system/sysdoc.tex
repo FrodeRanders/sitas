@@ -1,0 +1,43 @@
+\documentclass{sitasdoc}
+
+\usepackage[useregional]{datetime2}
+\usepackage{tabularx}
+\usepackage{placeins}
+
+\date{\today}
+\title{sitas}
+\subtitle{System and runtime documentation}
+\editors{Frode Randers}
+\author{Frode Randers}
+
+\begin{document}
+
+    \maketitle
+
+    \newpage
+    \renewcommand\contentsname{Contents}
+    \tableofcontents
+    \newpage
+
+    \input{chapters/introduction.tex}
+    \newpage
+
+    \input{chapters/architecture.tex}
+    \newpage
+
+    \input{chapters/executor.tex}
+    \newpage
+
+    \input{chapters/sharding.tex}
+    \newpage
+
+    \input{chapters/io-runtime.tex}
+    \newpage
+
+    \input{chapters/examples.tex}
+    \newpage
+
+    \input{chapters/operations.tex}
+    \newpage
+
+\end{document}

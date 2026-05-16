@@ -1,0 +1,42 @@
+\chapter{Examples}
+
+\section{Learning examples}
+
+The \filepath{examples/} directory is part of the teaching surface. The examples
+show the runtime pieces in isolation before combining them:
+
+\begin{itemize}
+    \item basic executor futures and timers;
+    \item readiness-driven TCP helpers;
+    \item sharded executor startup and submission;
+    \item shard-local values;
+    \item CPU placement reporting;
+    \item observability snapshots;
+    \item standard-file and \texttt{io\_uring} index-building demos.
+\end{itemize}
+
+\section{Sharded index build}
+
+The sharded index example uses two files: a fixed-size record data file and a
+sorted index of offsets into that data file. Each shard scans one partition,
+sorts its partition-local index entries, writes a materialized run file, and
+then participates in merge rounds until one sorted index remains.
+
+The \texttt{io\_uring} variant performs partition reads and run writes through
+the executor-backed Linux completion path. The merge stages still use standard
+file I/O, which keeps the example useful while leaving room for future runtime
+work.
+
+\section{Representative commands}
+
+\begin{lstlisting}[language=bash,caption={Local validation}]
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo doc --no-deps
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash,caption={Linux validation through Docker}]
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo run --example sharded_index_build_uring -- --records 512 --shards 4 --seed 0xbeef --cleanup
+\end{lstlisting}

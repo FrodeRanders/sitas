@@ -1,0 +1,41 @@
+\chapter{Sharding}
+
+\section{Shard-per-core direction}
+
+\texttt{ShardedExecutor} connects the single-threaded executor to the
+shard-per-core model. It starts one executor on each shard thread and provides
+APIs for submitting work to one shard, all shards, or a map/reduce over shards.
+
+The model is explicit: work does not migrate implicitly. A future runs on its
+assigned shard until code deliberately submits work elsewhere.
+
+\section{Cross-shard submission}
+
+\texttt{ShardedSubmitter} is the explicit cross-shard async mechanism. A task
+on one shard can submit a future to another shard and await the returned join
+handle. The remote future is polled on the target shard. The awaiting task
+resumes on its original shard after the remote work completes.
+
+Submitters own spawner clones. They are lifetime capabilities and must be
+dropped before a runtime can fully drain.
+
+\section{Shard-local values}
+
+\texttt{ShardLocal<T>} owns one value per executor shard. Access is routed to
+the owning shard and the user closure receives \texttt{\&mut T} synchronously.
+The implementation uses internal unchecked storage plus runtime owner checks,
+not a mutex around application state.
+
+The critical rule is that references to local state cannot escape the closure
+and cannot cross \texttt{.await}. This keeps ownership local even when the
+runtime itself uses synchronization for task bookkeeping.
+
+\section{CPU placement}
+
+CPU placement is an experimental Linux-supported runtime request. Linux applies
+hard affinity with \texttt{sched\_setaffinity} where supported and observes
+container cpuset restrictions through \texttt{sched\_getaffinity}. Non-Linux
+platforms report unsupported placement honestly.
+
+By default, placement failures are recorded in shard snapshots and startup can
+still succeed. Required placement turns that into fail-fast startup behavior.

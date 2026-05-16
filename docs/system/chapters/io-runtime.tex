@@ -1,0 +1,42 @@
+\chapter{I/O Runtime}
+
+\section{Readiness}
+
+The readiness path is intentionally small. A future registers interest in a
+file descriptor, the scheduler records the waker, the Unix reactor sleeps using
+\texttt{poll} or Linux \texttt{epoll} plus a wake pipe, and readiness wakes the
+interested task.
+
+This path is readiness-based, not completion-based. It is used by the current
+TCP helpers and remains separate from the experimental \texttt{io\_uring}
+completion path.
+
+\section{\texttt{io\_uring}}
+
+The Linux \texttt{io\_uring} backend is experimental. It currently supports a
+narrow executor integration for owned-buffer \texttt{read\_at} and
+\texttt{write\_at} style file I/O.
+
+Each Linux executor run loop installs a thread-local dispatcher when the host
+allows ring setup. Executor-backed \texttt{io\_uring} futures store operation
+ids and owned buffers. When polled on a shard, they queue an operation against
+the thread-local dispatcher and register their task waker.
+
+The dispatcher tracks:
+
+\begin{itemize}
+    \item queued submissions;
+    \item locally buffered completions;
+    \item registered wakers;
+    \item abandoned operations;
+    \item deferred owned buffers;
+    \item cumulative dispatched, buffered, woken, and discarded operation
+          counters.
+\end{itemize}
+
+\section{Current limitation}
+
+Timers, readiness waits, and \texttt{io\_uring} waits are not yet unified into
+one production event source with deadline-aware completion waiting. The current
+executor gives pending \texttt{io\_uring} work priority when there are no ready
+tasks, which is useful and test-covered, but it is still a staged integration.

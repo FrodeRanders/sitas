@@ -1,0 +1,38 @@
+\chapter{Operations}
+
+\section{Building this manual}
+
+The manual lives in \filepath{docs/system}. Build it with:
+
+\begin{lstlisting}[language=bash]
+cd docs/system
+make
+\end{lstlisting}
+
+The output is \filepath{docs/system/sysdoc.pdf}. The build uses
+\texttt{pdflatex} twice so the table of contents and references settle.
+
+\section{Cleaning generated files}
+
+\begin{lstlisting}[language=bash]
+cd docs/system
+make clean
+make distclean
+\end{lstlisting}
+
+\texttt{make clean} removes LaTeX auxiliary files. \texttt{make distclean} also
+removes the generated PDF.
+
+\section{Linux validation}
+
+Some runtime behavior is Linux-specific. The Docker helper mounts the project
+directory into a Linux container and can request an \texttt{io\_uring}-capable
+configuration:
+
+\begin{lstlisting}[language=bash]
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test os::uring::tests -- --nocapture
+\end{lstlisting}
+
+When the host or container configuration cannot provide \texttt{io\_uring}, the
+Linux-only examples report that the backend is unavailable rather than faking a
+successful run.

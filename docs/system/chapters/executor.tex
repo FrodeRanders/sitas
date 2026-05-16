@@ -1,0 +1,48 @@
+\chapter{Executor}
+
+\section{Role}
+
+The executor is a minimal single-threaded async kernel. It owns pinned futures
+inside tasks, maintains a ready queue, coalesces repeated wakes, and drives a
+root future through \texttt{run\_until} while also polling spawned tasks.
+
+The executor deliberately avoids Tokio or another third-party runtime. That
+keeps the interesting internals visible: wakers, task queues, timers, readiness
+registration, cancellation, and completion dispatch all live in this code base.
+
+\section{Responsibilities}
+
+\begin{itemize}
+    \item Poll ready tasks with a budget so self-waking tasks cannot starve
+          timers and I/O forever.
+    \item Implement custom task wakers that enqueue tasks onto the local ready
+          queue.
+    \item Catch task panics at executor boundaries.
+    \item Preserve panic payloads where join handles and \texttt{block\_on}
+          make them observable.
+    \item Provide \texttt{sleep}, \texttt{timeout}, \texttt{race}, and
+          \texttt{yield\_now}.
+    \item Provide typed join handles and abort support.
+    \item Provide cooperative stop tokens, \texttt{Notify}, and
+          \texttt{TaskScope}.
+    \item Drive readiness futures for read and write interests.
+    \item On Linux, drive executor-owned \texttt{io\_uring} read/write-at
+          futures.
+\end{itemize}
+
+\section{Wait ordering}
+
+Each loop iteration polls ready work, wakes expired timers, dispatches locally
+available \texttt{io\_uring} completions, and then decides how to wait.
+
+Pending \texttt{io\_uring} work now takes the executor wait slot when the shard
+has no ready tasks. That prevents unrelated timers or readiness interests from
+delaying completion-based file I/O. This is still not the final form: the long
+term goal is a single deadline-aware wait path that can combine timers,
+readiness, and completion waiting without giving any source accidental priority.
+
+\section{Observability}
+
+Executor snapshots are owned values. They include task counts, named task
+state, polling counters, timer counts, readiness counts, and Linux
+\texttt{io\_uring} dispatcher counters when the dispatcher is installed.

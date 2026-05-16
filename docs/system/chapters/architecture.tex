@@ -1,0 +1,64 @@
+\chapter{Architecture}
+
+\section{Invariants}
+
+The project is guided by a small set of invariants:
+
+\begin{enumerate}
+    \item Each piece of application service state is owned by one shard.
+    \item Only the owning shard may mutate its service state.
+    \item Application services should not be modeled as shared
+          \texttt{Arc<Mutex<Service>>} state.
+    \item Cross-shard interaction happens through typed messages, typed reply
+          handles, or typed submitter calls.
+    \item Values crossing shard boundaries are owned.
+    \item References to shard-local state must not escape synchronous access
+          closures and must not cross \texttt{.await}.
+    \item Async work remains on its assigned shard unless explicitly submitted
+          elsewhere.
+    \item Observability snapshots are owned values, not borrowed runtime
+          internals.
+    \item Unsafe code is isolated behind small safe APIs.
+\end{enumerate}
+
+\section{Layered model}
+
+The current runtime can be read as a layered system:
+
+\begin{lstlisting}[language={},caption={Conceptual layers}]
+Application service APIs
+    |
+Typed command/reply and submitter APIs
+    |
+Placement and shard routing
+    |
+Shard-local service state / ShardLocal<T>
+    |
+Shard executor or std shard thread
+    |
+Mailbox, task queue, timers, readiness, wakeups
+    |
+OS primitives: pipe/poll/epoll/io_uring/affinity
+\end{lstlisting}
+
+The standard-library baseline exercises the upper part of the model. The
+non-std runtime branch fills in the executor and OS layers while preserving the
+same shared-nothing service direction.
+
+\section{Primary modules}
+
+\begin{description}
+    \item[\texttt{runtime}] The reusable standard-library kernel for bounded
+        shard mailboxes, reply handles, shard startup, and shutdown.
+    \item[\texttt{kv}] The reference sharded key-value service.
+    \item[\texttt{counter}] A smaller second service proving that the runtime
+        primitives are not key-value-specific.
+    \item[\texttt{placement}] Key-to-shard routing.
+    \item[\texttt{os}] Unix FFI, wake pipes, readiness backends, affinity, and
+        Linux \texttt{io\_uring} experiments.
+    \item[\texttt{executor}] The single-threaded async kernel.
+    \item[\texttt{sharded\_executor}] One executor per shard thread, plus
+        submission and observation APIs.
+    \item[\texttt{shard\_local}] One owned value per executor shard with
+        checked local access.
+\end{description}

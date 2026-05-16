@@ -1,0 +1,38 @@
+\chapter{Introduction}
+
+\section{Purpose}
+
+\texttt{sitas} is an experimental Rust runtime and service model inspired by
+Seastar's shard-per-core architecture. It is not a direct clone. The project is
+about understanding the runtime internals: how work is owned by shards, how
+cross-shard messages move, how a small executor drives futures, and how OS
+completion and readiness mechanisms can be exposed without depending on a
+third-party async runtime.
+
+The code base started with a standard-library-only sharded key-value store. The
+current branch extends that baseline with a custom executor, Unix readiness
+primitives, TCP helpers, sharded async execution, shard-local values,
+observability snapshots, CPU placement, and experimental Linux \texttt{io\_uring}
+support.
+
+\section{Scope of this manual}
+
+This manual is a LaTeX companion to the Markdown architecture notes. It is
+intended for longer-form system documentation and for keeping a printable view
+of the evolving runtime design.
+
+It focuses on:
+
+\begin{itemize}
+    \item architectural invariants;
+    \item executor and scheduling behavior;
+    \item shard ownership and cross-shard submission;
+    \item readiness, \texttt{epoll}, and \texttt{io\_uring} integration;
+    \item example programs that exercise the runtime;
+    \item build and validation operations.
+\end{itemize}
+
+\begin{notabene}
+The project is still deliberately experimental. APIs are allowed to move when
+that exposes cleaner runtime internals or a better teaching surface.
+\end{notabene}
