@@ -22,10 +22,10 @@ sorted index of offsets into that data file. Each shard scans one partition,
 sorts its partition-local index entries, writes a materialized run file, and
 then participates in merge rounds until one sorted index remains.
 
-The \texttt{io\_uring} variant performs partition reads and run writes through
-the executor-backed Linux completion path. The merge stages still use standard
-file I/O, which keeps the example useful while leaving room for future runtime
-work.
+The \texttt{io\_uring} variant performs partition reads, run writes, and merge
+run reads/writes through the executor-backed Linux completion path. Final
+verification still uses ordinary file I/O because it checks the externally
+visible result rather than the runtime path that produced it.
 
 \section{Representative commands}
 

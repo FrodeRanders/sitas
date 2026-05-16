@@ -356,7 +356,7 @@ This integration deliberately keeps some limits visible:
 - the dispatcher is per executor thread, not shared across shards;
 - timers, readiness waits, and `io_uring` waits are not yet unified into one
   production event source with deadline-aware completion waiting;
-- merge I/O in the index example still uses std file I/O.
+- final verification in the index example still uses std file I/O.
 
 It has two layers of completion state:
 

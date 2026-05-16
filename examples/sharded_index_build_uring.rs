@@ -3,8 +3,8 @@
 //! This is intentionally more application-like than the tiny examples. It
 //! demonstrates how sitas keeps work shard-affine, returns owned metadata, and
 //! uses explicit merge submissions instead of sharing mutable index state.
-//! Compared with `sharded_index_build`, the partition phase uses Linux
-//! `io_uring` offset reads and writes inside each shard task.
+//! Compared with `sharded_index_build`, partition scans, run writes, and merge
+//! run reads/writes use Linux `io_uring` offsets inside each shard task.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 #[cfg(target_os = "linux")]
@@ -129,7 +129,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Merge phase: keep submitting merge tasks to shards until the run list has
-    // collapsed to a single globally sorted run file.
+    // collapsed to a single globally sorted run file. Merge tasks also use
+    // offset-based io_uring I/O for reading run entries and writing merged
+    // batches.
     runs.sort_by_key(|run| run.shard_id.0);
     let final_run = merge_runs_on_shards(&runtime, &progress, &paths.run_dir, runs)?;
 
@@ -302,15 +304,31 @@ fn cleanup_files(paths: &DemoPaths) -> io::Result<()> {
     Ok(())
 }
 
-fn write_index_entry(file: &mut File, entry: IndexEntry) -> io::Result<()> {
-    file.write_all(&entry.key.to_le_bytes())?;
-    file.write_all(&entry.offset.to_le_bytes())?;
-    Ok(())
-}
-
 fn encode_index_entry(entry: IndexEntry, buffer: &mut Vec<u8>) {
     buffer.extend_from_slice(&entry.key.to_le_bytes());
     buffer.extend_from_slice(&entry.offset.to_le_bytes());
+}
+
+fn decode_index_entry(buffer: &[u8]) -> io::Result<IndexEntry> {
+    if buffer.len() != INDEX_ENTRY_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "index entry buffer has {} bytes, expected {INDEX_ENTRY_SIZE}",
+                buffer.len()
+            ),
+        ));
+    }
+
+    let mut key = [0u8; 8];
+    key.copy_from_slice(&buffer[..8]);
+    let mut offset = [0u8; 8];
+    offset.copy_from_slice(&buffer[8..]);
+
+    Ok(IndexEntry {
+        key: u64::from_le_bytes(key),
+        offset: u64::from_le_bytes(offset),
+    })
 }
 
 // Verification is intentionally outside the sharded runtime: it checks the
@@ -358,6 +376,7 @@ fn verify_index_file(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn merge_runs_on_shards(
     runtime: &ShardedExecutor,
     progress: &Arc<Mutex<Vec<ShardProgress>>>,
@@ -396,7 +415,7 @@ fn merge_runs_on_shards(
                     "index-merge-round-{round}-{}-{}",
                     left.shard_id.0, right.shard_id.0
                 ),
-                async move { merge_pair(left, right, output_path, progress) },
+                async move { merge_pair_uring(left, right, output_path, progress).await },
             )?;
             handles.push(handle);
         }
@@ -417,8 +436,9 @@ fn merge_runs_on_shards(
 }
 
 // Runs inside a shard executor task. It streams two already sorted run files
-// into a new sorted run file without loading both inputs into memory.
-fn merge_pair(
+// into a new sorted run file through offset-based io_uring reads and writes.
+#[cfg(target_os = "linux")]
+async fn merge_pair_uring(
     left: ShardRun,
     right: ShardRun,
     output_path: PathBuf,
@@ -440,7 +460,7 @@ fn merge_pair(
         0,
     );
 
-    let entry_count = merge_run_files(&left.path, &right.path, &output_path)?;
+    let entry_count = merge_run_files_uring(&left, &right, &output_path).await?;
 
     set_progress(
         &progress,
@@ -462,43 +482,110 @@ fn merge_pair(
     })
 }
 
-fn merge_run_files(left_path: &Path, right_path: &Path, output_path: &Path) -> io::Result<usize> {
-    let mut left = RunReader::open(left_path)?;
-    let mut right = RunReader::open(right_path)?;
-    let mut output = File::create(output_path)?;
+#[cfg(target_os = "linux")]
+async fn merge_run_files_uring(
+    left_run: &ShardRun,
+    right_run: &ShardRun,
+    output_path: &Path,
+) -> io::Result<usize> {
+    let mut left = UringRunReader::open(&left_run.path, left_run.entry_count)?;
+    let mut right = UringRunReader::open(&right_run.path, right_run.entry_count)?;
+    let output = File::create(output_path)?;
+    let output_fd = output.as_raw_fd();
+    let mut output_offset = 0u64;
+    let mut output_buffer = Vec::with_capacity(PARTITION_READ_CHUNK_RECORDS * INDEX_ENTRY_SIZE);
     let mut count = 0usize;
 
     loop {
-        match (left.peek()?, right.peek()?) {
+        match (left.peek().await?, right.peek().await?) {
             (Some(left_entry), Some(right_entry)) if left_entry <= right_entry => {
-                write_index_entry(&mut output, left_entry)?;
+                append_merged_entry_uring(
+                    output_fd,
+                    &mut output_offset,
+                    &mut output_buffer,
+                    left_entry,
+                )
+                .await?;
                 left.consume();
                 count += 1;
             }
             (Some(_), Some(right_entry)) => {
-                write_index_entry(&mut output, right_entry)?;
+                append_merged_entry_uring(
+                    output_fd,
+                    &mut output_offset,
+                    &mut output_buffer,
+                    right_entry,
+                )
+                .await?;
                 right.consume();
                 count += 1;
             }
             (Some(left_entry), None) => {
-                write_index_entry(&mut output, left_entry)?;
+                append_merged_entry_uring(
+                    output_fd,
+                    &mut output_offset,
+                    &mut output_buffer,
+                    left_entry,
+                )
+                .await?;
                 left.consume();
                 count += 1;
-                count += left.drain_into(&mut output)?;
+                count += left
+                    .drain_into(output_fd, &mut output_offset, &mut output_buffer)
+                    .await?;
                 break;
             }
             (None, Some(right_entry)) => {
-                write_index_entry(&mut output, right_entry)?;
+                append_merged_entry_uring(
+                    output_fd,
+                    &mut output_offset,
+                    &mut output_buffer,
+                    right_entry,
+                )
+                .await?;
                 right.consume();
                 count += 1;
-                count += right.drain_into(&mut output)?;
+                count += right
+                    .drain_into(output_fd, &mut output_offset, &mut output_buffer)
+                    .await?;
                 break;
             }
             (None, None) => break,
         }
     }
 
+    flush_merged_entries_uring(output_fd, &mut output_offset, &mut output_buffer).await?;
     Ok(count)
+}
+
+#[cfg(target_os = "linux")]
+async fn append_merged_entry_uring(
+    output_fd: RawFd,
+    output_offset: &mut u64,
+    output_buffer: &mut Vec<u8>,
+    entry: IndexEntry,
+) -> io::Result<()> {
+    encode_index_entry(entry, output_buffer);
+    if output_buffer.len() >= PARTITION_READ_CHUNK_RECORDS * INDEX_ENTRY_SIZE {
+        flush_merged_entries_uring(output_fd, output_offset, output_buffer).await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn flush_merged_entries_uring(
+    output_fd: RawFd,
+    output_offset: &mut u64,
+    output_buffer: &mut Vec<u8>,
+) -> io::Result<()> {
+    if output_buffer.is_empty() {
+        return Ok(());
+    }
+
+    let written = output_buffer.len();
+    write_all_at_uring(output_fd, *output_offset, std::mem::take(output_buffer)).await?;
+    *output_offset += written as u64;
+    Ok(())
 }
 
 // Progress is a demo-level observability layer. It combines explicit per-shard
@@ -623,34 +710,32 @@ fn read_index_entry(file: &mut File) -> io::Result<Option<IndexEntry>> {
         }
     }
 
-    let mut key = [0u8; 8];
-    key.copy_from_slice(&buffer[..8]);
-    let mut offset = [0u8; 8];
-    offset.copy_from_slice(&buffer[8..]);
-
-    Ok(Some(IndexEntry {
-        key: u64::from_le_bytes(key),
-        offset: u64::from_le_bytes(offset),
-    }))
+    decode_index_entry(&buffer).map(Some)
 }
 
-struct RunReader {
+#[cfg(target_os = "linux")]
+struct UringRunReader {
     file: File,
+    entry_count: usize,
+    next_index: usize,
     // A one-entry lookahead is enough for a classic two-way merge.
     peeked: Option<Option<IndexEntry>>,
 }
 
-impl RunReader {
-    fn open(path: &Path) -> io::Result<Self> {
+#[cfg(target_os = "linux")]
+impl UringRunReader {
+    fn open(path: &Path, entry_count: usize) -> io::Result<Self> {
         Ok(Self {
             file: File::open(path)?,
+            entry_count,
+            next_index: 0,
             peeked: None,
         })
     }
 
-    fn peek(&mut self) -> io::Result<Option<IndexEntry>> {
+    async fn peek(&mut self) -> io::Result<Option<IndexEntry>> {
         if self.peeked.is_none() {
-            self.peeked = Some(read_index_entry(&mut self.file)?);
+            self.peeked = Some(self.read_next_entry().await?);
         }
 
         Ok(self.peeked.expect("peeked entry initialized"))
@@ -660,16 +745,32 @@ impl RunReader {
         self.peeked = None;
     }
 
-    fn drain_into(&mut self, output: &mut File) -> io::Result<usize> {
+    async fn drain_into(
+        &mut self,
+        output_fd: RawFd,
+        output_offset: &mut u64,
+        output_buffer: &mut Vec<u8>,
+    ) -> io::Result<usize> {
         let mut count = 0usize;
 
-        while let Some(entry) = self.peek()? {
-            write_index_entry(output, entry)?;
+        while let Some(entry) = self.peek().await? {
+            append_merged_entry_uring(output_fd, output_offset, output_buffer, entry).await?;
             self.consume();
             count += 1;
         }
 
         Ok(count)
+    }
+
+    async fn read_next_entry(&mut self) -> io::Result<Option<IndexEntry>> {
+        if self.next_index >= self.entry_count {
+            return Ok(None);
+        }
+
+        let offset = (self.next_index * INDEX_ENTRY_SIZE) as u64;
+        let buffer = read_exact_at_uring(self.file.as_raw_fd(), offset, INDEX_ENTRY_SIZE).await?;
+        self.next_index += 1;
+        decode_index_entry(&buffer).map(Some)
     }
 }
 
