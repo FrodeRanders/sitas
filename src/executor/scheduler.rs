@@ -108,7 +108,15 @@ impl InterestSet {
     }
 
     fn fds(&self) -> Vec<RawFd> {
-        self.interests.iter().map(|interest| interest.fd).collect()
+        let mut fds = Vec::new();
+
+        for interest in &self.interests {
+            if !fds.contains(&interest.fd) {
+                fds.push(interest.fd);
+            }
+        }
+
+        fds
     }
 
     fn len(&self) -> usize {
@@ -546,4 +554,28 @@ pub(super) fn set_current_scheduler(scheduler: Option<Arc<Scheduler>>) {
     CURRENT_SCHEDULER.with(|current| {
         *current.borrow_mut() = scheduler;
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interest_set_reports_unique_fds_but_wakes_all_waiters() {
+        let mut set = InterestSet::new();
+        let waker = Waker::noop().clone();
+
+        set.register(0, 10, waker.clone());
+        set.register(1, 10, waker.clone());
+        set.register(2, 11, waker);
+
+        assert_eq!(set.fds(), vec![10, 11]);
+
+        let wakers = set.wake_ready(&[10]);
+        assert_eq!(wakers.len(), 2);
+        assert!(set.take_ready(0));
+        assert!(set.take_ready(1));
+        assert!(!set.take_ready(2));
+        assert_eq!(set.fds(), vec![11]);
+    }
 }

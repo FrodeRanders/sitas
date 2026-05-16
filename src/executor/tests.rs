@@ -921,6 +921,38 @@ fn multiple_tasks_can_wait_for_different_readable_fds() {
 
 #[cfg(unix)]
 #[test]
+fn multiple_tasks_can_wait_for_same_readable_fd() {
+    let (executor, spawner) = executor_and_spawner();
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    let reader_fd = reader.as_raw_fd();
+    let output = Arc::new(Mutex::new(Vec::new()));
+
+    for value in [1, 2] {
+        let output_for_task = Arc::clone(&output);
+        spawner
+            .spawn(async move {
+                readable(reader_fd).await;
+                output_for_task.lock().unwrap().push(value);
+            })
+            .unwrap();
+    }
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        writer.write_all(b"x").unwrap();
+    });
+
+    drop(spawner);
+    executor.run();
+
+    let mut observed = output.lock().unwrap().clone();
+    observed.sort();
+    assert_eq!(observed, vec![1, 2]);
+}
+
+#[cfg(unix)]
+#[test]
 fn writable_future_completes_when_fd_is_writable() {
     let (executor, spawner) = executor_and_spawner();
     let (_reader, writer) = UnixStream::pair().unwrap();
