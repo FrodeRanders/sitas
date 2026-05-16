@@ -30,6 +30,8 @@ mod task;
 mod tcp;
 #[cfg(unix)]
 mod unix_io;
+#[cfg(target_os = "linux")]
+mod uring;
 
 pub use future::{
     Race, RaceOutput, Sleep, Timeout, TimeoutError, YieldNow, race, sleep, timeout, yield_now,
@@ -52,6 +54,8 @@ pub use unix_io::{
     copy_async, copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, writable,
     write_all_async, write_all_timeout_async,
 };
+#[cfg(target_os = "linux")]
+pub use uring::{ReadAtUring, read_at_uring, write_all_at_uring};
 
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
@@ -353,16 +357,25 @@ impl Executor {
 
     /// Runs tasks until all spawners and runnable tasks are gone.
     pub fn run(&self) {
+        #[cfg(target_os = "linux")]
+        let _io_uring_scope = IoUringScope::enter();
+
         loop {
             self.poll_ready_tasks();
 
             self.scheduler.wake_expired_timers();
+            self.dispatch_io_uring_completions();
 
             if self.scheduler.is_drained() {
                 break;
             }
 
             if self.scheduler.has_ready_tasks() {
+                continue;
+            }
+
+            if self.wait_io_uring_when_idle() {
+                self.scheduler.wake_expired_timers();
                 continue;
             }
 
@@ -389,6 +402,9 @@ impl Executor {
     where
         F: Future,
     {
+        #[cfg(target_os = "linux")]
+        let _io_uring_scope = IoUringScope::enter();
+
         let root = Arc::new(RootWaker::new(Arc::clone(&self.scheduler)));
         let waker = Waker::from(Arc::clone(&root));
         let mut context = Context::from_waker(&waker);
@@ -413,8 +429,14 @@ impl Executor {
             self.poll_ready_tasks();
 
             self.scheduler.wake_expired_timers();
+            self.dispatch_io_uring_completions();
 
             if root.is_ready() || self.scheduler.has_ready_tasks() {
+                continue;
+            }
+
+            if self.wait_io_uring_when_idle() {
+                self.scheduler.wake_expired_timers();
                 continue;
             }
 
@@ -451,6 +473,54 @@ impl Executor {
             polled,
             polled == READY_POLL_BUDGET && self.scheduler.has_ready_tasks(),
         );
+    }
+
+    fn dispatch_io_uring_completions(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            uring::dispatch_available();
+        }
+    }
+
+    fn wait_io_uring_when_idle(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if self.scheduler.time_until_next_timer().is_some() {
+                return false;
+            }
+
+            #[cfg(unix)]
+            if !self.scheduler.read_interest_fds().is_empty()
+                || !self.scheduler.write_interest_fds().is_empty()
+            {
+                return false;
+            }
+
+            if uring::should_wait() {
+                uring::wait_and_dispatch().expect("io_uring wait failed while running executor");
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct IoUringScope;
+
+#[cfg(target_os = "linux")]
+impl IoUringScope {
+    fn enter() -> Self {
+        uring::install_current_io_uring();
+        Self
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for IoUringScope {
+    fn drop(&mut self) {
+        uring::clear_current_io_uring();
     }
 }
 

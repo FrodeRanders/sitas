@@ -8,10 +8,9 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 #[cfg(target_os = "linux")]
-use sitas::os::{
-    IoUringDispatcher, IoUringReadFuture, IoUringWriteFuture, available_io_uring,
-    block_on_io_uring, report_io_uring_unavailable,
-};
+use sitas::executor::{read_at_uring, write_all_at_uring};
+#[cfg(target_os = "linux")]
+use sitas::os::{available_io_uring, report_io_uring_unavailable};
 use sitas::{
     CpuPlacement, ShardId, ShardedExecutor, ShardedExecutorConfig, available_cpu_ids,
     current_executor_cpu_placement, current_executor_shard, executor::block_on,
@@ -23,8 +22,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 // The demo builds a sorted secondary index for a fixed-record data file.
@@ -98,12 +95,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let progress = Arc::clone(&progress);
         // This variant keeps the same shard ownership shape but replaces the
         // partition scan and run-file writes with offset-based io_uring I/O.
-        // The dispatcher is still local to the task; later runtime work can
-        // move that dispatcher into the shard executor loop.
+        // The futures are driven by the shard executor's thread-local
+        // dispatcher, so the task can await completions without a nested
+        // io_uring-specific block_on loop.
         let handle = runtime.spawn_with_handle_named_on(
             ShardId(shard_idx),
             format!("uring-index-partition-{shard_idx}"),
-            async move { build_sorted_run_uring(data_path, run_path, partition, progress) },
+            async move { build_sorted_run_uring(data_path, run_path, partition, progress).await },
         )?;
         handles.push(handle);
     }
@@ -161,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // It uses offset-based io_uring reads and writes so the file cursor is never
 // shared or mutated by the kernel operations.
 #[cfg(target_os = "linux")]
-fn build_sorted_run_uring(
+async fn build_sorted_run_uring(
     data_path: PathBuf,
     run_path: PathBuf,
     partition: Partition,
@@ -173,18 +171,10 @@ fn build_sorted_run_uring(
 
     set_progress(&progress, shard_id, Phase::Scanning, 0, 0, 0);
 
-    let ring = available_io_uring(64)?
-        .ok_or_else(|| io::Error::other("io_uring unavailable after startup check"))?;
-    let dispatcher = IoUringDispatcher::new(ring).into_shared();
     let data = File::open(data_path)?;
 
-    let mut entries = read_partition_entries_uring(
-        Rc::clone(&dispatcher),
-        data.as_raw_fd(),
-        partition,
-        shard_id,
-        &progress,
-    )?;
+    let mut entries =
+        read_partition_entries_uring(data.as_raw_fd(), partition, shard_id, &progress).await?;
 
     let bytes_read = entries.len() * RECORD_SIZE;
     let bytes_written = entries.len() * INDEX_ENTRY_SIZE;
@@ -198,7 +188,7 @@ fn build_sorted_run_uring(
         0,
     );
     entries.sort_unstable();
-    write_index_file_uring(Rc::clone(&dispatcher), &run_path, &entries)?;
+    write_index_file_uring(&run_path, &entries).await?;
     set_progress(
         &progress,
         shard_id,
@@ -220,8 +210,7 @@ fn build_sorted_run_uring(
 }
 
 #[cfg(target_os = "linux")]
-fn read_partition_entries_uring(
-    dispatcher: sitas::os::SharedIoUringDispatcher,
+async fn read_partition_entries_uring(
     fd: RawFd,
     partition: Partition,
     shard_id: ShardId,
@@ -232,12 +221,9 @@ fn read_partition_entries_uring(
 
     while next_record < partition.end_record {
         let chunk_records = PARTITION_READ_CHUNK_RECORDS.min(partition.end_record - next_record);
-        let buffer = uring_read_exact_at(
-            Rc::clone(&dispatcher),
-            fd,
-            record_offset(next_record),
-            chunk_records * RECORD_SIZE,
-        )?;
+        let buffer =
+            uring_read_exact_at(fd, record_offset(next_record), chunk_records * RECORD_SIZE)
+                .await?;
 
         for (chunk_idx, record_bytes) in buffer.chunks_exact(RECORD_SIZE).enumerate() {
             let record_idx = next_record + chunk_idx;
@@ -265,91 +251,35 @@ fn read_partition_entries_uring(
 }
 
 #[cfg(target_os = "linux")]
-fn write_index_file_uring(
-    dispatcher: sitas::os::SharedIoUringDispatcher,
-    path: &Path,
-    entries: &[IndexEntry],
-) -> io::Result<()> {
+async fn write_index_file_uring(path: &Path, entries: &[IndexEntry]) -> io::Result<()> {
     let file = File::create(path)?;
     let mut buffer = Vec::with_capacity(entries.len() * INDEX_ENTRY_SIZE);
     for entry in entries {
         encode_index_entry(*entry, &mut buffer);
     }
-    uring_write_all_at(dispatcher, file.as_raw_fd(), 0, buffer)?;
+    write_all_at_uring(file.as_raw_fd(), 0, buffer).await?;
 
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn uring_read_exact_at(
-    dispatcher: sitas::os::SharedIoUringDispatcher,
-    fd: RawFd,
-    offset: u64,
-    len: usize,
-) -> io::Result<Vec<u8>> {
+async fn uring_read_exact_at(fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut output = Vec::with_capacity(len);
 
     while output.len() < len {
         let read_offset = offset + output.len() as u64;
         let remaining = len - output.len();
-        let future =
-            IoUringReadFuture::queue(Rc::clone(&dispatcher), fd, vec![0; remaining], read_offset)?;
-        let completion = block_on_io_uring(Rc::clone(&dispatcher), future)?;
-        let read = uring_result_to_usize(completion.completion.result, "read")?;
-        if read == 0 {
+        let buffer = read_at_uring(fd, read_offset, vec![0; remaining]).await?;
+        if buffer.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "io_uring read returned EOF before the requested record was complete",
             ));
         }
-        output.extend_from_slice(&completion.buffer[..read]);
+        output.extend_from_slice(&buffer);
     }
 
     Ok(output)
-}
-
-#[cfg(target_os = "linux")]
-fn uring_write_all_at(
-    dispatcher: sitas::os::SharedIoUringDispatcher,
-    fd: RawFd,
-    offset: u64,
-    mut buffer: Vec<u8>,
-) -> io::Result<()> {
-    let mut write_offset = offset;
-
-    while !buffer.is_empty() {
-        let requested = buffer.len();
-        let future = IoUringWriteFuture::queue(Rc::clone(&dispatcher), fd, buffer, write_offset)?;
-        let completion = block_on_io_uring(Rc::clone(&dispatcher), future)?;
-        let bytes = uring_result_to_usize(completion.completion.result, "write")?;
-        if bytes == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "io_uring write accepted zero bytes",
-            ));
-        }
-        write_offset += bytes as u64;
-        if bytes >= requested {
-            buffer = Vec::new();
-        } else {
-            buffer = completion.buffer[bytes..].to_vec();
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn uring_result_to_usize(result: i32, operation: &str) -> io::Result<usize> {
-    if result < 0 {
-        return Err(io::Error::from_raw_os_error(-result));
-    }
-
-    usize::try_from(result).map_err(|_| {
-        io::Error::other(format!(
-            "io_uring {operation} completion result did not fit usize"
-        ))
-    })
 }
 
 fn create_data_file(path: &Path, record_count: usize, seed: u64) -> io::Result<()> {

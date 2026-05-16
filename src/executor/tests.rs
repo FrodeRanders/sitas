@@ -11,6 +11,10 @@ use super::{
     serve_tcp_until_stopped_scoped_timeout, serve_tcp_until_stopped_timeout, writable,
     write_all_async, write_all_timeout_async,
 };
+#[cfg(target_os = "linux")]
+use super::{read_at_uring, write_all_at_uring};
+#[cfg(target_os = "linux")]
+use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -314,6 +318,36 @@ fn sleep_delays_future_completion() {
     });
 
     assert!(started.elapsed() >= Duration::from_millis(10));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn io_uring_read_and_write_are_driven_by_executor_loop() -> io::Result<()> {
+    if crate::os::available_io_uring(8)?.is_none() {
+        return Ok(());
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "sitas-executor-uring-{}-{:?}.dat",
+        std::process::id(),
+        thread::current().id()
+    ));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+
+    let bytes = block_on(async {
+        write_all_at_uring(file.as_raw_fd(), 0, b"abcdef".to_vec()).await?;
+        read_at_uring(file.as_raw_fd(), 2, vec![0; 3]).await
+    })?;
+
+    assert_eq!(bytes, b"cde");
+    drop(file);
+    fs::remove_file(path)?;
+    Ok(())
 }
 
 #[test]
