@@ -30,6 +30,7 @@ mod io_interest;
 mod join;
 mod scheduler;
 mod scope;
+mod snapshot;
 mod sync;
 mod task;
 mod task_set;

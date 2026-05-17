@@ -14,10 +14,11 @@ use crate::os::OsWaker;
 use super::counters::SchedulerCounters;
 #[cfg(unix)]
 use super::io_interest::ReadinessInterests;
+use super::snapshot::{ExecutorSnapshotParts, build_executor_snapshot};
 use super::task::{Task, set_current_task_waiting_for};
 use super::task_set::SchedulerTaskSet;
 use super::timer::TimerSet;
-use super::{ExecutorSnapshot, READY_POLL_BUDGET, SpawnError, TaskId, TaskWait};
+use super::{ExecutorSnapshot, SpawnError, TaskId, TaskWait};
 
 thread_local! {
     static CURRENT_SCHEDULER: RefCell<Option<Arc<Scheduler>>> = const { RefCell::new(None) };
@@ -147,54 +148,22 @@ impl Scheduler {
     }
 
     pub(super) fn snapshot(&self) -> ExecutorSnapshot {
-        let state = self.state.lock().expect("scheduler state mutex poisoned");
-        let task_set = state.tasks.snapshot();
-        let timer_count = state.timers.len();
-        let counters = state.counters;
-        #[cfg(unix)]
-        let read_interest_count = state.io_interests.read_len();
-        #[cfg(unix)]
-        let write_interest_count = state.io_interests.write_len();
-        #[cfg(target_os = "linux")]
-        let io_uring = state.io_uring;
-        let tasks = task_set.tasks;
-        drop(state);
+        let parts = {
+            let state = self.state.lock().expect("scheduler state mutex poisoned");
+            ExecutorSnapshotParts {
+                tasks: state.tasks.snapshot(),
+                timer_count: state.timers.len(),
+                counters: state.counters,
+                #[cfg(unix)]
+                read_interest_count: state.io_interests.read_len(),
+                #[cfg(unix)]
+                write_interest_count: state.io_interests.write_len(),
+                #[cfg(target_os = "linux")]
+                io_uring: state.io_uring,
+            }
+        };
 
-        let mut tasks = tasks
-            .into_iter()
-            .filter_map(|task| task.upgrade())
-            .map(|task| task.snapshot())
-            .collect::<Vec<_>>();
-        tasks.sort_by_key(|task| task.id);
-
-        ExecutorSnapshot {
-            accepting: task_set.accepting,
-            spawner_count: task_set.spawner_count,
-            task_count: task_set.task_count,
-            ready_queue_len: task_set.ready_queue_len,
-            timer_count,
-            #[cfg(unix)]
-            read_interest_count,
-            #[cfg(unix)]
-            write_interest_count,
-            #[cfg(target_os = "linux")]
-            io_uring,
-            ready_poll_budget: READY_POLL_BUDGET,
-            total_spawned_tasks: counters.total_spawned_tasks,
-            total_completed_tasks: counters.total_completed_tasks,
-            total_task_polls: counters.total_task_polls,
-            ready_poll_budget_exhaustions: counters.ready_poll_budget_exhaustions,
-            total_driver_events: counters.total_driver_events,
-            #[cfg(unix)]
-            total_readiness_events: counters.total_readiness_events,
-            #[cfg(unix)]
-            total_readable_events: counters.total_readable_events,
-            #[cfg(unix)]
-            total_writable_events: counters.total_writable_events,
-            #[cfg(target_os = "linux")]
-            total_completion_events: counters.total_completion_events,
-            tasks,
-        }
+        build_executor_snapshot(parts)
     }
 
     pub(super) fn finish_task(&self) {
