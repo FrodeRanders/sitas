@@ -26,13 +26,13 @@ thread_local! {
 
 #[derive(Debug)]
 pub(super) struct Scheduler {
-    pub(super) state: Mutex<SchedulerState>,
+    state: Mutex<SchedulerState>,
     #[cfg(unix)]
     waker: OsWaker,
 }
 
 #[derive(Debug)]
-pub(super) struct SchedulerState {
+struct SchedulerState {
     tasks: SchedulerTaskSet,
     pub(super) timers: TimerSet,
     #[cfg(unix)]

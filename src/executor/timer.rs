@@ -36,11 +36,6 @@ impl TimerSet {
         self.timers.len()
     }
 
-    #[cfg(test)]
-    pub(super) fn is_empty(&self) -> bool {
-        self.timers.is_empty()
-    }
-
     pub(super) fn register(&mut self, id: usize, deadline: Instant, waker: Waker) -> bool {
         let previous_next = self.next_deadline();
 

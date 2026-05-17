@@ -469,15 +469,7 @@ fn timeout_drops_inner_sleep_timer() {
     executor.run();
 
     assert_eq!(*output.lock().unwrap(), Some(Err(TimeoutError)));
-    assert!(
-        executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .timers
-            .is_empty()
-    );
+    assert_eq!(executor.scheduler.snapshot().timer_count, 0);
 }
 
 #[test]
@@ -545,15 +537,7 @@ fn race_drops_losing_sleep_timer() {
     executor.run();
 
     assert_eq!(*output.lock().unwrap(), Some(RaceOutput::First("fast")));
-    assert!(
-        executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .timers
-            .is_empty()
-    );
+    assert_eq!(executor.scheduler.snapshot().timer_count, 0);
 }
 
 #[test]
@@ -781,15 +765,7 @@ fn aborted_join_handle_returns_cancelled() {
     executor.run();
 
     assert_eq!(*result.lock().unwrap(), Some((true, true)));
-    assert!(
-        executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .timers
-            .is_empty()
-    );
+    assert_eq!(executor.scheduler.snapshot().timer_count, 0);
 }
 
 #[test]
@@ -2068,15 +2044,7 @@ fn dropping_executor_cancels_pending_sleep_task() {
         .unwrap();
 
     executor.poll_ready_tasks();
-    assert!(
-        !executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .timers
-            .is_empty()
-    );
+    assert!(executor.scheduler.snapshot().timer_count > 0);
 
     drop(executor);
 
