@@ -24,6 +24,8 @@ use crate::os::OsReactor;
 
 mod driver;
 mod future;
+#[cfg(unix)]
+mod io_interest;
 mod join;
 mod scheduler;
 mod scope;
