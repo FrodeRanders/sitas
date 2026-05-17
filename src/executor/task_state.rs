@@ -171,3 +171,148 @@ impl TaskState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn boxed_future() -> BoxFuture {
+        Box::pin(async {})
+    }
+
+    fn task_snapshot(state: &TaskState) -> TaskSnapshot {
+        state.snapshot(TaskId(7), Some("task".to_string()), Instant::now())
+    }
+
+    #[test]
+    fn new_task_state_starts_waiting_with_future() {
+        let state = TaskState::new(boxed_future(), None);
+        let snapshot = task_snapshot(&state);
+
+        assert_eq!(snapshot.id, TaskId(7));
+        assert_eq!(snapshot.name.as_deref(), Some("task"));
+        assert_eq!(snapshot.status, TaskStatus::Waiting);
+        assert_eq!(snapshot.waiting_for, None);
+        assert_eq!(snapshot.poll_count, 0);
+    }
+
+    #[test]
+    fn queued_state_records_schedule_time_once_until_polled() {
+        let mut state = TaskState::new(boxed_future(), None);
+        let scheduled_at = Instant::now();
+
+        assert!(state.mark_queued(scheduled_at));
+        assert!(!state.mark_queued(scheduled_at));
+
+        let snapshot = task_snapshot(&state);
+        assert_eq!(snapshot.status, TaskStatus::Queued);
+        assert_eq!(snapshot.last_scheduled_at, Some(scheduled_at));
+    }
+
+    #[test]
+    fn polling_state_tracks_wait_interest_and_pending_snapshot() {
+        let mut state = TaskState::new(boxed_future(), None);
+        let poll_started_at = Instant::now();
+        let future = state
+            .take_future_for_poll(poll_started_at)
+            .expect("future should be available");
+        let deadline = poll_started_at + Duration::from_millis(10);
+
+        state.set_waiting_for(TaskWait::Timer { deadline });
+        let snapshot = task_snapshot(&state);
+        assert_eq!(snapshot.status, TaskStatus::Polling);
+        assert_eq!(snapshot.waiting_for, Some(TaskWait::Timer { deadline }));
+        assert_eq!(snapshot.poll_count, 1);
+        assert_eq!(snapshot.last_poll_started_at, Some(poll_started_at));
+
+        let poll_finished_at = poll_started_at + Duration::from_millis(1);
+        assert!(!state.finish_pending(
+            future,
+            poll_finished_at.duration_since(poll_started_at),
+            poll_finished_at
+        ));
+
+        let snapshot = task_snapshot(&state);
+        assert_eq!(snapshot.status, TaskStatus::Waiting);
+        assert_eq!(snapshot.waiting_for, Some(TaskWait::Timer { deadline }));
+        assert_eq!(snapshot.last_poll_finished_at, Some(poll_finished_at));
+    }
+
+    #[test]
+    fn pending_without_wait_interest_records_unknown_wait() {
+        let mut state = TaskState::new(boxed_future(), None);
+        let poll_started_at = Instant::now();
+        let future = state
+            .take_future_for_poll(poll_started_at)
+            .expect("future should be available");
+        let poll_finished_at = poll_started_at + Duration::from_millis(1);
+
+        assert!(!state.finish_pending(
+            future,
+            poll_finished_at.duration_since(poll_started_at),
+            poll_finished_at
+        ));
+
+        assert_eq!(task_snapshot(&state).waiting_for, Some(TaskWait::Unknown));
+    }
+
+    #[test]
+    fn cancellation_while_polling_finishes_after_pending_result() {
+        let mut state = TaskState::new(boxed_future(), None);
+        let poll_started_at = Instant::now();
+        let future = state
+            .take_future_for_poll(poll_started_at)
+            .expect("future should be available");
+
+        assert_eq!(state.cancel(), Some(false));
+
+        let poll_finished_at = poll_started_at + Duration::from_millis(1);
+        assert!(state.finish_pending(
+            future,
+            poll_finished_at.duration_since(poll_started_at),
+            poll_finished_at
+        ));
+
+        let snapshot = task_snapshot(&state);
+        assert_eq!(snapshot.status, TaskStatus::Cancelled);
+        assert_eq!(snapshot.waiting_for, None);
+    }
+
+    #[test]
+    fn cancellation_before_polling_drops_future_immediately() {
+        let mut state = TaskState::new(boxed_future(), None);
+
+        assert_eq!(state.cancel(), Some(true));
+        assert_eq!(state.cancel(), None);
+        assert!(state.take_future_for_poll(Instant::now()).is_none());
+        assert_eq!(task_snapshot(&state).status, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn ready_and_panicked_states_complete_task() {
+        let mut ready = TaskState::new(boxed_future(), None);
+        let started = Instant::now();
+        let _future = ready
+            .take_future_for_poll(started)
+            .expect("future should be available");
+        let finished = started + Duration::from_millis(1);
+        ready.finish_ready(finished.duration_since(started), finished);
+        assert_eq!(task_snapshot(&ready).status, TaskStatus::Completed);
+
+        let mut panicked = TaskState::new(boxed_future(), Some(Box::new(|_| {})));
+        let _future = panicked
+            .take_future_for_poll(started)
+            .expect("future should be available");
+        assert!(
+            panicked
+                .finish_panicked(finished.duration_since(started), finished)
+                .is_some()
+        );
+        assert_eq!(task_snapshot(&panicked).status, TaskStatus::Completed);
+        assert!(
+            panicked
+                .finish_panicked(finished.duration_since(started), finished)
+                .is_none()
+        );
+    }
+}
