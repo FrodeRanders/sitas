@@ -35,6 +35,7 @@ mod snapshot;
 mod sync;
 mod task;
 mod task_set;
+mod task_state;
 #[cfg(unix)]
 mod tcp;
 mod timer;
