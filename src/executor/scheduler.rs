@@ -39,7 +39,6 @@ pub(super) struct SchedulerState {
     #[cfg(target_os = "linux")]
     io_uring: Option<IoUringDispatcherSnapshot>,
     counters: SchedulerCounters,
-    next_timer_id: usize,
 }
 
 impl Scheduler {
@@ -53,7 +52,6 @@ impl Scheduler {
                 #[cfg(target_os = "linux")]
                 io_uring: None,
                 counters: SchedulerCounters::default(),
-                next_timer_id: 0,
             }),
             #[cfg(unix)]
             waker,
@@ -241,9 +239,7 @@ impl Scheduler {
 
     pub(super) fn allocate_timer_id(&self) -> usize {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        let id = state.next_timer_id;
-        state.next_timer_id = state.next_timer_id.wrapping_add(1);
-        id
+        state.timers.allocate_id()
     }
 
     pub(super) fn register_timer(&self, id: usize, deadline: Instant, waker: Waker) {

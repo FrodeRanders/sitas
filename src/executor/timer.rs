@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub(super) struct TimerSet {
     timers: Vec<TimerEntry>,
+    next_id: usize,
 }
 
 #[derive(Debug)]
@@ -15,11 +16,20 @@ struct TimerEntry {
 
 impl TimerSet {
     pub(super) fn new() -> Self {
-        Self { timers: Vec::new() }
+        Self {
+            timers: Vec::new(),
+            next_id: 0,
+        }
     }
 
     pub(super) fn clear(&mut self) {
         self.timers.clear();
+    }
+
+    pub(super) fn allocate_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
     }
 
     pub(super) fn len(&self) -> usize {
