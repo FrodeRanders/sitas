@@ -14,7 +14,7 @@ use std::os::unix::io::RawFd;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -29,6 +29,7 @@ mod future;
 #[cfg(unix)]
 mod io_interest;
 mod join;
+mod root;
 mod scheduler;
 mod scope;
 mod snapshot;
@@ -50,6 +51,7 @@ pub use future::{
 };
 pub use join::{JoinError, JoinHandle};
 use join::{JoinState, complete_join};
+use root::RootWaker;
 use scheduler::Scheduler;
 pub use scope::{TaskScope, TaskScopeError};
 pub use sync::{Notified, Notify, StopSource, StopToken, stop_pair};
@@ -391,10 +393,7 @@ impl Executor {
         self.refresh_io_uring_snapshot();
 
         loop {
-            self.poll_ready_tasks();
-
-            self.scheduler.wake_expired_timers();
-            driver::dispatch_available(&self.scheduler);
+            self.drive_ready_work();
 
             if self.scheduler.is_drained() {
                 break;
@@ -404,10 +403,7 @@ impl Executor {
                 continue;
             }
 
-            let event = self.wait_for_driver_event("running executor");
-            driver::apply_event(&self.scheduler, event);
-
-            self.scheduler.wake_expired_timers();
+            self.wait_for_idle_driver_event("running executor");
         }
     }
 
@@ -440,20 +436,26 @@ impl Executor {
                 }
             }
 
-            self.poll_ready_tasks();
-
-            self.scheduler.wake_expired_timers();
-            driver::dispatch_available(&self.scheduler);
+            self.drive_ready_work();
 
             if root.is_ready() || self.scheduler.has_ready_tasks() {
                 continue;
             }
 
-            let event = self.wait_for_driver_event("running root future");
-            driver::apply_event(&self.scheduler, event);
-
-            self.scheduler.wake_expired_timers();
+            self.wait_for_idle_driver_event("running root future");
         }
+    }
+
+    fn drive_ready_work(&self) {
+        self.poll_ready_tasks();
+        self.scheduler.wake_expired_timers();
+        driver::dispatch_available(&self.scheduler);
+    }
+
+    fn wait_for_idle_driver_event(&self, context: &str) {
+        let event = self.wait_for_driver_event(context);
+        driver::apply_event(&self.scheduler, event);
+        self.scheduler.wake_expired_timers();
     }
 
     fn poll_ready_tasks(&self) {
@@ -508,52 +510,6 @@ impl Drop for IoUringScope {
 impl Drop for Executor {
     fn drop(&mut self) {
         self.scheduler.close();
-    }
-}
-
-struct RootWaker {
-    ready: Mutex<bool>,
-    scheduler: Arc<Scheduler>,
-}
-
-impl RootWaker {
-    fn new(scheduler: Arc<Scheduler>) -> Self {
-        Self {
-            ready: Mutex::new(true),
-            scheduler,
-        }
-    }
-
-    fn take_ready(&self) -> bool {
-        let mut ready = self.ready.lock().expect("root waker mutex poisoned");
-        let was_ready = *ready;
-        *ready = false;
-        was_ready
-    }
-
-    fn is_ready(&self) -> bool {
-        *self.ready.lock().expect("root waker mutex poisoned")
-    }
-
-    fn mark_ready(&self) {
-        *self.ready.lock().expect("root waker mutex poisoned") = true;
-        self.scheduler.wake_reactor();
-    }
-}
-
-impl fmt::Debug for RootWaker {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RootWaker").finish_non_exhaustive()
-    }
-}
-
-impl Wake for RootWaker {
-    fn wake(self: Arc<Self>) {
-        self.mark_ready();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.mark_ready();
     }
 }
 
