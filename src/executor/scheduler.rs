@@ -15,6 +15,7 @@ use crate::os::OsWaker;
 #[cfg(unix)]
 use super::io_interest::InterestSet;
 use super::task::{Task, set_current_task_waiting_for};
+use super::timer::TimerSet;
 use super::{ExecutorSnapshot, READY_POLL_BUDGET, SpawnError, TaskId, TaskWait};
 
 thread_local! {
@@ -32,7 +33,7 @@ pub(super) struct Scheduler {
 pub(super) struct SchedulerState {
     pub(super) queue: VecDeque<Arc<Task>>,
     pub(super) tasks: Vec<Weak<Task>>,
-    pub(super) timers: Vec<TimerEntry>,
+    pub(super) timers: TimerSet,
     #[cfg(unix)]
     pub(super) read_interests: InterestSet,
     #[cfg(unix)]
@@ -59,20 +60,13 @@ pub(super) struct SchedulerState {
     next_timer_id: usize,
 }
 
-#[derive(Debug)]
-pub(super) struct TimerEntry {
-    id: usize,
-    deadline: Instant,
-    waker: Waker,
-}
-
 impl Scheduler {
     pub(super) fn new(#[cfg(unix)] waker: OsWaker) -> Self {
         Self {
             state: Mutex::new(SchedulerState {
                 queue: VecDeque::new(),
                 tasks: Vec::new(),
-                timers: Vec::new(),
+                timers: TimerSet::new(),
                 #[cfg(unix)]
                 read_interests: InterestSet::new(),
                 #[cfg(unix)]
@@ -339,21 +333,7 @@ impl Scheduler {
         set_current_task_waiting_for(TaskWait::Timer { deadline });
         let should_wake = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            let previous_next = next_timer_deadline(&state.timers);
-
-            match state.timers.iter_mut().find(|timer| timer.id == id) {
-                Some(timer) => {
-                    timer.deadline = deadline;
-                    timer.waker = waker;
-                }
-                None => state.timers.push(TimerEntry {
-                    id,
-                    deadline,
-                    waker,
-                }),
-            }
-
-            previous_next.is_none_or(|previous| deadline < previous)
+            state.timers.register(id, deadline, waker)
         };
 
         if should_wake {
@@ -363,26 +343,13 @@ impl Scheduler {
 
     pub(super) fn remove_timer(&self, id: usize) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.timers.retain(|timer| timer.id != id);
+        state.timers.remove(id);
     }
 
     pub(super) fn wake_expired_timers(&self) {
         let expired = {
-            let now = Instant::now();
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            let mut expired = Vec::new();
-            let mut pending = Vec::with_capacity(state.timers.len());
-
-            for timer in state.timers.drain(..) {
-                if timer.deadline <= now {
-                    expired.push(timer.waker);
-                } else {
-                    pending.push(timer);
-                }
-            }
-
-            state.timers = pending;
-            expired
+            state.timers.expired(Instant::now())
         };
 
         for waker in expired {
@@ -392,8 +359,7 @@ impl Scheduler {
 
     pub(super) fn time_until_next_timer(&self) -> Option<Duration> {
         let state = self.state.lock().expect("scheduler state mutex poisoned");
-        let deadline = next_timer_deadline(&state.timers)?;
-        Some(deadline.saturating_duration_since(Instant::now()))
+        state.timers.time_until_next(Instant::now())
     }
 
     #[cfg(unix)]
@@ -494,10 +460,6 @@ impl Scheduler {
         #[cfg(unix)]
         let _ = self.waker.wake();
     }
-}
-
-fn next_timer_deadline(timers: &[TimerEntry]) -> Option<Instant> {
-    timers.iter().map(|timer| timer.deadline).min()
 }
 
 pub(super) fn current_scheduler() -> Arc<Scheduler> {

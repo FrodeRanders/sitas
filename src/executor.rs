@@ -33,6 +33,7 @@ mod sync;
 mod task;
 #[cfg(unix)]
 mod tcp;
+mod timer;
 #[cfg(unix)]
 mod unix_io;
 #[cfg(target_os = "linux")]
