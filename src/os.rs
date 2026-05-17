@@ -911,6 +911,51 @@ mod tests {
         assert!(event.writable.is_empty());
     }
 
+    #[test]
+    fn wait_readable_replaces_previous_writable_interest_on_same_fd() {
+        let reactor = OsReactor::new().unwrap();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let fd = stream.as_raw_fd();
+
+        let event = reactor
+            .wait_writable(&[fd], Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(event.writable, vec![fd]);
+
+        peer.write_all(b"x").unwrap();
+
+        let event = reactor
+            .wait_readable(&[fd], Some(Duration::from_secs(1)))
+            .unwrap();
+
+        assert_eq!(event.readable, vec![fd]);
+        assert!(event.writable.is_empty());
+    }
+
+    #[test]
+    fn wait_writable_replaces_previous_readable_interest_on_same_fd() {
+        let reactor = OsReactor::new().unwrap();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let fd = stream.as_raw_fd();
+
+        peer.write_all(b"x").unwrap();
+
+        let event = reactor
+            .wait_io(&[fd], &[fd], Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(event.readable, vec![fd]);
+        assert_eq!(event.writable, vec![fd]);
+
+        let event = reactor
+            .wait_writable(&[fd], Some(Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(event.readable.is_empty());
+        assert_eq!(event.writable, vec![fd]);
+    }
+
     #[cfg(any(
         target_os = "linux",
         all(
