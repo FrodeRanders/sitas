@@ -13,6 +13,7 @@ const EPOLLERR: u32 = 0x0008;
 const EPOLLHUP: u32 = 0x0010;
 const EPOLL_CTL_ADD: c_int = 1;
 const EPOLL_CTL_DEL: c_int = 2;
+const EPOLL_CTL_MOD: c_int = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -64,8 +65,7 @@ impl EpollBackend {
     {
         let timeout_ms = timeout_to_wait_ms(timeout);
         let interests = EpollInterests::new(read_fds, write_fds);
-        let registration =
-            register_epoll_interests(self.epoll_fd.raw(), &self.registry, &interests)?;
+        reconcile_epoll_interests(self.epoll_fd.raw(), &self.registry, &interests)?;
 
         loop {
             let max_events = interests.len() + 1;
@@ -92,7 +92,7 @@ impl EpollBackend {
                         woke = event.events & EPOLLIN != 0 && drain_wakes()?;
                         continue;
                     }
-                    let interest = registration
+                    let interest = self
                         .interest(event.data)
                         .expect("epoll returned an unknown interest index");
                     if interest.read && event.events & (EPOLLIN | EPOLLERR | EPOLLHUP) != 0 {
@@ -116,9 +116,16 @@ impl EpollBackend {
             return Err(error);
         }
     }
+
+    fn interest(&self, token: u64) -> Option<EpollInterest> {
+        self.registry
+            .lock()
+            .expect("epoll registry mutex poisoned")
+            .get(token)
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EpollInterest {
     fd: RawFd,
     read: bool,
@@ -164,6 +171,10 @@ impl EpollInterests {
     fn len(&self) -> usize {
         self.interests.len()
     }
+
+    fn contains_fd(&self, fd: RawFd) -> bool {
+        self.interests.iter().any(|interest| interest.fd == fd)
+    }
 }
 
 fn add_epoll_interest(interests: &mut Vec<EpollInterest>, fd: RawFd, read: bool, write: bool) {
@@ -178,19 +189,21 @@ fn add_epoll_interest(interests: &mut Vec<EpollInterest>, fd: RawFd, read: bool,
 #[derive(Debug)]
 struct EpollRegistry {
     next_token: u64,
-    interests: HashMap<u64, EpollInterest>,
+    by_token: HashMap<u64, EpollInterest>,
+    by_fd: HashMap<RawFd, u64>,
 }
 
 impl EpollRegistry {
     fn new() -> Self {
         Self {
             next_token: 1,
-            interests: HashMap::new(),
+            by_token: HashMap::new(),
+            by_fd: HashMap::new(),
         }
     }
 
     fn insert_wake(&mut self, fd: RawFd) {
-        self.interests.insert(
+        self.by_token.insert(
             0,
             EpollInterest {
                 fd,
@@ -200,89 +213,71 @@ impl EpollRegistry {
         );
     }
 
-    fn insert_temporary(&mut self, interest: EpollInterest) -> u64 {
+    fn allocate_token(&mut self) -> u64 {
         let token = self.next_token;
         self.next_token += 1;
-        self.interests.insert(token, interest);
         token
     }
 
-    fn remove(&mut self, token: u64) -> Option<EpollInterest> {
-        self.interests.remove(&token)
+    fn insert(&mut self, token: u64, interest: EpollInterest) {
+        self.by_fd.insert(interest.fd, token);
+        self.by_token.insert(token, interest);
+    }
+
+    fn update(&mut self, token: u64, interest: EpollInterest) {
+        self.by_token.insert(token, interest);
+    }
+
+    fn remove_fd(&mut self, fd: RawFd) -> Option<EpollInterest> {
+        let token = self.by_fd.remove(&fd)?;
+        self.by_token.remove(&token)
+    }
+
+    fn token_for_fd(&self, fd: RawFd) -> Option<u64> {
+        self.by_fd.get(&fd).copied()
     }
 
     fn get(&self, token: u64) -> Option<EpollInterest> {
-        self.interests.get(&token).copied()
+        self.by_token.get(&token).copied()
+    }
+
+    fn interest_fds(&self) -> Vec<RawFd> {
+        self.by_fd.keys().copied().collect()
     }
 }
 
-struct EpollRegistration<'a> {
+fn reconcile_epoll_interests(
     epoll_fd: RawFd,
-    registry: &'a Mutex<EpollRegistry>,
-    tokens: Vec<u64>,
-}
+    registry: &Mutex<EpollRegistry>,
+    interests: &EpollInterests,
+) -> io::Result<()> {
+    let mut registry = registry.lock().expect("epoll registry mutex poisoned");
+    let stale_fds: Vec<_> = registry
+        .interest_fds()
+        .into_iter()
+        .filter(|fd| !interests.contains_fd(*fd))
+        .collect();
 
-impl Drop for EpollRegistration<'_> {
-    fn drop(&mut self) {
-        let mut registry = self.registry.lock().expect("epoll registry mutex poisoned");
-
-        for token in self.tokens.drain(..) {
-            let Some(interest) = registry.remove(token) else {
-                continue;
-            };
-            // SAFETY: `epoll_fd` is owned by the reactor and `fd` was
-            // previously registered by this guard. The event pointer is unused
-            // for `EPOLL_CTL_DEL` on Linux.
-            let _ = unsafe {
-                epoll_ctl(
-                    self.epoll_fd,
-                    EPOLL_CTL_DEL,
-                    interest.fd,
-                    std::ptr::null_mut::<EpollEvent>(),
-                )
-            };
+    for fd in stale_fds {
+        if registry.remove_fd(fd).is_some() {
+            let _ = delete_epoll_fd(epoll_fd, fd);
         }
     }
-}
-
-impl EpollRegistration<'_> {
-    fn interest(&self, token: u64) -> Option<EpollInterest> {
-        self.registry
-            .lock()
-            .expect("epoll registry mutex poisoned")
-            .get(token)
-    }
-}
-
-fn register_epoll_interests<'a>(
-    epoll_fd: RawFd,
-    registry: &'a Mutex<EpollRegistry>,
-    interests: &EpollInterests,
-) -> io::Result<EpollRegistration<'a>> {
-    let mut registration = EpollRegistration {
-        epoll_fd,
-        registry,
-        tokens: Vec::with_capacity(interests.len()),
-    };
 
     for interest in interests.iter().copied() {
-        let token = {
-            let mut registry = registry.lock().expect("epoll registry mutex poisoned");
-            registry.insert_temporary(interest)
-        };
-
-        if let Err(error) = register_epoll_fd(epoll_fd, interest.fd, interest.events(), token) {
-            registry
-                .lock()
-                .expect("epoll registry mutex poisoned")
-                .remove(token);
-            return Err(error);
+        if let Some(token) = registry.token_for_fd(interest.fd) {
+            if registry.get(token) != Some(interest) {
+                modify_epoll_fd(epoll_fd, interest.fd, interest.events(), token)?;
+                registry.update(token, interest);
+            }
+        } else {
+            let token = registry.allocate_token();
+            register_epoll_fd(epoll_fd, interest.fd, interest.events(), token)?;
+            registry.insert(token, interest);
         }
-
-        registration.tokens.push(token);
     }
 
-    Ok(registration)
+    Ok(())
 }
 
 fn create_epoll() -> io::Result<OwnedFd> {
@@ -297,12 +292,38 @@ fn create_epoll() -> io::Result<OwnedFd> {
 }
 
 fn register_epoll_fd(epoll_fd: RawFd, fd: RawFd, events: u32, data: u64) -> io::Result<()> {
+    control_epoll_fd(epoll_fd, EPOLL_CTL_ADD, fd, events, data)
+}
+
+fn modify_epoll_fd(epoll_fd: RawFd, fd: RawFd, events: u32, data: u64) -> io::Result<()> {
+    control_epoll_fd(epoll_fd, EPOLL_CTL_MOD, fd, events, data)
+}
+
+fn delete_epoll_fd(epoll_fd: RawFd, fd: RawFd) -> io::Result<()> {
+    // SAFETY: `epoll_fd` is owned by the reactor and `fd` was previously
+    // registered by this backend. The event pointer is unused for
+    // `EPOLL_CTL_DEL` on Linux.
+    let result = unsafe { epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
+    if result < 0 {
+        Err(last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn control_epoll_fd(
+    epoll_fd: RawFd,
+    op: c_int,
+    fd: RawFd,
+    events: u32,
+    data: u64,
+) -> io::Result<()> {
     let mut event = EpollEvent { events, data };
 
     // SAFETY: `epoll_fd` is an open epoll descriptor, `fd` is borrowed for
     // readiness observation, and `event` points to an initialized event value
     // for the duration of the call.
-    let result = unsafe { epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &mut event) };
+    let result = unsafe { epoll_ctl(epoll_fd, op, fd, &mut event) };
     if result < 0 {
         Err(last_os_error())
     } else {

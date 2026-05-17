@@ -83,8 +83,7 @@ impl KqueueBackend {
             timeout as *const Timespec
         });
         let interests = KqueueInterests::new(read_fds, write_fds);
-        let registration =
-            register_kqueue_interests(self.kqueue_fd.raw(), &self.registry, &interests)?;
+        reconcile_kqueue_interests(self.kqueue_fd.raw(), &self.registry, &interests)?;
 
         loop {
             let max_events = interests.len() + 1;
@@ -114,7 +113,7 @@ impl KqueueBackend {
                         woke = drain_wakes()?;
                         continue;
                     }
-                    let interest = registration
+                    let interest = self
                         .interest(token)
                         .expect("kqueue returned an unknown interest token");
                     if interest.read && event.filter == EVFILT_READ && event.flags & EV_ERROR == 0 {
@@ -147,9 +146,16 @@ impl KqueueBackend {
             return Err(error);
         }
     }
+
+    fn interest(&self, token: u64) -> Option<KqueueInterest> {
+        self.registry
+            .lock()
+            .expect("kqueue registry mutex poisoned")
+            .get(token)
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KqueueInterest {
     fd: RawFd,
     read: bool,
@@ -182,6 +188,10 @@ impl KqueueInterests {
     fn len(&self) -> usize {
         self.interests.len()
     }
+
+    fn contains_fd(&self, fd: RawFd) -> bool {
+        self.interests.iter().any(|interest| interest.fd == fd)
+    }
 }
 
 fn add_kqueue_interest(interests: &mut Vec<KqueueInterest>, fd: RawFd, read: bool, write: bool) {
@@ -196,19 +206,21 @@ fn add_kqueue_interest(interests: &mut Vec<KqueueInterest>, fd: RawFd, read: boo
 #[derive(Debug)]
 struct KqueueRegistry {
     next_token: u64,
-    interests: HashMap<u64, KqueueInterest>,
+    by_token: HashMap<u64, KqueueInterest>,
+    by_fd: HashMap<RawFd, u64>,
 }
 
 impl KqueueRegistry {
     fn new() -> Self {
         Self {
             next_token: 1,
-            interests: HashMap::new(),
+            by_token: HashMap::new(),
+            by_fd: HashMap::new(),
         }
     }
 
     fn insert_wake(&mut self, fd: RawFd) {
-        self.interests.insert(
+        self.by_token.insert(
             0,
             KqueueInterest {
                 fd,
@@ -218,90 +230,76 @@ impl KqueueRegistry {
         );
     }
 
-    fn insert_temporary(&mut self, interest: KqueueInterest) -> u64 {
+    fn allocate_token(&mut self) -> u64 {
         let token = self.next_token;
         self.next_token += 1;
-        self.interests.insert(token, interest);
         token
     }
 
-    fn remove(&mut self, token: u64) -> Option<KqueueInterest> {
-        self.interests.remove(&token)
+    fn insert(&mut self, token: u64, interest: KqueueInterest) {
+        self.by_fd.insert(interest.fd, token);
+        self.by_token.insert(token, interest);
+    }
+
+    fn update(&mut self, token: u64, interest: KqueueInterest) {
+        self.by_token.insert(token, interest);
+    }
+
+    fn remove_fd(&mut self, fd: RawFd) -> Option<KqueueInterest> {
+        let token = self.by_fd.remove(&fd)?;
+        self.by_token.remove(&token)
+    }
+
+    fn token_for_fd(&self, fd: RawFd) -> Option<u64> {
+        self.by_fd.get(&fd).copied()
     }
 
     fn get(&self, token: u64) -> Option<KqueueInterest> {
-        self.interests.get(&token).copied()
+        self.by_token.get(&token).copied()
+    }
+
+    fn interest_fds(&self) -> Vec<RawFd> {
+        self.by_fd.keys().copied().collect()
     }
 }
 
-struct KqueueRegistration<'a> {
+fn reconcile_kqueue_interests(
     kqueue_fd: RawFd,
-    registry: &'a Mutex<KqueueRegistry>,
-    tokens: Vec<u64>,
-}
+    registry: &Mutex<KqueueRegistry>,
+    interests: &KqueueInterests,
+) -> io::Result<()> {
+    let mut registry = registry.lock().expect("kqueue registry mutex poisoned");
+    let stale_fds: Vec<_> = registry
+        .interest_fds()
+        .into_iter()
+        .filter(|fd| !interests.contains_fd(*fd))
+        .collect();
 
-impl Drop for KqueueRegistration<'_> {
-    fn drop(&mut self) {
-        let mut registry = self
-            .registry
-            .lock()
-            .expect("kqueue registry mutex poisoned");
-
-        for token in self.tokens.drain(..) {
-            let Some(interest) = registry.remove(token) else {
-                continue;
-            };
-            if interest.read {
-                let _ = delete_kqueue_fd(self.kqueue_fd, interest.fd, EVFILT_READ);
-            }
-            if interest.write {
-                let _ = delete_kqueue_fd(self.kqueue_fd, interest.fd, EVFILT_WRITE);
-            }
+    for fd in stale_fds {
+        if let Some(interest) = registry.remove_fd(fd) {
+            unregister_kqueue_interest(kqueue_fd, interest);
         }
     }
-}
-
-impl KqueueRegistration<'_> {
-    fn interest(&self, token: u64) -> Option<KqueueInterest> {
-        self.registry
-            .lock()
-            .expect("kqueue registry mutex poisoned")
-            .get(token)
-    }
-}
-
-fn register_kqueue_interests<'a>(
-    kqueue_fd: RawFd,
-    registry: &'a Mutex<KqueueRegistry>,
-    interests: &KqueueInterests,
-) -> io::Result<KqueueRegistration<'a>> {
-    let mut registration = KqueueRegistration {
-        kqueue_fd,
-        registry,
-        tokens: Vec::with_capacity(interests.len()),
-    };
 
     for interest in interests.iter().copied() {
-        let token = {
-            let mut registry = registry.lock().expect("kqueue registry mutex poisoned");
-            registry.insert_temporary(interest)
-        };
-
-        if let Err(error) = register_temporary_kqueue_interest(kqueue_fd, interest, token) {
-            registry
-                .lock()
-                .expect("kqueue registry mutex poisoned")
-                .remove(token);
-            return Err(error);
+        if let Some(token) = registry.token_for_fd(interest.fd) {
+            if let Some(previous) = registry.get(token)
+                && previous != interest
+            {
+                update_kqueue_interest(kqueue_fd, previous, interest, token)?;
+                registry.update(token, interest);
+            }
+        } else {
+            let token = registry.allocate_token();
+            register_kqueue_interest(kqueue_fd, interest, token)?;
+            registry.insert(token, interest);
         }
-
-        registration.tokens.push(token);
     }
 
-    Ok(registration)
+    Ok(())
 }
 
-fn register_temporary_kqueue_interest(
+fn register_kqueue_interest(
     kqueue_fd: RawFd,
     interest: KqueueInterest,
     token: u64,
@@ -313,6 +311,36 @@ fn register_temporary_kqueue_interest(
         register_kqueue_fd(kqueue_fd, interest.fd, EVFILT_WRITE, token)?;
     }
     Ok(())
+}
+
+fn update_kqueue_interest(
+    kqueue_fd: RawFd,
+    previous: KqueueInterest,
+    next: KqueueInterest,
+    token: u64,
+) -> io::Result<()> {
+    if previous.read && !next.read {
+        let _ = delete_kqueue_fd(kqueue_fd, previous.fd, EVFILT_READ);
+    }
+    if previous.write && !next.write {
+        let _ = delete_kqueue_fd(kqueue_fd, previous.fd, EVFILT_WRITE);
+    }
+    if !previous.read && next.read {
+        register_kqueue_fd(kqueue_fd, next.fd, EVFILT_READ, token)?;
+    }
+    if !previous.write && next.write {
+        register_kqueue_fd(kqueue_fd, next.fd, EVFILT_WRITE, token)?;
+    }
+    Ok(())
+}
+
+fn unregister_kqueue_interest(kqueue_fd: RawFd, interest: KqueueInterest) {
+    if interest.read {
+        let _ = delete_kqueue_fd(kqueue_fd, interest.fd, EVFILT_READ);
+    }
+    if interest.write {
+        let _ = delete_kqueue_fd(kqueue_fd, interest.fd, EVFILT_WRITE);
+    }
 }
 
 fn create_kqueue() -> io::Result<OwnedFd> {

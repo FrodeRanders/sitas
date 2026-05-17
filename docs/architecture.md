@@ -325,6 +325,9 @@ The readiness path is intentionally small:
 - `WouldBlock` registers interest and yields to the executor;
 - the Unix reactor sleeps using `epoll`, `kqueue`, or fallback `poll` plus a
   wake pipe;
+- the `epoll` and `kqueue` backends keep a persistent kernel registration set
+  and reconcile it against the executor's current fd interests before each
+  wait, so unchanged interests do not churn through add/delete syscalls;
 - readiness wakes the interested task;
 - the operation retries.
 

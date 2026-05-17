@@ -889,6 +889,28 @@ mod tests {
         assert_eq!(event.writable, vec![fd]);
     }
 
+    #[test]
+    fn wait_readable_replaces_previous_fd_interest() {
+        let reactor = OsReactor::new().unwrap();
+        let (first_read_fd, first_write_fd) = create_pipe().unwrap();
+        let (second_read_fd, second_write_fd) = create_pipe().unwrap();
+
+        let event = reactor
+            .wait_readable(&[first_read_fd.raw()], Some(Duration::from_millis(1)))
+            .unwrap();
+        assert!(event.readable.is_empty());
+
+        write_one(first_write_fd.raw());
+        write_one(second_write_fd.raw());
+
+        let event = reactor
+            .wait_readable(&[second_read_fd.raw()], Some(Duration::from_secs(1)))
+            .unwrap();
+
+        assert_eq!(event.readable, vec![second_read_fd.raw()]);
+        assert!(event.writable.is_empty());
+    }
+
     #[cfg(any(
         target_os = "linux",
         all(
