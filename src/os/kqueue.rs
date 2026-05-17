@@ -6,7 +6,7 @@ use std::ptr;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use super::{EINTR, OsEvent, OwnedFd, last_os_error};
+use super::{EINTR, OsEvent, OwnedFd, last_os_error, push_unique_fd};
 
 const EVFILT_READ: c_short = -1;
 const EVFILT_WRITE: c_short = -2;
@@ -134,18 +134,10 @@ impl KqueueBackend {
                     }
                 }
 
-                return Ok(OsEvent {
-                    woke,
-                    readable,
-                    writable,
-                });
+                return Ok(OsEvent::ready(woke, readable, writable));
             }
             if result == 0 {
-                return Ok(OsEvent {
-                    woke: false,
-                    readable: Vec::new(),
-                    writable: Vec::new(),
-                });
+                return Ok(OsEvent::empty());
             }
 
             let error = last_os_error();
@@ -395,11 +387,5 @@ fn duration_to_timespec(duration: Duration) -> Timespec {
     Timespec {
         tv_sec: duration.as_secs().min(i64::MAX as u64) as i64,
         tv_nsec: i64::from(duration.subsec_nanos()),
-    }
-}
-
-fn push_unique_fd(fds: &mut Vec<RawFd>, fd: RawFd) {
-    if !fds.contains(&fd) {
-        fds.push(fd);
     }
 }

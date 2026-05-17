@@ -5,7 +5,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use super::{EINTR, OsEvent, OwnedFd, last_os_error, timeout_to_wait_ms};
+use super::{EINTR, OsEvent, OwnedFd, last_os_error, push_unique_fd, timeout_to_wait_ms};
 
 const EPOLLIN: u32 = 0x0001;
 const EPOLLOUT: u32 = 0x0004;
@@ -103,18 +103,10 @@ impl EpollBackend {
                     }
                 }
 
-                return Ok(OsEvent {
-                    woke,
-                    readable,
-                    writable,
-                });
+                return Ok(OsEvent::ready(woke, readable, writable));
             }
             if result == 0 {
-                return Ok(OsEvent {
-                    woke: false,
-                    readable: Vec::new(),
-                    writable: Vec::new(),
-                });
+                return Ok(OsEvent::empty());
             }
 
             let error = last_os_error();
@@ -315,11 +307,5 @@ fn register_epoll_fd(epoll_fd: RawFd, fd: RawFd, events: u32, data: u64) -> io::
         Err(last_os_error())
     } else {
         Ok(())
-    }
-}
-
-fn push_unique_fd(fds: &mut Vec<RawFd>, fd: RawFd) {
-    if !fds.contains(&fd) {
-        fds.push(fd);
     }
 }

@@ -345,32 +345,29 @@ impl OsReactor {
             let result = unsafe { poll(fds.as_mut_ptr(), fds.len() as Nfds, timeout_ms) };
             if result > 0 {
                 let woke = fds[0].revents & POLLIN != 0 && self.drain_wakes()?;
-                let readable = fds
+                let mut readable = Vec::new();
+                let mut writable = Vec::new();
+
+                for fd in fds
                     .iter()
                     .skip(1)
                     .take(read_fds.len())
                     .filter(|fd| fd.revents & POLLIN != 0)
-                    .map(|fd| fd.fd)
-                    .collect();
-                let writable = fds
+                {
+                    push_unique_fd(&mut readable, fd.fd);
+                }
+                for fd in fds
                     .iter()
                     .skip(1 + read_fds.len())
                     .filter(|fd| fd.revents & POLLOUT != 0)
-                    .map(|fd| fd.fd)
-                    .collect();
+                {
+                    push_unique_fd(&mut writable, fd.fd);
+                }
 
-                return Ok(OsEvent {
-                    woke,
-                    readable,
-                    writable,
-                });
+                return Ok(OsEvent::ready(woke, readable, writable));
             }
             if result == 0 {
-                return Ok(OsEvent {
-                    woke: false,
-                    readable: Vec::new(),
-                    writable: Vec::new(),
-                });
+                return Ok(OsEvent::empty());
             }
 
             let error = last_os_error();
@@ -479,6 +476,30 @@ pub struct OsEvent {
     pub readable: Vec<RawFd>,
     /// File descriptors that were writable when the reactor returned.
     pub writable: Vec<RawFd>,
+}
+
+impl OsEvent {
+    fn empty() -> Self {
+        Self {
+            woke: false,
+            readable: Vec::new(),
+            writable: Vec::new(),
+        }
+    }
+
+    fn ready(woke: bool, readable: Vec<RawFd>, writable: Vec<RawFd>) -> Self {
+        Self {
+            woke,
+            readable,
+            writable,
+        }
+    }
+}
+
+fn push_unique_fd(fds: &mut Vec<RawFd>, fd: RawFd) {
+    if !fds.contains(&fd) {
+        fds.push(fd);
+    }
 }
 
 /// Starts a non-blocking TCP connection.
