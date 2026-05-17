@@ -22,6 +22,7 @@ use crate::os::IoUringDispatcherSnapshot;
 #[cfg(unix)]
 use crate::os::OsReactor;
 
+mod counters;
 mod driver;
 mod future;
 #[cfg(unix)]

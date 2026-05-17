@@ -12,6 +12,7 @@ use crate::os::IoUringDispatcherSnapshot;
 #[cfg(unix)]
 use crate::os::OsWaker;
 
+use super::counters::SchedulerCounters;
 #[cfg(unix)]
 use super::io_interest::InterestSet;
 use super::task::{Task, set_current_task_waiting_for};
@@ -43,19 +44,7 @@ pub(super) struct SchedulerState {
     accepting: bool,
     spawner_count: usize,
     task_count: usize,
-    total_spawned_tasks: u64,
-    total_completed_tasks: u64,
-    total_task_polls: u64,
-    ready_poll_budget_exhaustions: u64,
-    total_driver_events: u64,
-    #[cfg(unix)]
-    total_readiness_events: u64,
-    #[cfg(unix)]
-    total_readable_events: u64,
-    #[cfg(unix)]
-    total_writable_events: u64,
-    #[cfg(target_os = "linux")]
-    total_completion_events: u64,
+    counters: SchedulerCounters,
     next_task_id: usize,
     next_timer_id: usize,
 }
@@ -76,19 +65,7 @@ impl Scheduler {
                 accepting: true,
                 spawner_count: 1,
                 task_count: 0,
-                total_spawned_tasks: 0,
-                total_completed_tasks: 0,
-                total_task_polls: 0,
-                ready_poll_budget_exhaustions: 0,
-                total_driver_events: 0,
-                #[cfg(unix)]
-                total_readiness_events: 0,
-                #[cfg(unix)]
-                total_readable_events: 0,
-                #[cfg(unix)]
-                total_writable_events: 0,
-                #[cfg(target_os = "linux")]
-                total_completion_events: 0,
+                counters: SchedulerCounters::default(),
                 next_task_id: 0,
                 next_timer_id: 0,
             }),
@@ -133,7 +110,7 @@ impl Scheduler {
                 return Err(SpawnError);
             }
             state.task_count += 1;
-            state.total_spawned_tasks += 1;
+            state.counters.record_spawned_task();
             state.tasks.push(Arc::downgrade(&task));
             state.queue.push_back(task);
         }
@@ -216,19 +193,7 @@ impl Scheduler {
         let task_count = state.task_count;
         let ready_queue_len = state.queue.len();
         let timer_count = state.timers.len();
-        let total_spawned_tasks = state.total_spawned_tasks;
-        let total_completed_tasks = state.total_completed_tasks;
-        let total_task_polls = state.total_task_polls;
-        let ready_poll_budget_exhaustions = state.ready_poll_budget_exhaustions;
-        let total_driver_events = state.total_driver_events;
-        #[cfg(unix)]
-        let total_readiness_events = state.total_readiness_events;
-        #[cfg(unix)]
-        let total_readable_events = state.total_readable_events;
-        #[cfg(unix)]
-        let total_writable_events = state.total_writable_events;
-        #[cfg(target_os = "linux")]
-        let total_completion_events = state.total_completion_events;
+        let counters = state.counters;
         #[cfg(unix)]
         let read_interest_count = state.read_interests.len();
         #[cfg(unix)]
@@ -258,19 +223,19 @@ impl Scheduler {
             #[cfg(target_os = "linux")]
             io_uring,
             ready_poll_budget: READY_POLL_BUDGET,
-            total_spawned_tasks,
-            total_completed_tasks,
-            total_task_polls,
-            ready_poll_budget_exhaustions,
-            total_driver_events,
+            total_spawned_tasks: counters.total_spawned_tasks,
+            total_completed_tasks: counters.total_completed_tasks,
+            total_task_polls: counters.total_task_polls,
+            ready_poll_budget_exhaustions: counters.ready_poll_budget_exhaustions,
+            total_driver_events: counters.total_driver_events,
             #[cfg(unix)]
-            total_readiness_events,
+            total_readiness_events: counters.total_readiness_events,
             #[cfg(unix)]
-            total_readable_events,
+            total_readable_events: counters.total_readable_events,
             #[cfg(unix)]
-            total_writable_events,
+            total_writable_events: counters.total_writable_events,
             #[cfg(target_os = "linux")]
-            total_completion_events,
+            total_completion_events: counters.total_completion_events,
             tasks,
         }
     }
@@ -279,7 +244,7 @@ impl Scheduler {
         let should_wake = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
             state.task_count = state.task_count.saturating_sub(1);
-            state.total_completed_tasks += 1;
+            state.counters.record_completed_task();
             state.queue.is_empty() && state.spawner_count == 0 && state.task_count == 0
         };
 
@@ -290,30 +255,23 @@ impl Scheduler {
 
     pub(super) fn record_ready_poll_batch(&self, polled: usize, exhausted_budget: bool) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.total_task_polls += polled as u64;
-        if exhausted_budget {
-            state.ready_poll_budget_exhaustions += 1;
-        }
+        state
+            .counters
+            .record_ready_poll_batch(polled, exhausted_budget);
     }
 
     #[cfg(unix)]
     pub(super) fn record_readiness_driver_event(&self, readable: bool, writable: bool) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.total_driver_events += 1;
-        state.total_readiness_events += 1;
-        if readable {
-            state.total_readable_events += 1;
-        }
-        if writable {
-            state.total_writable_events += 1;
-        }
+        state
+            .counters
+            .record_readiness_driver_event(readable, writable);
     }
 
     #[cfg(target_os = "linux")]
     pub(super) fn record_completion_driver_event(&self) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.total_driver_events += 1;
-        state.total_completion_events += 1;
+        state.counters.record_completion_driver_event();
     }
 
     #[cfg(target_os = "linux")]
