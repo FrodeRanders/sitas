@@ -83,3 +83,69 @@ impl TimerSet {
         self.timers.iter().map(|timer| timer.deadline).min()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn waker() -> Waker {
+        Waker::noop().clone()
+    }
+
+    #[test]
+    fn timer_ids_are_allocated_monotonically() {
+        let mut timers = TimerSet::new();
+
+        assert_eq!(timers.allocate_id(), 0);
+        assert_eq!(timers.allocate_id(), 1);
+        assert_eq!(timers.allocate_id(), 2);
+    }
+
+    #[test]
+    fn register_reports_when_deadline_becomes_earliest() {
+        let mut timers = TimerSet::new();
+        let now = Instant::now();
+
+        assert!(timers.register(0, now + Duration::from_millis(20), waker()));
+        assert!(!timers.register(1, now + Duration::from_millis(30), waker()));
+        assert!(timers.register(2, now + Duration::from_millis(10), waker()));
+        assert!(!timers.register(2, now + Duration::from_millis(40), waker()));
+
+        assert_eq!(timers.time_until_next(now), Some(Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn expired_returns_due_wakers_and_keeps_future_timers() {
+        let mut timers = TimerSet::new();
+        let now = Instant::now();
+
+        timers.register(0, now + Duration::from_millis(5), waker());
+        timers.register(1, now + Duration::from_millis(15), waker());
+        timers.register(2, now + Duration::from_millis(10), waker());
+
+        let expired = timers.expired(now + Duration::from_millis(10));
+        assert_eq!(expired.len(), 2);
+        assert_eq!(timers.len(), 1);
+        assert_eq!(
+            timers.time_until_next(now + Duration::from_millis(10)),
+            Some(Duration::from_millis(5))
+        );
+    }
+
+    #[test]
+    fn remove_and_clear_drop_pending_timers() {
+        let mut timers = TimerSet::new();
+        let now = Instant::now();
+
+        timers.register(0, now + Duration::from_millis(5), waker());
+        timers.register(1, now + Duration::from_millis(10), waker());
+        timers.remove(0);
+
+        assert_eq!(timers.len(), 1);
+        assert_eq!(timers.time_until_next(now), Some(Duration::from_millis(10)));
+
+        timers.clear();
+        assert_eq!(timers.len(), 0);
+        assert_eq!(timers.time_until_next(now), None);
+    }
+}
