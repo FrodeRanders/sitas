@@ -11,10 +11,11 @@ use crate::os::IoUringDispatcherSnapshot;
 use crate::os::OsWaker;
 
 use super::counters::SchedulerCounters;
+use super::current::set_current_task_waiting_for;
 #[cfg(unix)]
 use super::io_interest::ReadinessInterests;
 use super::snapshot::{ExecutorSnapshotParts, build_executor_snapshot};
-use super::task::{Task, set_current_task_waiting_for};
+use super::task::Task;
 use super::task_set::SchedulerTaskSet;
 use super::timer::TimerSet;
 use super::{ExecutorSnapshot, SpawnError, TaskId, TaskWait};

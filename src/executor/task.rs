@@ -1,17 +1,12 @@
-use std::cell::RefCell;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use super::current::enter_scheduler;
+use super::current::{enter_scheduler, enter_task};
 use super::scheduler::Scheduler;
 use super::{BoxFuture, PanicHandler, TaskId, TaskSnapshot, TaskStatus, TaskWait};
-
-thread_local! {
-    static CURRENT_TASK: RefCell<Option<Arc<Task>>> = const { RefCell::new(None) };
-}
 
 pub(super) struct Task {
     id: TaskId,
@@ -91,16 +86,12 @@ impl Task {
         };
 
         let current_scheduler = enter_scheduler(Arc::clone(&self.scheduler));
-        CURRENT_TASK.with(|current| {
-            *current.borrow_mut() = Some(Arc::clone(&self));
-        });
+        let current_task = enter_task(Arc::clone(&self));
 
         let poll_result =
             panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut context)));
 
-        CURRENT_TASK.with(|current| {
-            *current.borrow_mut() = None;
-        });
+        drop(current_task);
         drop(current_scheduler);
 
         let poll_finished_at = Instant::now();
@@ -260,12 +251,4 @@ impl Wake for Task {
     fn wake_by_ref(self: &Arc<Self>) {
         let _ = self.scheduler.schedule_existing(self.clone());
     }
-}
-
-pub(super) fn set_current_task_waiting_for(waiting_for: TaskWait) {
-    CURRENT_TASK.with(|current| {
-        if let Some(task) = current.borrow().as_ref() {
-            task.set_waiting_for(waiting_for);
-        }
-    });
 }
