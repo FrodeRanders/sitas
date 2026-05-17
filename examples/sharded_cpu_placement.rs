@@ -10,7 +10,7 @@ use sitas::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("available CPUs: {:?}", available_cpu_ids());
 
-    let runtime = ShardedExecutor::start_pinned_on_available_cpus().unwrap();
+    let runtime = ShardedExecutor::start_pinned_on_available_cpus()?;
 
     for shard in runtime.snapshot().shards {
         println!(

@@ -1037,7 +1037,7 @@ fn read_exact_async_returns_unexpected_eof() {
             .unwrap_err()
     });
 
-    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 }
 
 #[cfg(unix)]
@@ -1063,7 +1063,7 @@ fn read_exact_timeout_async_returns_timed_out() {
     drop(spawner);
     executor.run();
 
-    assert_eq!(*output.lock().unwrap(), Some(std::io::ErrorKind::TimedOut));
+    assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::TimedOut));
     assert_eq!(executor.scheduler.snapshot().read_interest_count, 0);
 }
 
@@ -1144,7 +1144,7 @@ fn copy_async_rejects_empty_buffer() {
             .unwrap_err()
     });
 
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
 
 #[cfg(unix)]
@@ -1167,7 +1167,7 @@ fn copy_timeout_async_returns_timed_out() {
         .unwrap_err()
     });
 
-    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
 }
 
 #[cfg(unix)]
@@ -1190,7 +1190,7 @@ fn accept_async_waits_for_tcp_connection() {
         let mut empty = [0u8; 1];
         assert_eq!(
             stream.read(&mut empty).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
+            io::ErrorKind::WouldBlock
         );
         stream
     });
@@ -1225,7 +1225,7 @@ fn accept_timeout_async_returns_timed_out() {
     drop(spawner);
     executor.run();
 
-    assert_eq!(*output.lock().unwrap(), Some(std::io::ErrorKind::TimedOut));
+    assert_eq!(*output.lock().unwrap(), Some(io::ErrorKind::TimedOut));
     assert_eq!(executor.scheduler.snapshot().read_interest_count, 0);
 }
 
@@ -1318,7 +1318,7 @@ fn connect_timeout_async_establishes_nonblocking_tcp_stream() {
 fn connect_async_supports_ipv6_loopback() {
     let listener = match TcpListener::bind("[::1]:0") {
         Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => return,
+        Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => return,
         Err(error) => panic!("failed to bind IPv6 loopback listener: {error}"),
     };
     let address = listener.local_addr().unwrap();
@@ -2076,7 +2076,7 @@ fn dropping_executor_cancels_pending_readable_task() {
 
 struct WakeTwiceThenPending;
 
-impl std::future::Future for WakeTwiceThenPending {
+impl Future for WakeTwiceThenPending {
     type Output = ();
 
     fn poll(
@@ -2091,7 +2091,7 @@ impl std::future::Future for WakeTwiceThenPending {
 
 struct AlwaysWake;
 
-impl std::future::Future for AlwaysWake {
+impl Future for AlwaysWake {
     type Output = ();
 
     fn poll(
@@ -2108,7 +2108,7 @@ struct CatchJoinPanic<T> {
     observed: Arc<Mutex<bool>>,
 }
 
-impl<T> std::future::Future for CatchJoinPanic<T> {
+impl<T> Future for CatchJoinPanic<T> {
     type Output = ();
 
     fn poll(

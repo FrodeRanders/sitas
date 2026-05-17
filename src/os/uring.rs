@@ -286,7 +286,7 @@ impl IoUring {
     ///
     /// The returned operation id identifies the cancellation request itself.
     /// The target operation still produces its own completion, commonly with a
-    /// negative cancelled result if the kernel accepted the cancellation.
+    /// negative canceled result if the kernel accepted the cancellation.
     pub fn cancel_operation(
         &mut self,
         target: IoUringOperationId,

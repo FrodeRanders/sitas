@@ -105,7 +105,7 @@ All cross-shard interaction happens through typed messages.
 No mutex protects the key-value service state because that state is never
 shared. Values returned across shard boundaries are owned values.
 
-See [docs/architecture.md](docs/architecture.md) for the current request flow
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current request flow
 and shutdown model.
 
 ## Deliberately Missing

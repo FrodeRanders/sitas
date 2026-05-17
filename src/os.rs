@@ -518,7 +518,7 @@ fn tcp_connect_start_v4(address: SocketAddrV4) -> io::Result<TcpStream> {
     tcp_connect_start_with_address(
         AF_INET,
         (&socket_address as *const SockAddrIn).cast::<c_void>(),
-        std::mem::size_of::<SockAddrIn>() as SockLen,
+        size_of::<SockAddrIn>() as SockLen,
     )
 }
 
@@ -527,7 +527,7 @@ fn tcp_connect_start_v6(address: SocketAddrV6) -> io::Result<TcpStream> {
     tcp_connect_start_with_address(
         AF_INET6,
         (&socket_address as *const SockAddrIn6).cast::<c_void>(),
-        std::mem::size_of::<SockAddrIn6>() as SockLen,
+        size_of::<SockAddrIn6>() as SockLen,
     )
 }
 
@@ -625,7 +625,7 @@ fn socket_addr_v4(address: SocketAddrV4) -> SockAddrIn {
 #[cfg(not(target_os = "linux"))]
 fn socket_addr_v4(address: SocketAddrV4) -> SockAddrIn {
     SockAddrIn {
-        sin_len: std::mem::size_of::<SockAddrIn>() as u8,
+        sin_len: size_of::<SockAddrIn>() as u8,
         sin_family: AF_INET as u8,
         sin_port: address.port().to_be(),
         sin_addr: InAddr {
@@ -651,7 +651,7 @@ fn socket_addr_v6(address: SocketAddrV6) -> SockAddrIn6 {
 #[cfg(not(target_os = "linux"))]
 fn socket_addr_v6(address: SocketAddrV6) -> SockAddrIn6 {
     SockAddrIn6 {
-        sin6_len: std::mem::size_of::<SockAddrIn6>() as u8,
+        sin6_len: size_of::<SockAddrIn6>() as u8,
         sin6_family: AF_INET6 as u8,
         sin6_port: address.port().to_be(),
         sin6_flowinfo: address.flowinfo(),

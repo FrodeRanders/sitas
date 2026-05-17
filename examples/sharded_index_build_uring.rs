@@ -899,7 +899,7 @@ struct DemoPaths {
 
 impl DemoPaths {
     fn new() -> Self {
-        let base = std::env::temp_dir().join(format!("sitas-index-demo-{}", std::process::id()));
+        let base = env::temp_dir().join(format!("sitas-index-demo-{}", std::process::id()));
         Self {
             data: base.with_extension("data"),
             index: base.with_extension("index"),

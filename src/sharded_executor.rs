@@ -247,13 +247,12 @@ impl ShardedExecutor {
                 .name(thread_name.clone())
                 .spawn(move || {
                     let cpu_placement = affinity::apply_to_current_thread(requested_cpu);
-                    CURRENT_EXECUTOR_SHARD.with(|current| current.set(Some(shard_id)));
-                    CURRENT_EXECUTOR_CPU_PLACEMENT
-                        .with(|current| current.replace(Some(cpu_placement.clone())));
+                    CURRENT_EXECUTOR_SHARD.set(Some(shard_id));
+                    CURRENT_EXECUTOR_CPU_PLACEMENT.replace(Some(cpu_placement.clone()));
                     let _ = started_sender.send(cpu_placement);
                     executor.run();
-                    CURRENT_EXECUTOR_CPU_PLACEMENT.with(|current| current.replace(None));
-                    CURRENT_EXECUTOR_SHARD.with(|current| current.set(None));
+                    CURRENT_EXECUTOR_CPU_PLACEMENT.replace(None);
+                    CURRENT_EXECUTOR_SHARD.set(None);
                 }) {
                 Ok(join) => join,
                 Err(_) => {

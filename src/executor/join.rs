@@ -26,7 +26,7 @@ pub(super) struct JoinState<T> {
 /// value.
 pub enum JoinError {
     /// The task was aborted before it completed.
-    Cancelled,
+    Canceled,
     /// The task panicked while it was being polled.
     Panic(PanicPayload),
 }
@@ -34,7 +34,7 @@ pub enum JoinError {
 impl JoinError {
     /// Returns true if the task was aborted before completion.
     pub fn is_cancelled(&self) -> bool {
-        matches!(self, JoinError::Cancelled)
+        matches!(self, JoinError::Canceled)
     }
 
     /// Returns true if the task panicked while it was being polled.
@@ -45,7 +45,7 @@ impl JoinError {
     /// Consumes the error and returns the panic payload if the task panicked.
     pub fn into_panic(self) -> Option<PanicPayload> {
         match self {
-            JoinError::Cancelled => None,
+            JoinError::Canceled => None,
             JoinError::Panic(payload) => Some(payload),
         }
     }
@@ -54,7 +54,7 @@ impl JoinError {
 impl fmt::Debug for JoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            JoinError::Cancelled => f.write_str("Cancelled"),
+            JoinError::Canceled => f.write_str("Canceled"),
             JoinError::Panic(_) => f.write_str("Panic(..)"),
         }
     }
@@ -63,7 +63,7 @@ impl fmt::Debug for JoinError {
 impl fmt::Display for JoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            JoinError::Cancelled => write!(f, "task was cancelled"),
+            JoinError::Canceled => write!(f, "task was canceled"),
             JoinError::Panic(_) => write!(f, "task panicked"),
         }
     }
@@ -85,13 +85,13 @@ impl<T> JoinHandle<T> {
     /// Aborts the task if it has not completed yet.
     ///
     /// Awaiting this handle after a successful abort returns
-    /// [`JoinError::Cancelled`].
+    /// [`JoinError::Canceled`].
     pub fn abort(&self) -> bool {
         if !self.task.cancel() {
             return false;
         }
 
-        complete_join(&self.shared, Err(JoinError::Cancelled));
+        complete_join(&self.shared, Err(JoinError::Canceled));
         true
     }
 }

@@ -94,7 +94,7 @@ pub enum TaskStatus {
     Waiting,
     /// The task completed normally.
     Completed,
-    /// The task was cancelled before completing.
+    /// The task was canceled before completing.
     Cancelled,
 }
 
@@ -176,7 +176,7 @@ pub struct ExecutorSnapshot {
     pub ready_poll_budget: usize,
     /// Number of tasks accepted by this executor since startup.
     pub total_spawned_tasks: u64,
-    /// Number of tasks that have completed, panicked, or been cancelled since startup.
+    /// Number of tasks that have completed, panicked, or been canceled since startup.
     pub total_completed_tasks: u64,
     /// Number of spawned task polls performed since startup.
     pub total_task_polls: u64,
