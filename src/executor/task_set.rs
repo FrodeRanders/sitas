@@ -110,3 +110,98 @@ impl SchedulerTaskSet {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::os::OsReactor;
+
+    use super::*;
+    use crate::executor::scheduler::Scheduler;
+
+    fn scheduler() -> Arc<Scheduler> {
+        let reactor = OsReactor::new().expect("failed to create test reactor");
+        Arc::new(Scheduler::new(reactor.waker()))
+    }
+
+    fn task(id: usize) -> Arc<Task> {
+        Arc::new(Task::new(
+            TaskId(id),
+            None,
+            Box::pin(async {}),
+            scheduler(),
+            None,
+        ))
+    }
+
+    #[test]
+    fn task_ids_are_allocated_monotonically() {
+        let mut tasks = SchedulerTaskSet::new();
+
+        assert_eq!(tasks.allocate_task_id(), TaskId(0));
+        assert_eq!(tasks.allocate_task_id(), TaskId(1));
+        assert_eq!(tasks.allocate_task_id(), TaskId(2));
+    }
+
+    #[test]
+    fn new_tasks_are_counted_and_queued_in_order() {
+        let mut tasks = SchedulerTaskSet::new();
+        let first = task(0);
+        let second = task(1);
+
+        tasks.schedule_new(Arc::clone(&first)).unwrap();
+        tasks.schedule_new(Arc::clone(&second)).unwrap();
+
+        assert_eq!(tasks.snapshot().task_count, 2);
+        assert_eq!(tasks.snapshot().ready_queue_len, 2);
+        assert!(Arc::ptr_eq(&tasks.next_task().unwrap(), &first));
+        assert!(Arc::ptr_eq(&tasks.next_task().unwrap(), &second));
+        assert!(tasks.next_task().is_none());
+    }
+
+    #[test]
+    fn existing_tasks_are_requeued_without_changing_task_count() {
+        let mut tasks = SchedulerTaskSet::new();
+        let task = task(0);
+
+        tasks.schedule_new(Arc::clone(&task)).unwrap();
+        tasks.schedule_existing(Arc::clone(&task)).unwrap();
+
+        assert_eq!(tasks.snapshot().task_count, 1);
+        assert_eq!(tasks.snapshot().ready_queue_len, 2);
+    }
+
+    #[test]
+    fn finishing_tasks_and_dropping_spawners_drains_the_set() {
+        let mut tasks = SchedulerTaskSet::new();
+        let task = task(0);
+
+        tasks.schedule_new(task).unwrap();
+        assert!(tasks.next_task().is_some());
+
+        assert!(!tasks.finish_task());
+        assert!(!tasks.is_drained());
+        assert!(tasks.remove_spawner());
+        assert!(tasks.is_drained());
+    }
+
+    #[test]
+    fn closing_stops_accepting_and_returns_observable_tasks() {
+        let mut tasks = SchedulerTaskSet::new();
+        let task = task(0);
+        assert!(task.mark_queued());
+
+        tasks.schedule_new(Arc::clone(&task)).unwrap();
+        let closed = tasks.close();
+
+        assert_eq!(closed.len(), 1);
+        assert!(Arc::ptr_eq(&closed[0], &task));
+        assert!(!tasks.snapshot().accepting);
+        assert_eq!(tasks.snapshot().task_count, 0);
+        assert_eq!(tasks.snapshot().ready_queue_len, 0);
+
+        assert!(tasks.schedule_new(Arc::clone(&task)).is_err());
+        assert!(task.mark_queued());
+    }
+}
