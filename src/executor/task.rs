@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use super::current::set_current_scheduler;
+use super::current::enter_scheduler;
 use super::scheduler::Scheduler;
 use super::{BoxFuture, PanicHandler, TaskId, TaskSnapshot, TaskStatus, TaskWait};
 
@@ -90,7 +90,7 @@ impl Task {
             future
         };
 
-        set_current_scheduler(Some(Arc::clone(&self.scheduler)));
+        let current_scheduler = enter_scheduler(Arc::clone(&self.scheduler));
         CURRENT_TASK.with(|current| {
             *current.borrow_mut() = Some(Arc::clone(&self));
         });
@@ -101,7 +101,7 @@ impl Task {
         CURRENT_TASK.with(|current| {
             *current.borrow_mut() = None;
         });
-        set_current_scheduler(None);
+        drop(current_scheduler);
 
         let poll_finished_at = Instant::now();
         let poll_duration = poll_finished_at.saturating_duration_since(poll_started_at);

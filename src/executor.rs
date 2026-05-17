@@ -43,7 +43,7 @@ mod unix_io;
 #[cfg(target_os = "linux")]
 mod uring;
 
-use current::set_current_scheduler;
+use current::enter_scheduler;
 pub use future::{
     Race, RaceOutput, Sleep, Timeout, TimeoutError, YieldNow, race, sleep, timeout, yield_now,
 };
@@ -426,12 +426,11 @@ impl Executor {
 
         loop {
             if root.take_ready() {
-                set_current_scheduler(Some(Arc::clone(&self.scheduler)));
+                let current_scheduler = enter_scheduler(Arc::clone(&self.scheduler));
 
                 let poll_result =
                     panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut context)));
-
-                set_current_scheduler(None);
+                drop(current_scheduler);
 
                 match poll_result {
                     Ok(Poll::Ready(output)) => return output,
