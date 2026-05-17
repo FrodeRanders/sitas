@@ -171,6 +171,14 @@ pub struct ExecutorSnapshot {
     pub total_task_polls: u64,
     /// Number of ready-poll batches that consumed the full ready-poll budget.
     pub ready_poll_budget_exhaustions: u64,
+    /// Number of idle driver events observed by the executor.
+    pub total_driver_events: u64,
+    /// Number of readiness driver events observed by the executor.
+    #[cfg(unix)]
+    pub total_readiness_events: u64,
+    /// Number of Linux completion driver events observed by the executor.
+    #[cfg(target_os = "linux")]
+    pub total_completion_events: u64,
     /// Owned snapshots for tasks that are still externally observable.
     pub tasks: Vec<TaskSnapshot>,
 }

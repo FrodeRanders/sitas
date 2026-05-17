@@ -417,6 +417,9 @@ fn io_uring_completion_is_not_delayed_by_unexpired_timer() -> io::Result<()> {
 
     assert_eq!(bytes, b"cde");
     assert!(started.elapsed() < Duration::from_millis(150));
+    let snapshot = executor.snapshot();
+    assert!(snapshot.total_driver_events > 0);
+    assert!(snapshot.total_completion_events > 0);
     drop(file);
     fs::remove_file(path)?;
     Ok(())
@@ -644,6 +647,11 @@ fn executor_snapshot_reports_cumulative_scheduler_counters() {
     assert_eq!(snapshot.total_completed_tasks, 3);
     assert_eq!(snapshot.total_task_polls, 6);
     assert_eq!(snapshot.ready_poll_budget_exhaustions, 0);
+    assert_eq!(snapshot.total_driver_events, 0);
+    #[cfg(unix)]
+    assert_eq!(snapshot.total_readiness_events, 0);
+    #[cfg(target_os = "linux")]
+    assert_eq!(snapshot.total_completion_events, 0);
 }
 
 #[test]
@@ -872,6 +880,9 @@ fn readable_future_completes_when_fd_becomes_readable() {
     executor.run();
 
     assert_eq!(*output.lock().unwrap(), Some(b'x'));
+    let snapshot = executor.snapshot();
+    assert!(snapshot.total_driver_events > 0);
+    assert!(snapshot.total_readiness_events > 0);
 }
 
 #[cfg(unix)]

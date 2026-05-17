@@ -44,6 +44,11 @@ pub(super) struct SchedulerState {
     total_completed_tasks: u64,
     total_task_polls: u64,
     ready_poll_budget_exhaustions: u64,
+    total_driver_events: u64,
+    #[cfg(unix)]
+    total_readiness_events: u64,
+    #[cfg(target_os = "linux")]
+    total_completion_events: u64,
     next_task_id: usize,
     next_timer_id: usize,
 }
@@ -177,6 +182,11 @@ impl Scheduler {
                 total_completed_tasks: 0,
                 total_task_polls: 0,
                 ready_poll_budget_exhaustions: 0,
+                total_driver_events: 0,
+                #[cfg(unix)]
+                total_readiness_events: 0,
+                #[cfg(target_os = "linux")]
+                total_completion_events: 0,
                 next_task_id: 0,
                 next_timer_id: 0,
             }),
@@ -308,6 +318,11 @@ impl Scheduler {
         let total_completed_tasks = state.total_completed_tasks;
         let total_task_polls = state.total_task_polls;
         let ready_poll_budget_exhaustions = state.ready_poll_budget_exhaustions;
+        let total_driver_events = state.total_driver_events;
+        #[cfg(unix)]
+        let total_readiness_events = state.total_readiness_events;
+        #[cfg(target_os = "linux")]
+        let total_completion_events = state.total_completion_events;
         #[cfg(unix)]
         let read_interest_count = state.read_interests.len();
         #[cfg(unix)]
@@ -341,6 +356,11 @@ impl Scheduler {
             total_completed_tasks,
             total_task_polls,
             ready_poll_budget_exhaustions,
+            total_driver_events,
+            #[cfg(unix)]
+            total_readiness_events,
+            #[cfg(target_os = "linux")]
+            total_completion_events,
             tasks,
         }
     }
@@ -364,6 +384,20 @@ impl Scheduler {
         if exhausted_budget {
             state.ready_poll_budget_exhaustions += 1;
         }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn record_readiness_driver_event(&self) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.total_driver_events += 1;
+        state.total_readiness_events += 1;
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn record_completion_driver_event(&self) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.total_driver_events += 1;
+        state.total_completion_events += 1;
     }
 
     #[cfg(target_os = "linux")]
