@@ -13,7 +13,7 @@ use crate::os::OsWaker;
 
 use super::counters::SchedulerCounters;
 #[cfg(unix)]
-use super::io_interest::InterestSet;
+use super::io_interest::ReadinessInterests;
 use super::task::{Task, set_current_task_waiting_for};
 use super::task_set::SchedulerTaskSet;
 use super::timer::TimerSet;
@@ -35,9 +35,7 @@ pub(super) struct SchedulerState {
     tasks: SchedulerTaskSet,
     pub(super) timers: TimerSet,
     #[cfg(unix)]
-    pub(super) read_interests: InterestSet,
-    #[cfg(unix)]
-    pub(super) write_interests: InterestSet,
+    io_interests: ReadinessInterests,
     #[cfg(target_os = "linux")]
     io_uring: Option<IoUringDispatcherSnapshot>,
     counters: SchedulerCounters,
@@ -51,9 +49,7 @@ impl Scheduler {
                 tasks: SchedulerTaskSet::new(),
                 timers: TimerSet::new(),
                 #[cfg(unix)]
-                read_interests: InterestSet::new(),
-                #[cfg(unix)]
-                write_interests: InterestSet::new(),
+                io_interests: ReadinessInterests::new(),
                 #[cfg(target_os = "linux")]
                 io_uring: None,
                 counters: SchedulerCounters::default(),
@@ -140,10 +136,7 @@ impl Scheduler {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
             state.timers.clear();
             #[cfg(unix)]
-            {
-                state.read_interests.clear();
-                state.write_interests.clear();
-            }
+            state.io_interests.clear();
 
             state.tasks.close()
         };
@@ -161,9 +154,9 @@ impl Scheduler {
         let timer_count = state.timers.len();
         let counters = state.counters;
         #[cfg(unix)]
-        let read_interest_count = state.read_interests.len();
+        let read_interest_count = state.io_interests.read_len();
         #[cfg(unix)]
-        let write_interest_count = state.write_interests.len();
+        let write_interest_count = state.io_interests.write_len();
         #[cfg(target_os = "linux")]
         let io_uring = state.io_uring;
         let tasks = task_set.tasks;
@@ -289,7 +282,7 @@ impl Scheduler {
     #[cfg(unix)]
     pub(super) fn allocate_read_interest_id(&self) -> usize {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.read_interests.allocate_id()
+        state.io_interests.allocate_read_id()
     }
 
     #[cfg(unix)]
@@ -297,7 +290,7 @@ impl Scheduler {
         set_current_task_waiting_for(TaskWait::Readable { fd });
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            state.read_interests.register(id, fd, waker);
+            state.io_interests.register_read(id, fd, waker);
         }
 
         self.wake_reactor();
@@ -306,20 +299,20 @@ impl Scheduler {
     #[cfg(unix)]
     pub(super) fn remove_read_interest(&self, id: usize) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.read_interests.remove(id);
+        state.io_interests.remove_read(id);
     }
 
     #[cfg(unix)]
     pub(super) fn read_interest_fds(&self) -> Vec<RawFd> {
         let state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.read_interests.fds()
+        state.io_interests.read_fds()
     }
 
     #[cfg(unix)]
     pub(super) fn wake_readable_fds(&self, readable: &[RawFd]) {
         let wakers = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            state.read_interests.wake_ready(readable)
+            state.io_interests.wake_readable(readable)
         };
 
         for waker in wakers {
@@ -330,13 +323,13 @@ impl Scheduler {
     #[cfg(unix)]
     pub(super) fn take_ready_read_interest(&self, id: usize) -> bool {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.read_interests.take_ready(id)
+        state.io_interests.take_ready_read(id)
     }
 
     #[cfg(unix)]
     pub(super) fn allocate_write_interest_id(&self) -> usize {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.write_interests.allocate_id()
+        state.io_interests.allocate_write_id()
     }
 
     #[cfg(unix)]
@@ -344,7 +337,7 @@ impl Scheduler {
         set_current_task_waiting_for(TaskWait::Writable { fd });
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            state.write_interests.register(id, fd, waker);
+            state.io_interests.register_write(id, fd, waker);
         }
 
         self.wake_reactor();
@@ -353,20 +346,20 @@ impl Scheduler {
     #[cfg(unix)]
     pub(super) fn remove_write_interest(&self, id: usize) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.write_interests.remove(id);
+        state.io_interests.remove_write(id);
     }
 
     #[cfg(unix)]
     pub(super) fn write_interest_fds(&self) -> Vec<RawFd> {
         let state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.write_interests.fds()
+        state.io_interests.write_fds()
     }
 
     #[cfg(unix)]
     pub(super) fn wake_writable_fds(&self, writable: &[RawFd]) {
         let wakers = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            state.write_interests.wake_ready(writable)
+            state.io_interests.wake_writable(writable)
         };
 
         for waker in wakers {
@@ -377,7 +370,7 @@ impl Scheduler {
     #[cfg(unix)]
     pub(super) fn take_ready_write_interest(&self, id: usize) -> bool {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.write_interests.take_ready(id)
+        state.io_interests.take_ready_write(id)
     }
 
     pub(super) fn wake_reactor(&self) {

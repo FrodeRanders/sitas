@@ -1088,15 +1088,7 @@ fn read_exact_timeout_async_returns_timed_out() {
     executor.run();
 
     assert_eq!(*output.lock().unwrap(), Some(std::io::ErrorKind::TimedOut));
-    assert!(
-        executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .read_interests
-            .is_empty()
-    );
+    assert_eq!(executor.scheduler.snapshot().read_interest_count, 0);
 }
 
 #[cfg(unix)]
@@ -1258,15 +1250,7 @@ fn accept_timeout_async_returns_timed_out() {
     executor.run();
 
     assert_eq!(*output.lock().unwrap(), Some(std::io::ErrorKind::TimedOut));
-    assert!(
-        executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .read_interests
-            .is_empty()
-    );
+    assert_eq!(executor.scheduler.snapshot().read_interest_count, 0);
 }
 
 #[cfg(unix)]
@@ -2115,15 +2099,7 @@ fn dropping_executor_cancels_pending_readable_task() {
         .unwrap();
 
     executor.poll_ready_tasks();
-    assert!(
-        !executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .read_interests
-            .is_empty()
-    );
+    assert!(executor.scheduler.snapshot().read_interest_count > 0);
 
     drop(executor);
 
