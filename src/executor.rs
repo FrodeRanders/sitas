@@ -23,6 +23,7 @@ use crate::os::IoUringDispatcherSnapshot;
 use crate::os::OsReactor;
 
 mod counters;
+mod current;
 mod driver;
 mod future;
 #[cfg(unix)]
@@ -42,12 +43,13 @@ mod unix_io;
 #[cfg(target_os = "linux")]
 mod uring;
 
+use current::set_current_scheduler;
 pub use future::{
     Race, RaceOutput, Sleep, Timeout, TimeoutError, YieldNow, race, sleep, timeout, yield_now,
 };
 pub use join::{JoinError, JoinHandle};
 use join::{JoinState, complete_join};
-use scheduler::{Scheduler, set_current_scheduler};
+use scheduler::Scheduler;
 pub use scope::{TaskScope, TaskScopeError};
 pub use sync::{Notified, Notify, StopSource, StopToken, stop_pair};
 use task::Task;

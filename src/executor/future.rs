@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use super::scheduler::{Scheduler, current_scheduler};
+use super::current::current_scheduler;
+use super::scheduler::Scheduler;
 
 /// Returns a future that completes after `duration`.
 ///

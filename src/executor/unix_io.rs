@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use crate::os::tcp_connect_start;
 
-use super::scheduler::{Scheduler, current_scheduler};
+use super::current::current_scheduler;
+use super::scheduler::Scheduler;
 use super::{TimeoutError, timeout};
 
 /// Returns a future that completes when `fd` is readable.

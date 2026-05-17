@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{Duration, Instant};
@@ -19,10 +18,6 @@ use super::task::{Task, set_current_task_waiting_for};
 use super::task_set::SchedulerTaskSet;
 use super::timer::TimerSet;
 use super::{ExecutorSnapshot, SpawnError, TaskId, TaskWait};
-
-thread_local! {
-    static CURRENT_SCHEDULER: RefCell<Option<Arc<Scheduler>>> = const { RefCell::new(None) };
-}
 
 #[derive(Debug)]
 pub(super) struct Scheduler {
@@ -342,16 +337,4 @@ impl Scheduler {
         #[cfg(unix)]
         let _ = self.waker.wake();
     }
-}
-
-pub(super) fn current_scheduler() -> Arc<Scheduler> {
-    CURRENT_SCHEDULER
-        .with(|current| current.borrow().as_ref().cloned())
-        .expect("executor futures must be polled by sitas::executor::Executor")
-}
-
-pub(super) fn set_current_scheduler(scheduler: Option<Arc<Scheduler>>) {
-    CURRENT_SCHEDULER.with(|current| {
-        *current.borrow_mut() = scheduler;
-    });
 }

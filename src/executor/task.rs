@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use super::scheduler::{Scheduler, set_current_scheduler};
+use super::current::set_current_scheduler;
+use super::scheduler::Scheduler;
 use super::{BoxFuture, PanicHandler, TaskId, TaskSnapshot, TaskStatus, TaskWait};
 
 thread_local! {
