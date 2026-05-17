@@ -690,9 +690,15 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 fn timeout_to_wait_ms(timeout: Option<Duration>) -> c_int {
     match timeout {
         Some(duration) => {
+            if duration.is_zero() {
+                return 0;
+            }
+
             let millis = duration.as_millis();
             if millis > c_int::MAX as u128 {
                 c_int::MAX
+            } else if duration.subsec_nanos() > 0 {
+                (millis + 1).min(c_int::MAX as u128) as c_int
             } else {
                 millis as c_int
             }
@@ -881,6 +887,24 @@ mod tests {
         assert!(!event.woke);
         assert_eq!(event.readable, vec![fd]);
         assert_eq!(event.writable, vec![fd]);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        all(
+            not(target_os = "linux"),
+            not(any(target_os = "macos", target_os = "ios"))
+        )
+    ))]
+    #[test]
+    fn millisecond_wait_timeout_rounds_nonzero_submillisecond_up() {
+        assert_eq!(super::timeout_to_wait_ms(Some(Duration::ZERO)), 0);
+        assert_eq!(super::timeout_to_wait_ms(Some(Duration::from_nanos(1))), 1);
+        assert_eq!(
+            super::timeout_to_wait_ms(Some(Duration::from_micros(1_500))),
+            2
+        );
+        assert_eq!(super::timeout_to_wait_ms(None), -1);
     }
 
     fn write_one(fd: RawFd) {
