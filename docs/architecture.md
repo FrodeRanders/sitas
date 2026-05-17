@@ -376,7 +376,7 @@ It has two layers of completion state:
 
 ### Normal tracked completion path
 
-```text
+```
 queue_*_operation()
   |
   | records IoUringOperationId -> IoUringOperationKind
@@ -410,7 +410,7 @@ completion consumed by future
 
 When a future is dropped before its operation completes:
 
-```text
+```
 future Drop
   |
   | clear_waker(operation)
@@ -507,7 +507,7 @@ The project should remain boring at the semantic core and experimental at the ru
 
 The preferred direction is:
 
-```text
+```
 correct shared-nothing ownership
     -> typed service boundaries
     -> observable lifecycle

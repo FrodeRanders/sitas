@@ -97,7 +97,7 @@ standard library:
 
 The core invariant is:
 
-```text
+```
 Only the owning shard may mutate its service state.
 All cross-shard interaction happens through typed messages.
 ```
