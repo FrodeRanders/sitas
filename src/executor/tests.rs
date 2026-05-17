@@ -953,6 +953,44 @@ fn multiple_tasks_can_wait_for_same_readable_fd() {
 
 #[cfg(unix)]
 #[test]
+fn read_and_write_waiters_on_same_fd_are_woken_together() {
+    let (executor, spawner) = executor_and_spawner();
+    let (reader, mut peer) = UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    let fd = reader.as_raw_fd();
+    let output = Arc::new(Mutex::new(Vec::new()));
+
+    let readable_output = Arc::clone(&output);
+    spawner
+        .spawn(async move {
+            readable(fd).await;
+            readable_output.lock().unwrap().push("readable");
+        })
+        .unwrap();
+
+    let writable_output = Arc::clone(&output);
+    spawner
+        .spawn(async move {
+            writable(fd).await;
+            writable_output.lock().unwrap().push("writable");
+        })
+        .unwrap();
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        peer.write_all(b"x").unwrap();
+    });
+
+    drop(spawner);
+    executor.run();
+
+    let mut observed = output.lock().unwrap().clone();
+    observed.sort();
+    assert_eq!(observed, vec!["readable", "writable"]);
+}
+
+#[cfg(unix)]
+#[test]
 fn writable_future_completes_when_fd_is_writable() {
     let (executor, spawner) = executor_and_spawner();
     let (_reader, writer) = UnixStream::pair().unwrap();

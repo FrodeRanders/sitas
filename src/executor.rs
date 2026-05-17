@@ -386,18 +386,7 @@ impl Executor {
             }
 
             #[cfg(unix)]
-            {
-                let event = self
-                    .reactor
-                    .wait_io(
-                        &self.scheduler.read_interest_fds(),
-                        &self.scheduler.write_interest_fds(),
-                        self.scheduler.time_until_next_timer(),
-                    )
-                    .expect("OS reactor wait failed while running executor");
-                self.scheduler.wake_readable_fds(&event.readable);
-                self.scheduler.wake_writable_fds(&event.writable);
-            }
+            self.wait_for_reactor_event("running executor");
 
             self.scheduler.wake_expired_timers();
         }
@@ -448,18 +437,7 @@ impl Executor {
             }
 
             #[cfg(unix)]
-            {
-                let event = self
-                    .reactor
-                    .wait_io(
-                        &self.scheduler.read_interest_fds(),
-                        &self.scheduler.write_interest_fds(),
-                        self.scheduler.time_until_next_timer(),
-                    )
-                    .expect("OS reactor wait failed while running root future");
-                self.scheduler.wake_readable_fds(&event.readable);
-                self.scheduler.wake_writable_fds(&event.writable);
-            }
+            self.wait_for_reactor_event("running root future");
 
             self.scheduler.wake_expired_timers();
         }
@@ -501,6 +479,20 @@ impl Executor {
         }
 
         false
+    }
+
+    #[cfg(unix)]
+    fn wait_for_reactor_event(&self, context: &str) {
+        let read_fds = self.scheduler.read_interest_fds();
+        let write_fds = self.scheduler.write_interest_fds();
+        let timeout = self.scheduler.time_until_next_timer();
+        let event = self
+            .reactor
+            .wait_io(&read_fds, &write_fds, timeout)
+            .unwrap_or_else(|error| panic!("OS reactor wait failed while {context}: {error}"));
+
+        self.scheduler.wake_readable_fds(&event.readable);
+        self.scheduler.wake_writable_fds(&event.writable);
     }
 
     fn refresh_io_uring_snapshot(&self) {
