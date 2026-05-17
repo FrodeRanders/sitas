@@ -47,6 +47,10 @@ pub(super) struct SchedulerState {
     total_driver_events: u64,
     #[cfg(unix)]
     total_readiness_events: u64,
+    #[cfg(unix)]
+    total_readable_events: u64,
+    #[cfg(unix)]
+    total_writable_events: u64,
     #[cfg(target_os = "linux")]
     total_completion_events: u64,
     next_task_id: usize,
@@ -185,6 +189,10 @@ impl Scheduler {
                 total_driver_events: 0,
                 #[cfg(unix)]
                 total_readiness_events: 0,
+                #[cfg(unix)]
+                total_readable_events: 0,
+                #[cfg(unix)]
+                total_writable_events: 0,
                 #[cfg(target_os = "linux")]
                 total_completion_events: 0,
                 next_task_id: 0,
@@ -321,6 +329,10 @@ impl Scheduler {
         let total_driver_events = state.total_driver_events;
         #[cfg(unix)]
         let total_readiness_events = state.total_readiness_events;
+        #[cfg(unix)]
+        let total_readable_events = state.total_readable_events;
+        #[cfg(unix)]
+        let total_writable_events = state.total_writable_events;
         #[cfg(target_os = "linux")]
         let total_completion_events = state.total_completion_events;
         #[cfg(unix)]
@@ -359,6 +371,10 @@ impl Scheduler {
             total_driver_events,
             #[cfg(unix)]
             total_readiness_events,
+            #[cfg(unix)]
+            total_readable_events,
+            #[cfg(unix)]
+            total_writable_events,
             #[cfg(target_os = "linux")]
             total_completion_events,
             tasks,
@@ -387,10 +403,16 @@ impl Scheduler {
     }
 
     #[cfg(unix)]
-    pub(super) fn record_readiness_driver_event(&self) {
+    pub(super) fn record_readiness_driver_event(&self, readable: bool, writable: bool) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
         state.total_driver_events += 1;
         state.total_readiness_events += 1;
+        if readable {
+            state.total_readable_events += 1;
+        }
+        if writable {
+            state.total_writable_events += 1;
+        }
     }
 
     #[cfg(target_os = "linux")]

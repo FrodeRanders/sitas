@@ -132,7 +132,8 @@ Responsibilities:
 - Linux executor-owned `io_uring` read-at, read-exact-at, and write-at helpers
   driven from the executor loop when a shard has no ready tasks;
 - driver-event counters split readiness wakeups from Linux completion wakeups
-  in owned executor snapshots;
+  in owned executor snapshots, and further split readiness events by whether
+  they carried readable or writable fd progress;
 - cumulative executor counters for spawned tasks, completed tasks, task polls,
   and ready-poll budget exhaustion events.
 

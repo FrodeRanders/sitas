@@ -176,6 +176,12 @@ pub struct ExecutorSnapshot {
     /// Number of readiness driver events observed by the executor.
     #[cfg(unix)]
     pub total_readiness_events: u64,
+    /// Number of readiness driver events that reported at least one readable fd.
+    #[cfg(unix)]
+    pub total_readable_events: u64,
+    /// Number of readiness driver events that reported at least one writable fd.
+    #[cfg(unix)]
+    pub total_writable_events: u64,
     /// Number of Linux completion driver events observed by the executor.
     #[cfg(target_os = "linux")]
     pub total_completion_events: u64,

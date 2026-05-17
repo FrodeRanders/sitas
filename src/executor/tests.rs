@@ -649,7 +649,11 @@ fn executor_snapshot_reports_cumulative_scheduler_counters() {
     assert_eq!(snapshot.ready_poll_budget_exhaustions, 0);
     assert_eq!(snapshot.total_driver_events, 0);
     #[cfg(unix)]
-    assert_eq!(snapshot.total_readiness_events, 0);
+    {
+        assert_eq!(snapshot.total_readiness_events, 0);
+        assert_eq!(snapshot.total_readable_events, 0);
+        assert_eq!(snapshot.total_writable_events, 0);
+    }
     #[cfg(target_os = "linux")]
     assert_eq!(snapshot.total_completion_events, 0);
 }
@@ -883,6 +887,8 @@ fn readable_future_completes_when_fd_becomes_readable() {
     let snapshot = executor.snapshot();
     assert!(snapshot.total_driver_events > 0);
     assert!(snapshot.total_readiness_events > 0);
+    assert!(snapshot.total_readable_events > 0);
+    assert_eq!(snapshot.total_writable_events, 0);
 }
 
 #[cfg(unix)]
@@ -1021,6 +1027,11 @@ fn writable_future_completes_when_fd_is_writable() {
     executor.run();
 
     assert!(*output.lock().unwrap());
+    let snapshot = executor.snapshot();
+    assert!(snapshot.total_driver_events > 0);
+    assert!(snapshot.total_readiness_events > 0);
+    assert_eq!(snapshot.total_readable_events, 0);
+    assert!(snapshot.total_writable_events > 0);
 }
 
 #[cfg(unix)]

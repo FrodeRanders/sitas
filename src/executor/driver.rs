@@ -63,7 +63,10 @@ pub(super) fn apply_event(scheduler: &Scheduler, event: Option<DriverEvent>) {
     match event {
         #[cfg(unix)]
         Some(DriverEvent::Readiness(event)) => {
-            scheduler.record_readiness_driver_event();
+            scheduler.record_readiness_driver_event(
+                !event.readable.is_empty(),
+                !event.writable.is_empty(),
+            );
             scheduler.wake_readable_fds(&event.readable);
             scheduler.wake_writable_fds(&event.writable);
         }
