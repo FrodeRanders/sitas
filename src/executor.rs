@@ -22,6 +22,7 @@ use crate::os::IoUringDispatcherSnapshot;
 #[cfg(unix)]
 use crate::os::OsReactor;
 
+mod driver;
 mod future;
 mod join;
 mod scheduler;
@@ -35,6 +36,7 @@ mod unix_io;
 #[cfg(target_os = "linux")]
 mod uring;
 
+use driver::DriverEvent;
 pub use future::{
     Race, RaceOutput, Sleep, Timeout, TimeoutError, YieldNow, race, sleep, timeout, yield_now,
 };
@@ -380,13 +382,8 @@ impl Executor {
                 continue;
             }
 
-            if self.wait_io_uring_when_idle() {
-                self.scheduler.wake_expired_timers();
-                continue;
-            }
-
-            #[cfg(unix)]
-            self.wait_for_reactor_event("running executor");
+            let event = self.wait_for_driver_event("running executor");
+            self.apply_driver_event(event);
 
             self.scheduler.wake_expired_timers();
         }
@@ -431,13 +428,8 @@ impl Executor {
                 continue;
             }
 
-            if self.wait_io_uring_when_idle() {
-                self.scheduler.wake_expired_timers();
-                continue;
-            }
-
-            #[cfg(unix)]
-            self.wait_for_reactor_event("running root future");
+            let event = self.wait_for_driver_event("running root future");
+            self.apply_driver_event(event);
 
             self.scheduler.wake_expired_timers();
         }
@@ -468,31 +460,55 @@ impl Executor {
         }
     }
 
-    fn wait_io_uring_when_idle(&self) -> bool {
+    fn wait_for_driver_event(&self, context: &str) -> Option<DriverEvent> {
+        #[cfg(not(unix))]
+        let _ = context;
+
         #[cfg(target_os = "linux")]
-        {
-            if uring::should_wait() {
-                uring::wait_and_dispatch().expect("io_uring wait failed while running executor");
-                self.refresh_io_uring_snapshot();
-                return true;
+        if self.wait_for_io_uring_event() {
+            return Some(DriverEvent::Completion);
+        }
+
+        #[cfg(unix)]
+        return Some(self.wait_for_reactor_event(context));
+
+        #[allow(unreachable_code)]
+        None
+    }
+
+    fn apply_driver_event(&self, event: Option<DriverEvent>) {
+        match event {
+            #[cfg(unix)]
+            Some(DriverEvent::Readiness(event)) => {
+                self.scheduler.wake_readable_fds(&event.readable);
+                self.scheduler.wake_writable_fds(&event.writable);
             }
+            #[cfg(target_os = "linux")]
+            Some(DriverEvent::Completion) => {}
+            None => {}
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_io_uring_event(&self) -> bool {
+        if uring::should_wait() {
+            uring::wait_and_dispatch().expect("io_uring wait failed while running executor");
+            self.refresh_io_uring_snapshot();
+            return true;
         }
 
         false
     }
 
     #[cfg(unix)]
-    fn wait_for_reactor_event(&self, context: &str) {
+    fn wait_for_reactor_event(&self, context: &str) -> DriverEvent {
         let read_fds = self.scheduler.read_interest_fds();
         let write_fds = self.scheduler.write_interest_fds();
         let timeout = self.scheduler.time_until_next_timer();
-        let event = self
-            .reactor
+        self.reactor
             .wait_io(&read_fds, &write_fds, timeout)
-            .unwrap_or_else(|error| panic!("OS reactor wait failed while {context}: {error}"));
-
-        self.scheduler.wake_readable_fds(&event.readable);
-        self.scheduler.wake_writable_fds(&event.writable);
+            .unwrap_or_else(|error| panic!("OS reactor wait failed while {context}: {error}"))
+            .into()
     }
 
     fn refresh_io_uring_snapshot(&self) {

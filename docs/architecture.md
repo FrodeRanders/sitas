@@ -127,6 +127,8 @@ Responsibilities:
 - timer registration, timeout futures, and cancellation cleanup;
 - readiness futures for read/write interests;
 - Unix reactor sleep when no tasks are ready;
+- an internal event-driver result so the run loops consume readiness wakeups
+  and Linux completion wakeups through one executor-facing path;
 - Linux executor-owned `io_uring` read-at, read-exact-at, and write-at helpers
   driven from the executor loop when a shard has no ready tasks;
 - cumulative executor counters for spawned tasks, completed tasks, task polls,
