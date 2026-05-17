@@ -1,6 +1,5 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
@@ -16,6 +15,7 @@ use super::counters::SchedulerCounters;
 #[cfg(unix)]
 use super::io_interest::InterestSet;
 use super::task::{Task, set_current_task_waiting_for};
+use super::task_set::SchedulerTaskSet;
 use super::timer::TimerSet;
 use super::{ExecutorSnapshot, READY_POLL_BUDGET, SpawnError, TaskId, TaskWait};
 
@@ -32,8 +32,7 @@ pub(super) struct Scheduler {
 
 #[derive(Debug)]
 pub(super) struct SchedulerState {
-    pub(super) queue: VecDeque<Arc<Task>>,
-    pub(super) tasks: Vec<Weak<Task>>,
+    tasks: SchedulerTaskSet,
     pub(super) timers: TimerSet,
     #[cfg(unix)]
     pub(super) read_interests: InterestSet,
@@ -41,11 +40,7 @@ pub(super) struct SchedulerState {
     pub(super) write_interests: InterestSet,
     #[cfg(target_os = "linux")]
     io_uring: Option<IoUringDispatcherSnapshot>,
-    accepting: bool,
-    spawner_count: usize,
-    task_count: usize,
     counters: SchedulerCounters,
-    next_task_id: usize,
     next_timer_id: usize,
 }
 
@@ -53,8 +48,7 @@ impl Scheduler {
     pub(super) fn new(#[cfg(unix)] waker: OsWaker) -> Self {
         Self {
             state: Mutex::new(SchedulerState {
-                queue: VecDeque::new(),
-                tasks: Vec::new(),
+                tasks: SchedulerTaskSet::new(),
                 timers: TimerSet::new(),
                 #[cfg(unix)]
                 read_interests: InterestSet::new(),
@@ -62,11 +56,7 @@ impl Scheduler {
                 write_interests: InterestSet::new(),
                 #[cfg(target_os = "linux")]
                 io_uring: None,
-                accepting: true,
-                spawner_count: 1,
-                task_count: 0,
                 counters: SchedulerCounters::default(),
-                next_task_id: 0,
                 next_timer_id: 0,
             }),
             #[cfg(unix)]
@@ -76,21 +66,18 @@ impl Scheduler {
 
     pub(super) fn allocate_task_id(&self) -> TaskId {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        let id = state.next_task_id;
-        state.next_task_id = state.next_task_id.wrapping_add(1);
-        TaskId(id)
+        state.tasks.allocate_task_id()
     }
 
     pub(super) fn add_spawner(&self) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.spawner_count += 1;
+        state.tasks.add_spawner();
     }
 
     pub(super) fn remove_spawner(&self) {
         let should_wake = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            state.spawner_count = state.spawner_count.saturating_sub(1);
-            state.spawner_count == 0
+            state.tasks.remove_spawner()
         };
 
         if should_wake {
@@ -105,14 +92,8 @@ impl Scheduler {
 
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            if !state.accepting {
-                task.clear_queued();
-                return Err(SpawnError);
-            }
-            state.task_count += 1;
+            state.tasks.schedule_new(task)?;
             state.counters.record_spawned_task();
-            state.tasks.push(Arc::downgrade(&task));
-            state.queue.push_back(task);
         }
 
         self.wake_reactor();
@@ -126,11 +107,7 @@ impl Scheduler {
 
         {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            if !state.accepting {
-                task.clear_queued();
-                return Err(SpawnError);
-            }
-            state.queue.push_back(task);
+            state.tasks.schedule_existing(task)?;
         }
 
         self.wake_reactor();
@@ -141,30 +118,26 @@ impl Scheduler {
         self.state
             .lock()
             .expect("scheduler state mutex poisoned")
-            .queue
-            .pop_front()
+            .tasks
+            .next_task()
     }
 
     pub(super) fn is_drained(&self) -> bool {
         let state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.queue.is_empty() && state.spawner_count == 0 && state.task_count == 0
+        state.tasks.is_drained()
     }
 
     pub(super) fn has_ready_tasks(&self) -> bool {
-        !self
-            .state
+        self.state
             .lock()
             .expect("scheduler state mutex poisoned")
-            .queue
-            .is_empty()
+            .tasks
+            .has_ready_tasks()
     }
 
     pub(super) fn close(&self) {
         let tasks = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            state.accepting = false;
-            state.task_count = 0;
-            state.queue.clear();
             state.timers.clear();
             #[cfg(unix)]
             {
@@ -172,11 +145,7 @@ impl Scheduler {
                 state.write_interests.clear();
             }
 
-            state
-                .tasks
-                .drain(..)
-                .filter_map(|task| task.upgrade())
-                .collect::<Vec<_>>()
+            state.tasks.close()
         };
 
         for task in tasks {
@@ -188,10 +157,7 @@ impl Scheduler {
 
     pub(super) fn snapshot(&self) -> ExecutorSnapshot {
         let state = self.state.lock().expect("scheduler state mutex poisoned");
-        let accepting = state.accepting;
-        let spawner_count = state.spawner_count;
-        let task_count = state.task_count;
-        let ready_queue_len = state.queue.len();
+        let task_set = state.tasks.snapshot();
         let timer_count = state.timers.len();
         let counters = state.counters;
         #[cfg(unix)]
@@ -200,7 +166,7 @@ impl Scheduler {
         let write_interest_count = state.write_interests.len();
         #[cfg(target_os = "linux")]
         let io_uring = state.io_uring;
-        let tasks = state.tasks.clone();
+        let tasks = task_set.tasks;
         drop(state);
 
         let mut tasks = tasks
@@ -211,10 +177,10 @@ impl Scheduler {
         tasks.sort_by_key(|task| task.id);
 
         ExecutorSnapshot {
-            accepting,
-            spawner_count,
-            task_count,
-            ready_queue_len,
+            accepting: task_set.accepting,
+            spawner_count: task_set.spawner_count,
+            task_count: task_set.task_count,
+            ready_queue_len: task_set.ready_queue_len,
             timer_count,
             #[cfg(unix)]
             read_interest_count,
@@ -243,9 +209,9 @@ impl Scheduler {
     pub(super) fn finish_task(&self) {
         let should_wake = {
             let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-            state.task_count = state.task_count.saturating_sub(1);
+            let should_wake = state.tasks.finish_task();
             state.counters.record_completed_task();
-            state.queue.is_empty() && state.spawner_count == 0 && state.task_count == 0
+            should_wake
         };
 
         if should_wake {

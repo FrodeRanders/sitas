@@ -32,6 +32,7 @@ mod scheduler;
 mod scope;
 mod sync;
 mod task;
+mod task_set;
 #[cfg(unix)]
 mod tcp;
 mod timer;

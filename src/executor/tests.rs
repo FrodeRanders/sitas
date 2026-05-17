@@ -614,16 +614,7 @@ fn repeated_wakes_share_one_ready_queue_entry() {
     let task = executor.scheduler.next_task().unwrap();
     task.poll();
 
-    assert_eq!(
-        executor
-            .scheduler
-            .state
-            .lock()
-            .expect("scheduler state mutex poisoned")
-            .queue
-            .len(),
-        1
-    );
+    assert_eq!(executor.scheduler.snapshot().ready_queue_len, 1);
 }
 
 #[test]
