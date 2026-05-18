@@ -54,9 +54,13 @@ pub use spawner::{ExecutorObserver, SpawnError, Spawner};
 pub use sync::{Notified, Notify, StopSource, StopToken, stop_pair};
 #[cfg(unix)]
 pub use tcp::{
-    serve_tcp_n, serve_tcp_n_timeout, serve_tcp_until_idle, serve_tcp_until_idle_timeout,
-    serve_tcp_until_stopped, serve_tcp_until_stopped_scoped,
-    serve_tcp_until_stopped_scoped_timeout, serve_tcp_until_stopped_timeout,
+    serve_tcp_n, serve_tcp_n_in_group, serve_tcp_n_timeout, serve_tcp_n_timeout_in_group,
+    serve_tcp_until_idle, serve_tcp_until_idle_in_group, serve_tcp_until_idle_timeout,
+    serve_tcp_until_idle_timeout_in_group, serve_tcp_until_stopped,
+    serve_tcp_until_stopped_in_group, serve_tcp_until_stopped_scoped,
+    serve_tcp_until_stopped_scoped_in_group, serve_tcp_until_stopped_scoped_timeout,
+    serve_tcp_until_stopped_scoped_timeout_in_group, serve_tcp_until_stopped_timeout,
+    serve_tcp_until_stopped_timeout_in_group,
 };
 pub use types::{
     DEFAULT_SCHEDULING_GROUP_ID, DEFAULT_SCHEDULING_GROUP_SHARES, ExecutorSnapshot,

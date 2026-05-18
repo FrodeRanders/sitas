@@ -6,10 +6,10 @@ use super::{
 use super::{
     accept_async, accept_timeout_async, connect_async, connect_timeout_async, copy_async,
     copy_timeout_async, read_exact_async, read_exact_timeout_async, readable, serve_tcp_n,
-    serve_tcp_n_timeout, serve_tcp_until_idle, serve_tcp_until_idle_timeout,
+    serve_tcp_n_in_group, serve_tcp_n_timeout, serve_tcp_until_idle, serve_tcp_until_idle_timeout,
     serve_tcp_until_stopped, serve_tcp_until_stopped_scoped,
-    serve_tcp_until_stopped_scoped_timeout, serve_tcp_until_stopped_timeout, writable,
-    write_all_async, write_all_timeout_async,
+    serve_tcp_until_stopped_scoped_in_group, serve_tcp_until_stopped_scoped_timeout,
+    serve_tcp_until_stopped_timeout, writable, write_all_async, write_all_timeout_async,
 };
 #[cfg(target_os = "linux")]
 use super::{read_at_uring, read_exact_at_uring, write_all_at_uring};
@@ -1582,6 +1582,60 @@ fn serve_tcp_n_spawns_handlers_for_accepted_streams() {
 
 #[cfg(unix)]
 #[test]
+fn serve_tcp_n_in_group_spawns_handlers_in_scheduling_group() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (executor, spawner) = executor_and_spawner();
+    let server_spawner = spawner.clone();
+    let group = spawner.create_scheduling_group("tcp-handlers", 75).unwrap();
+    let group_id = group.id();
+    let group_for_server = group.clone();
+    let handler_started = Notify::new();
+    let handler_started_for_server = handler_started.clone();
+    let release_handler = Notify::new();
+    let release_handler_for_server = release_handler.clone();
+
+    spawner
+        .spawn(async move {
+            serve_tcp_n_in_group(
+                listener,
+                server_spawner,
+                &group_for_server,
+                1,
+                move |_stream, _peer| {
+                    let handler_started = handler_started_for_server.clone();
+                    let release_handler = release_handler_for_server.clone();
+                    async move {
+                        handler_started.notify_waiters();
+                        release_handler.notified().await;
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        })
+        .unwrap();
+
+    let _client = TcpStream::connect(address).unwrap();
+    executor.run_until(handler_started.notified());
+
+    let snapshot = spawner.snapshot();
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .any(|task| task.scheduling_group_id == group_id)
+    );
+
+    release_handler.notify_waiters();
+    drop(spawner);
+    executor.run();
+}
+
+#[cfg(unix)]
+#[test]
 fn serve_tcp_n_returns_handler_error() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -1995,6 +2049,61 @@ fn serve_tcp_until_stopped_scoped_stops_handlers() {
 
     assert_eq!(client.join().unwrap(), b'x');
     assert_eq!(*output.lock().unwrap(), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_tcp_until_stopped_scoped_in_group_spawns_handlers_in_scheduling_group() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (stop_source, stop_token) = stop_pair();
+    let (executor, spawner) = executor_and_spawner();
+    let server_spawner = spawner.clone();
+    let group = spawner
+        .create_scheduling_group("scoped-tcp-handlers", 40)
+        .unwrap();
+    let group_id = group.id();
+    let group_for_server = group.clone();
+    let handler_started = Notify::new();
+    let handler_started_for_server = handler_started.clone();
+
+    spawner
+        .spawn(async move {
+            let accepted = serve_tcp_until_stopped_scoped_in_group(
+                listener,
+                server_spawner,
+                &group_for_server,
+                stop_token,
+                move |_stream, _peer, handler_stop| {
+                    let handler_started = handler_started_for_server.clone();
+                    async move {
+                        handler_started.notify_waiters();
+                        handler_stop.await;
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(accepted, 1);
+        })
+        .unwrap();
+
+    let _client = TcpStream::connect(address).unwrap();
+    executor.run_until(handler_started.notified());
+
+    let snapshot = spawner.snapshot();
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .any(|task| task.scheduling_group_id == group_id)
+    );
+
+    stop_source.stop();
+    drop(spawner);
+    executor.run();
 }
 
 #[cfg(unix)]

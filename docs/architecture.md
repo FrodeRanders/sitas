@@ -196,6 +196,10 @@ The executor currently supports readiness-driven TCP helpers:
 - scoped stoppable server helpers that propagate shutdown to handlers;
 - bounded handler shutdown with abort of uncooperative handlers.
 
+Server helpers have default-group and explicit scheduling-group variants. The
+grouped variants place accepted handler tasks into the requested executor-local
+group while keeping the accept loop itself in the caller's current task.
+
 These helpers validate that one executor thread can interleave client and server TCP work using readiness events.
 
 ### `sharded_executor`

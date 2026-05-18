@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    JoinError, JoinHandle, Notify, RaceOutput, SpawnError, Spawner, StopToken, TaskScope,
-    TaskScopeError, TimeoutError, accept_async, accept_timeout_async, race, timeout,
+    JoinError, JoinHandle, Notify, RaceOutput, SchedulingGroup, SpawnError, Spawner, StopToken,
+    TaskScope, TaskScopeError, TimeoutError, accept_async, accept_timeout_async, race, timeout,
 };
 
 /// Accepts `connection_count` TCP connections and spawns one handler task for
@@ -30,6 +30,7 @@ where
     serve_tcp_n_with(
         listener,
         spawner,
+        None,
         connection_count,
         TcpHandlerShutdown::Wait,
         handler,
@@ -56,7 +57,106 @@ where
     serve_tcp_n_with(
         listener,
         spawner,
+        None,
         connection_count,
+        TcpHandlerShutdown::Timeout(shutdown_timeout),
+        handler,
+    )
+    .await
+}
+
+/// Accepts `connection_count` TCP connections and spawns handlers into
+/// `group`.
+pub async fn serve_tcp_n_in_group<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    group: &SchedulingGroup,
+    connection_count: usize,
+    handler: H,
+) -> io::Result<()>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_n_with(
+        listener,
+        spawner,
+        Some(group),
+        connection_count,
+        TcpHandlerShutdown::Wait,
+        handler,
+    )
+    .await
+}
+
+/// Accepts `connection_count` TCP connections, spawning handlers into `group`,
+/// then gives those handlers up to `shutdown_timeout` to finish.
+pub async fn serve_tcp_n_timeout_in_group<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    group: &SchedulingGroup,
+    connection_count: usize,
+    shutdown_timeout: Duration,
+    handler: H,
+) -> io::Result<()>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_n_with(
+        listener,
+        spawner,
+        Some(group),
+        connection_count,
+        TcpHandlerShutdown::Timeout(shutdown_timeout),
+        handler,
+    )
+    .await
+}
+
+/// Accepts TCP connections until `idle_timeout` elapses and spawns handlers
+/// into `group`.
+pub async fn serve_tcp_until_idle_in_group<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    group: &SchedulingGroup,
+    idle_timeout: Duration,
+    handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_until_idle_with(
+        listener,
+        spawner,
+        Some(group),
+        idle_timeout,
+        TcpHandlerShutdown::Wait,
+        handler,
+    )
+    .await
+}
+
+/// Accepts TCP connections until `idle_timeout` elapses, spawning handlers
+/// into `group`, then gives those handlers up to `shutdown_timeout` to finish.
+pub async fn serve_tcp_until_idle_timeout_in_group<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    group: &SchedulingGroup,
+    idle_timeout: Duration,
+    shutdown_timeout: Duration,
+    handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_until_idle_with(
+        listener,
+        spawner,
+        Some(group),
+        idle_timeout,
         TcpHandlerShutdown::Timeout(shutdown_timeout),
         handler,
     )
@@ -82,6 +182,7 @@ where
     serve_tcp_until_idle_with(
         listener,
         spawner,
+        None,
         idle_timeout,
         TcpHandlerShutdown::Wait,
         handler,
@@ -108,6 +209,7 @@ where
     serve_tcp_until_idle_with(
         listener,
         spawner,
+        None,
         idle_timeout,
         TcpHandlerShutdown::Timeout(shutdown_timeout),
         handler,
@@ -131,7 +233,15 @@ where
     H: FnMut(TcpStream, SocketAddr) -> F,
     F: Future<Output = io::Result<()>> + Send + 'static,
 {
-    serve_tcp_until_stopped_with(listener, spawner, stop, TcpHandlerShutdown::Wait, handler).await
+    serve_tcp_until_stopped_with(
+        listener,
+        spawner,
+        None,
+        stop,
+        TcpHandlerShutdown::Wait,
+        handler,
+    )
+    .await
 }
 
 /// Accepts TCP connections until `stop` completes, then gives handler tasks up
@@ -156,6 +266,56 @@ where
     serve_tcp_until_stopped_with(
         listener,
         spawner,
+        None,
+        stop,
+        TcpHandlerShutdown::Timeout(shutdown_timeout),
+        handler,
+    )
+    .await
+}
+
+/// Accepts TCP connections until `stop` completes and spawns handlers into
+/// `group`.
+pub async fn serve_tcp_until_stopped_in_group<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    group: &SchedulingGroup,
+    stop: StopToken,
+    handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_until_stopped_with(
+        listener,
+        spawner,
+        Some(group),
+        stop,
+        TcpHandlerShutdown::Wait,
+        handler,
+    )
+    .await
+}
+
+/// Accepts TCP connections until `stop` completes, spawning handlers into
+/// `group`, then gives those handlers up to `shutdown_timeout` to finish.
+pub async fn serve_tcp_until_stopped_timeout_in_group<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    group: &SchedulingGroup,
+    stop: StopToken,
+    shutdown_timeout: Duration,
+    handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_until_stopped_with(
+        listener,
+        spawner,
+        Some(group),
         stop,
         TcpHandlerShutdown::Timeout(shutdown_timeout),
         handler,
@@ -172,6 +332,7 @@ enum TcpHandlerShutdown {
 async fn serve_tcp_n_with<H, F>(
     listener: TcpListener,
     spawner: Spawner,
+    group: Option<&SchedulingGroup>,
     connection_count: usize,
     shutdown: TcpHandlerShutdown,
     mut handler: H,
@@ -185,11 +346,7 @@ where
 
     for _ in 0..connection_count {
         let (stream, peer) = accept_async(&listener).await?;
-        handlers.push(
-            spawner
-                .spawn_with_handle(handler(stream, peer))
-                .map_err(spawn_error_to_io)?,
-        );
+        handlers.push(spawn_tcp_handler(&spawner, group, handler(stream, peer))?);
     }
 
     join_tcp_handlers_with(handlers, shutdown).await
@@ -198,6 +355,7 @@ where
 async fn serve_tcp_until_idle_with<H, F>(
     listener: TcpListener,
     spawner: Spawner,
+    group: Option<&SchedulingGroup>,
     idle_timeout: Duration,
     shutdown: TcpHandlerShutdown,
     mut handler: H,
@@ -212,11 +370,7 @@ where
     loop {
         match accept_timeout_async(&listener, idle_timeout).await {
             Ok((stream, peer)) => {
-                handlers.push(
-                    spawner
-                        .spawn_with_handle(handler(stream, peer))
-                        .map_err(spawn_error_to_io)?,
-                );
+                handlers.push(spawn_tcp_handler(&spawner, group, handler(stream, peer))?);
             }
             Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
             Err(error) => return Err(error),
@@ -232,6 +386,7 @@ where
 async fn serve_tcp_until_stopped_with<H, F>(
     listener: TcpListener,
     spawner: Spawner,
+    group: Option<&SchedulingGroup>,
     stop: StopToken,
     shutdown: TcpHandlerShutdown,
     mut handler: H,
@@ -246,11 +401,7 @@ where
     loop {
         match race(accept_async(&listener), stop.clone()).await {
             RaceOutput::First(Ok((stream, peer))) => {
-                handlers.push(
-                    spawner
-                        .spawn_with_handle(handler(stream, peer))
-                        .map_err(spawn_error_to_io)?,
-                );
+                handlers.push(spawn_tcp_handler(&spawner, group, handler(stream, peer))?);
             }
             RaceOutput::First(Err(error)) => return Err(error),
             RaceOutput::Second(()) => break,
@@ -280,8 +431,15 @@ where
     H: FnMut(TcpStream, SocketAddr, StopToken) -> F,
     F: Future<Output = io::Result<()>> + Send + 'static,
 {
-    serve_tcp_until_stopped_scoped_with(listener, spawner, stop, ScopedTcpShutdown::Wait, handler)
-        .await
+    serve_tcp_until_stopped_scoped_with(
+        listener,
+        spawner,
+        None,
+        stop,
+        ScopedTcpShutdown::Wait,
+        handler,
+    )
+    .await
 }
 
 /// Accepts TCP connections until `stop` completes, then gives handler tasks up
@@ -303,6 +461,57 @@ where
     serve_tcp_until_stopped_scoped_with(
         listener,
         spawner,
+        None,
+        stop,
+        ScopedTcpShutdown::Timeout(shutdown_timeout),
+        handler,
+    )
+    .await
+}
+
+/// Accepts TCP connections until `stop` completes, spawning stop-aware handler
+/// tasks into `group`.
+pub async fn serve_tcp_until_stopped_scoped_in_group<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    group: &SchedulingGroup,
+    stop: StopToken,
+    handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr, StopToken) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_until_stopped_scoped_with(
+        listener,
+        spawner,
+        Some(group),
+        stop,
+        ScopedTcpShutdown::Wait,
+        handler,
+    )
+    .await
+}
+
+/// Accepts TCP connections until `stop` completes, spawning stop-aware handler
+/// tasks into `group`, then gives those handlers up to `shutdown_timeout` to
+/// finish after receiving their shared stop token.
+pub async fn serve_tcp_until_stopped_scoped_timeout_in_group<H, F>(
+    listener: TcpListener,
+    spawner: Spawner,
+    group: &SchedulingGroup,
+    stop: StopToken,
+    shutdown_timeout: Duration,
+    handler: H,
+) -> io::Result<usize>
+where
+    H: FnMut(TcpStream, SocketAddr, StopToken) -> F,
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    serve_tcp_until_stopped_scoped_with(
+        listener,
+        spawner,
+        Some(group),
         stop,
         ScopedTcpShutdown::Timeout(shutdown_timeout),
         handler,
@@ -319,6 +528,7 @@ enum ScopedTcpShutdown {
 async fn serve_tcp_until_stopped_scoped_with<H, F>(
     listener: TcpListener,
     spawner: Spawner,
+    group: Option<&SchedulingGroup>,
     stop: StopToken,
     shutdown: ScopedTcpShutdown,
     mut handler: H,
@@ -343,22 +553,26 @@ where
             RaceOutput::First(Ok((stream, peer))) => {
                 let handler_error = Arc::clone(&handler_error);
                 let handler_error_notify = handler_error_notify.clone();
-                handlers
-                    .spawn({
-                        let future = handler(stream, peer, handlers.stop_token());
-                        async move {
-                            if let Err(error) = future.await {
-                                let mut stored = handler_error
-                                    .lock()
-                                    .expect("TCP handler error mutex poisoned");
-                                if stored.is_none() {
-                                    *stored = Some(error);
-                                }
-                                handler_error_notify.notify_waiters();
+                let future = {
+                    let future = handler(stream, peer, handlers.stop_token());
+                    async move {
+                        if let Err(error) = future.await {
+                            let mut stored = handler_error
+                                .lock()
+                                .expect("TCP handler error mutex poisoned");
+                            if stored.is_none() {
+                                *stored = Some(error);
                             }
+                            handler_error_notify.notify_waiters();
                         }
-                    })
-                    .map_err(spawn_error_to_io)?;
+                    }
+                };
+
+                match group {
+                    Some(group) => handlers.spawn_in_group(group, future),
+                    None => handlers.spawn(future),
+                }
+                .map_err(spawn_error_to_io)?;
                 accepted += 1;
             }
             RaceOutput::First(Err(error)) => return Err(error),
@@ -384,6 +598,21 @@ where
         (_, Ok(()), Some(error)) => Err(error),
         (_, Ok(()), None) => Ok(accepted),
     }
+}
+
+fn spawn_tcp_handler<F>(
+    spawner: &Spawner,
+    group: Option<&SchedulingGroup>,
+    future: F,
+) -> io::Result<JoinHandle<io::Result<()>>>
+where
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    match group {
+        Some(group) => spawner.spawn_with_handle_in_group(group, future),
+        None => spawner.spawn_with_handle(future),
+    }
+    .map_err(spawn_error_to_io)
 }
 
 async fn join_tcp_handlers_with(
