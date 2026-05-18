@@ -6,14 +6,12 @@
 //! Unix, the `non-std-runtime` branch parks the executor on an OS reactor wake
 //! source when no tasks are ready.
 
-use std::error::Error;
-use std::fmt;
 use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -33,6 +31,7 @@ mod root;
 mod scheduler;
 mod scope;
 mod snapshot;
+mod spawner;
 mod sync;
 mod task;
 mod task_set;
@@ -50,12 +49,11 @@ pub use future::{
     Race, RaceOutput, Sleep, Timeout, TimeoutError, YieldNow, race, sleep, timeout, yield_now,
 };
 pub use join::{JoinError, JoinHandle};
-use join::{JoinState, complete_join};
 use root::RootWaker;
 use scheduler::Scheduler;
 pub use scope::{TaskScope, TaskScopeError};
+pub use spawner::{ExecutorObserver, SpawnError, Spawner};
 pub use sync::{Notified, Notify, StopSource, StopToken, stop_pair};
-use task::Task;
 #[cfg(unix)]
 pub use tcp::{
     serve_tcp_n, serve_tcp_n_timeout, serve_tcp_until_idle, serve_tcp_until_idle_timeout,
@@ -200,171 +198,6 @@ pub struct ExecutorSnapshot {
     pub tasks: Vec<TaskSnapshot>,
 }
 
-/// Weak observer handle for an executor.
-///
-/// Unlike [`Spawner`], this handle does not keep the executor alive and does
-/// not count as a live spawner. It is intended for monitoring code that should
-/// observe runtime state without affecting shutdown.
-#[derive(Debug, Clone)]
-pub struct ExecutorObserver {
-    scheduler: Weak<Scheduler>,
-}
-
-impl ExecutorObserver {
-    /// Returns an executor snapshot if the executor is still alive.
-    pub fn snapshot(&self) -> Option<ExecutorSnapshot> {
-        self.scheduler
-            .upgrade()
-            .map(|scheduler| scheduler.snapshot())
-    }
-}
-
-/// Error returned when a task cannot be submitted to an executor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SpawnError;
-
-impl fmt::Display for SpawnError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "executor is not accepting tasks")
-    }
-}
-
-impl Error for SpawnError {}
-
-/// Handle used to submit futures to an [`Executor`].
-#[derive(Debug)]
-pub struct Spawner {
-    scheduler: Arc<Scheduler>,
-}
-
-impl Clone for Spawner {
-    fn clone(&self) -> Self {
-        self.scheduler.add_spawner();
-
-        Self {
-            scheduler: Arc::clone(&self.scheduler),
-        }
-    }
-}
-
-impl Drop for Spawner {
-    fn drop(&mut self) {
-        self.scheduler.remove_spawner();
-    }
-}
-
-impl Spawner {
-    /// Spawns a future onto the executor's ready queue.
-    pub fn spawn<F>(&self, future: F) -> Result<(), SpawnError>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.spawn_with_name(None, future)
-    }
-
-    /// Spawns a named future onto the executor's ready queue.
-    pub fn spawn_named<F>(&self, name: impl Into<String>, future: F) -> Result<(), SpawnError>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.spawn_with_name(Some(name.into()), future)
-    }
-
-    fn spawn_with_name<F>(&self, name: Option<String>, future: F) -> Result<(), SpawnError>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        self.spawn_with_panic_handler(name, future, None)
-            .map(|_| ())
-    }
-
-    /// Spawns a future and returns a handle that can await its output.
-    pub fn spawn_with_handle<F>(&self, future: F) -> Result<JoinHandle<F::Output>, SpawnError>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.spawn_with_handle_and_name(None, future)
-    }
-
-    /// Spawns a named future and returns a handle that can await its output.
-    pub fn spawn_with_handle_named<F>(
-        &self,
-        name: impl Into<String>,
-        future: F,
-    ) -> Result<JoinHandle<F::Output>, SpawnError>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.spawn_with_handle_and_name(Some(name.into()), future)
-    }
-
-    fn spawn_with_handle_and_name<F>(
-        &self,
-        name: Option<String>,
-        future: F,
-    ) -> Result<JoinHandle<F::Output>, SpawnError>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let shared = Arc::new(Mutex::new(JoinState {
-            result: None,
-            waker: None,
-        }));
-        let shared_for_task = Arc::clone(&shared);
-        let shared_for_panic = Arc::clone(&shared);
-
-        let task = self.spawn_with_panic_handler(
-            name,
-            async move {
-                let output = future.await;
-                complete_join(&shared_for_task, Ok(output));
-            },
-            Some(Box::new(move |payload| {
-                complete_join(&shared_for_panic, Err(JoinError::Panic(payload)));
-            })),
-        )?;
-
-        Ok(JoinHandle::new(shared, task))
-    }
-
-    fn spawn_with_panic_handler<F>(
-        &self,
-        name: Option<String>,
-        future: F,
-        panic_handler: Option<PanicHandler>,
-    ) -> Result<Arc<Task>, SpawnError>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let id = self.scheduler.allocate_task_id();
-        let task = Arc::new(Task::new(
-            id,
-            name,
-            Box::pin(future),
-            Arc::clone(&self.scheduler),
-            panic_handler,
-        ));
-
-        self.scheduler.schedule(Arc::clone(&task))?;
-        Ok(task)
-    }
-
-    /// Returns an owned snapshot of this spawner's executor.
-    pub fn snapshot(&self) -> ExecutorSnapshot {
-        self.scheduler.snapshot()
-    }
-
-    /// Returns a weak observer handle for this spawner's executor.
-    pub fn observer(&self) -> ExecutorObserver {
-        ExecutorObserver {
-            scheduler: Arc::downgrade(&self.scheduler),
-        }
-    }
-}
-
 /// Single-threaded executor that polls tasks from a ready queue.
 #[derive(Debug)]
 pub struct Executor {
@@ -381,9 +214,7 @@ impl Executor {
 
     /// Returns a weak observer handle for this executor.
     pub fn observer(&self) -> ExecutorObserver {
-        ExecutorObserver {
-            scheduler: Arc::downgrade(&self.scheduler),
-        }
+        ExecutorObserver::new(Arc::downgrade(&self.scheduler))
     }
 
     /// Runs tasks until all spawners and runnable tasks are gone.
@@ -525,7 +356,7 @@ pub fn executor_and_spawner() -> (Executor, Spawner) {
                 scheduler: Arc::clone(&scheduler),
                 reactor,
             },
-            Spawner { scheduler },
+            Spawner::new(scheduler),
         )
     }
 }
