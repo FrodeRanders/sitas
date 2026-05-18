@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use super::join::{JoinState, complete_join};
 use super::scheduler::Scheduler;
+use super::scheduling_group::{SchedulingGroup, SchedulingGroupError};
 use super::task::Task;
-use super::{ExecutorSnapshot, JoinError, JoinHandle, PanicHandler};
+use super::{ExecutorSnapshot, JoinError, JoinHandle, PanicHandler, SchedulingGroupId};
 
 /// Weak observer handle for an executor.
 ///
@@ -70,6 +71,21 @@ impl Spawner {
         Self { scheduler }
     }
 
+    /// Creates an executor-local scheduling group with a relative weight.
+    pub fn create_scheduling_group(
+        &self,
+        name: impl Into<String>,
+        shares: u32,
+    ) -> Result<SchedulingGroup, SchedulingGroupError> {
+        if shares == 0 {
+            return Err(SchedulingGroupError::ZeroShares);
+        }
+
+        let name = name.into();
+        let id = self.scheduler.create_scheduling_group(name.clone(), shares);
+        Ok(SchedulingGroup::new(id, name, shares))
+    }
+
     /// Spawns a future onto the executor's ready queue.
     pub fn spawn<F>(&self, future: F) -> Result<(), SpawnError>
     where
@@ -86,11 +102,44 @@ impl Spawner {
         self.spawn_with_name(Some(name.into()), future)
     }
 
+    /// Spawns a future into a scheduling group.
+    pub fn spawn_in_group<F>(&self, group: &SchedulingGroup, future: F) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_name_and_group(None, group.id(), future)
+    }
+
+    /// Spawns a named future into a scheduling group.
+    pub fn spawn_named_in_group<F>(
+        &self,
+        group: &SchedulingGroup,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_name_and_group(Some(name.into()), group.id(), future)
+    }
+
     fn spawn_with_name<F>(&self, name: Option<String>, future: F) -> Result<(), SpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_with_panic_handler(name, future, None)
+        self.spawn_with_name_and_group(name, SchedulingGroup::default().id(), future)
+    }
+
+    fn spawn_with_name_and_group<F>(
+        &self,
+        name: Option<String>,
+        scheduling_group_id: SchedulingGroupId,
+        future: F,
+    ) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_panic_handler(name, scheduling_group_id, future, None)
             .map(|_| ())
     }
 
@@ -116,9 +165,50 @@ impl Spawner {
         self.spawn_with_handle_and_name(Some(name.into()), future)
     }
 
+    /// Spawns a future into a scheduling group and returns an awaitable handle.
+    pub fn spawn_with_handle_in_group<F>(
+        &self,
+        group: &SchedulingGroup,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, SpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_with_handle_name_and_group(None, group.id(), future)
+    }
+
+    /// Spawns a named future into a scheduling group and returns an awaitable
+    /// handle.
+    pub fn spawn_with_handle_named_in_group<F>(
+        &self,
+        group: &SchedulingGroup,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, SpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_with_handle_name_and_group(Some(name.into()), group.id(), future)
+    }
+
     fn spawn_with_handle_and_name<F>(
         &self,
         name: Option<String>,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, SpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_with_handle_name_and_group(name, SchedulingGroup::default().id(), future)
+    }
+
+    fn spawn_with_handle_name_and_group<F>(
+        &self,
+        name: Option<String>,
+        scheduling_group_id: SchedulingGroupId,
         future: F,
     ) -> Result<JoinHandle<F::Output>, SpawnError>
     where
@@ -134,6 +224,7 @@ impl Spawner {
 
         let task = self.spawn_with_panic_handler(
             name,
+            scheduling_group_id,
             async move {
                 let output = future.await;
                 complete_join(&shared_for_task, Ok(output));
@@ -149,6 +240,7 @@ impl Spawner {
     fn spawn_with_panic_handler<F>(
         &self,
         name: Option<String>,
+        scheduling_group_id: SchedulingGroupId,
         future: F,
         panic_handler: Option<PanicHandler>,
     ) -> Result<Arc<Task>, SpawnError>
@@ -156,9 +248,10 @@ impl Spawner {
         F: Future<Output = ()> + Send + 'static,
     {
         let id = self.scheduler.allocate_task_id();
-        let task = Arc::new(Task::new(
+        let task = Arc::new(Task::new_in_group(
             id,
             name,
+            scheduling_group_id,
             Box::pin(future),
             Arc::clone(&self.scheduler),
             panic_handler,

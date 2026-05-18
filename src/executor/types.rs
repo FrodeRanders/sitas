@@ -5,6 +5,17 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use crate::os::IoUringDispatcherSnapshot;
 
+/// Identifier assigned to an executor scheduling group.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SchedulingGroupId(pub usize);
+
+/// Identifier of the default scheduling group used by ordinary spawns.
+pub const DEFAULT_SCHEDULING_GROUP_ID: SchedulingGroupId = SchedulingGroupId(0);
+
+/// Relative weight assigned to the default scheduling group.
+pub const DEFAULT_SCHEDULING_GROUP_SHARES: u32 = 100;
+
 /// Identifier assigned to a task when it is spawned.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -59,6 +70,8 @@ pub struct TaskSnapshot {
     pub id: TaskId,
     /// Optional human-readable task name supplied by the spawner.
     pub name: Option<String>,
+    /// Scheduling group this task belongs to.
+    pub scheduling_group_id: SchedulingGroupId,
     /// Current coarse task lifecycle state.
     pub status: TaskStatus,
     /// Last wait interest registered by this task, if known.
@@ -77,6 +90,24 @@ pub struct TaskSnapshot {
     pub last_poll_finished_at: Option<Instant>,
 }
 
+/// Owned point-in-time summary of one scheduling group.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulingGroupSnapshot {
+    /// Executor-local scheduling group identifier.
+    pub id: SchedulingGroupId,
+    /// Human-readable group name.
+    pub name: String,
+    /// Relative scheduling weight.
+    pub shares: u32,
+    /// Number of ready tasks currently queued in this group.
+    pub ready_queue_len: usize,
+    /// Weighted virtual runtime accumulated by this group.
+    pub virtual_runtime: u128,
+    /// Total wall-clock poll time charged to this group.
+    pub total_poll_time: Duration,
+}
+
 /// Owned point-in-time summary of one executor.
 #[must_use]
 #[derive(Debug, Clone)]
@@ -89,6 +120,8 @@ pub struct ExecutorSnapshot {
     pub task_count: usize,
     /// Number of tasks currently queued for polling.
     pub ready_queue_len: usize,
+    /// Owned snapshots of executor scheduling groups.
+    pub scheduling_groups: Vec<SchedulingGroupSnapshot>,
     /// Number of registered timers.
     pub timer_count: usize,
     /// Number of registered read-readiness interests.

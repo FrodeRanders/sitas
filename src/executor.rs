@@ -24,6 +24,7 @@ mod io_interest;
 mod join;
 mod root;
 mod scheduler;
+mod scheduling_group;
 mod scope;
 mod snapshot;
 mod spawner;
@@ -47,6 +48,7 @@ pub use future::{
 pub use join::{JoinError, JoinHandle};
 use root::RootWaker;
 use scheduler::Scheduler;
+pub use scheduling_group::{SchedulingGroup, SchedulingGroupError};
 pub use scope::{TaskScope, TaskScopeError};
 pub use spawner::{ExecutorObserver, SpawnError, Spawner};
 pub use sync::{Notified, Notify, StopSource, StopToken, stop_pair};
@@ -56,7 +58,10 @@ pub use tcp::{
     serve_tcp_until_stopped, serve_tcp_until_stopped_scoped,
     serve_tcp_until_stopped_scoped_timeout, serve_tcp_until_stopped_timeout,
 };
-pub use types::{ExecutorSnapshot, TaskId, TaskSnapshot, TaskStatus, TaskWait};
+pub use types::{
+    DEFAULT_SCHEDULING_GROUP_ID, DEFAULT_SCHEDULING_GROUP_SHARES, ExecutorSnapshot,
+    SchedulingGroupId, SchedulingGroupSnapshot, TaskId, TaskSnapshot, TaskStatus, TaskWait,
+};
 #[cfg(unix)]
 pub use unix_io::{
     Readable, Writable, accept_async, accept_timeout_async, connect_async, connect_timeout_async,
@@ -171,7 +176,9 @@ impl Executor {
                 break;
             };
             polled += 1;
-            task.poll();
+            if let Some((group_id, poll_duration)) = task.poll() {
+                self.scheduler.record_task_poll(group_id, poll_duration);
+            }
         }
 
         self.scheduler.record_ready_poll_batch(

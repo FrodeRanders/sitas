@@ -2,16 +2,17 @@ use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::current::{enter_scheduler, enter_task};
 use super::scheduler::Scheduler;
 use super::task_state::TaskState;
-use super::{BoxFuture, PanicHandler, TaskId, TaskSnapshot, TaskWait};
+use super::{BoxFuture, PanicHandler, SchedulingGroupId, TaskId, TaskSnapshot, TaskWait};
 
 pub(super) struct Task {
     id: TaskId,
     name: Option<String>,
+    scheduling_group_id: SchedulingGroupId,
     created_at: Instant,
     state: Mutex<TaskState>,
     scheduler: Arc<Scheduler>,
@@ -24,6 +25,7 @@ impl fmt::Debug for Task {
 }
 
 impl Task {
+    #[cfg(test)]
     pub(super) fn new(
         id: TaskId,
         name: Option<String>,
@@ -31,25 +33,41 @@ impl Task {
         scheduler: Arc<Scheduler>,
         panic_handler: Option<PanicHandler>,
     ) -> Self {
+        Self::new_in_group(
+            id,
+            name,
+            super::types::DEFAULT_SCHEDULING_GROUP_ID,
+            future,
+            scheduler,
+            panic_handler,
+        )
+    }
+
+    pub(super) fn new_in_group(
+        id: TaskId,
+        name: Option<String>,
+        scheduling_group_id: SchedulingGroupId,
+        future: BoxFuture,
+        scheduler: Arc<Scheduler>,
+        panic_handler: Option<PanicHandler>,
+    ) -> Self {
         Self {
             id,
             name,
+            scheduling_group_id,
             created_at: Instant::now(),
             state: Mutex::new(TaskState::new(future, panic_handler)),
             scheduler,
         }
     }
 
-    pub(super) fn poll(self: Arc<Self>) {
+    pub(super) fn poll(self: Arc<Self>) -> Option<(SchedulingGroupId, Duration)> {
         let waker = Waker::from(self.clone());
         let mut context = Context::from_waker(&waker);
         let poll_started_at = Instant::now();
         let mut future = {
             let mut state = self.state.lock().expect("task state mutex poisoned");
-            let Some(future) = state.take_future_for_poll(poll_started_at) else {
-                return;
-            };
-            future
+            state.take_future_for_poll(poll_started_at)?
         };
 
         let current_scheduler = enter_scheduler(Arc::clone(&self.scheduler));
@@ -94,6 +112,8 @@ impl Task {
                 self.scheduler.finish_task();
             }
         }
+
+        Some((self.scheduling_group_id, poll_duration))
     }
 
     pub(super) fn mark_queued(&self) -> bool {
@@ -129,6 +149,10 @@ impl Task {
             .clear_queued();
     }
 
+    pub(super) fn scheduling_group_id(&self) -> SchedulingGroupId {
+        self.scheduling_group_id
+    }
+
     pub(super) fn set_waiting_for(&self, waiting_for: TaskWait) {
         let mut state = self.state.lock().expect("task state mutex poisoned");
         state.set_waiting_for(waiting_for);
@@ -136,7 +160,12 @@ impl Task {
 
     pub(super) fn snapshot(&self) -> TaskSnapshot {
         let state = self.state.lock().expect("task state mutex poisoned");
-        state.snapshot(self.id, self.name.clone(), self.created_at)
+        state.snapshot(
+            self.id,
+            self.name.clone(),
+            self.scheduling_group_id,
+            self.created_at,
+        )
     }
 }
 

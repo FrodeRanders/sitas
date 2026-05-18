@@ -18,7 +18,7 @@ use super::snapshot::{ExecutorSnapshotParts, build_executor_snapshot};
 use super::task::Task;
 use super::task_set::SchedulerTaskSet;
 use super::timer::TimerSet;
-use super::{ExecutorSnapshot, SpawnError, TaskId, TaskWait};
+use super::{ExecutorSnapshot, SchedulingGroupId, SpawnError, TaskId, TaskWait};
 
 #[derive(Debug)]
 pub(super) struct Scheduler {
@@ -58,6 +58,11 @@ impl Scheduler {
     pub(super) fn allocate_task_id(&self) -> TaskId {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
         state.tasks.allocate_task_id()
+    }
+
+    pub(super) fn create_scheduling_group(&self, name: String, shares: u32) -> SchedulingGroupId {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.tasks.create_scheduling_group(name, shares)
     }
 
     pub(super) fn add_spawner(&self) {
@@ -180,6 +185,11 @@ impl Scheduler {
         state
             .counters
             .record_ready_poll_batch(polled, exhausted_budget);
+    }
+
+    pub(super) fn record_task_poll(&self, group_id: SchedulingGroupId, poll_duration: Duration) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.tasks.record_task_poll(group_id, poll_duration);
     }
 
     #[cfg(unix)]

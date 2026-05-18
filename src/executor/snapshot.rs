@@ -32,6 +32,7 @@ pub(super) fn build_executor_snapshot(parts: ExecutorSnapshotParts) -> ExecutorS
         spawner_count: parts.tasks.spawner_count,
         task_count: parts.tasks.task_count,
         ready_queue_len: parts.tasks.ready_queue_len,
+        scheduling_groups: parts.tasks.groups,
         timer_count: parts.timer_count,
         #[cfg(unix)]
         read_interest_count: parts.read_interest_count,
@@ -65,7 +66,7 @@ mod tests {
 
     use super::super::scheduler::Scheduler;
     use super::super::task::Task;
-    use super::super::{BoxFuture, TaskId};
+    use super::super::{BoxFuture, DEFAULT_SCHEDULING_GROUP_ID, SchedulingGroupSnapshot, TaskId};
     use super::*;
 
     fn scheduler() -> Arc<Scheduler> {
@@ -100,8 +101,20 @@ mod tests {
             total_completion_events: 2,
         };
 
+        let default_group = SchedulingGroupSnapshot {
+            id: DEFAULT_SCHEDULING_GROUP_ID,
+            name: String::from("default"),
+            shares: super::super::DEFAULT_SCHEDULING_GROUP_SHARES,
+            ready_queue_len: task_snapshot.ready_queue_len,
+            virtual_runtime: 5,
+            total_poll_time: std::time::Duration::from_millis(2),
+        };
+
         ExecutorSnapshotParts {
-            tasks: task_snapshot,
+            tasks: SchedulerTaskSnapshot {
+                groups: vec![default_group],
+                ..task_snapshot
+            },
             timer_count: 3,
             counters,
             #[cfg(unix)]
@@ -120,6 +133,7 @@ mod tests {
             spawner_count: 2,
             task_count: 4,
             ready_queue_len: 1,
+            groups: Vec::new(),
             tasks: Vec::new(),
         };
 
@@ -129,6 +143,8 @@ mod tests {
         assert_eq!(snapshot.spawner_count, 2);
         assert_eq!(snapshot.task_count, 4);
         assert_eq!(snapshot.ready_queue_len, 1);
+        assert_eq!(snapshot.scheduling_groups.len(), 1);
+        assert_eq!(snapshot.scheduling_groups[0].name, "default");
         assert_eq!(snapshot.timer_count, 3);
         assert_eq!(snapshot.ready_poll_budget, super::super::READY_POLL_BUDGET);
         assert_eq!(snapshot.total_spawned_tasks, 10);
@@ -164,6 +180,7 @@ mod tests {
             spawner_count: 1,
             task_count: 2,
             ready_queue_len: 0,
+            groups: Vec::new(),
             tasks: vec![Arc::downgrade(&high), dropped_weak, Arc::downgrade(&low)],
         };
 

@@ -63,6 +63,8 @@ if [ "$#" -eq 0 ]; then
         cargo run --example os_uring_batch
         cargo run --example os_uring_abandon
         cargo run --example os_uring_lifecycle
+        cargo run --example scheduling_group_demo
+	    cargo run --example sharded_scheduling_groups
     '
 fi
 

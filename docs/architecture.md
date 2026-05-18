@@ -110,6 +110,8 @@ Responsibilities:
 
 - owning pinned futures in tasks;
 - maintaining a ready queue;
+- maintaining per-scheduling-group ready queues with weighted virtual runtime
+  selection when tasks opt into explicit scheduling groups;
 - coalescing repeated wakes to one ready-queue entry per task;
 - budgeting ready-queue polling so self-waking tasks cannot indefinitely starve timers or readiness;
 - implementing custom wakers that re-enqueue tasks;
@@ -138,6 +140,36 @@ Responsibilities:
   and ready-poll budget exhaustion events.
 
 The executor is intentionally small and dependency-free. It is a semantic experiment before a production runtime.
+
+### Scheduling groups
+
+Scheduling groups are the first small Seastar-like resource-class mechanism in
+the custom executor. A [`Spawner`](../src/executor/spawner.rs) can create an
+executor-local group with a name and relative share count, then spawn tasks into
+that group. Ordinary `spawn` calls use the default group with 100 shares.
+
+Each group owns its own ready queue. When the executor chooses the next ready
+task, it selects a non-empty group with the lowest weighted virtual runtime,
+then pops one task from that group's FIFO queue. After the task is polled, the
+executor charges the group with actual wall-clock poll time scaled by its
+shares. This is intentionally simple: it gives CPU-heavy cooperative tasks a
+real weighted scheduling signal without introducing preemption, priorities,
+load balancing, or a production resource controller.
+
+Scheduling group snapshots are owned values and include group id, name, shares,
+ready queue length, total charged poll time, and virtual runtime. Task snapshots
+include the scheduling group id. The `scheduling_group_demo` example first runs
+all work in the default group as a baseline, then repeats the workload with
+weighted groups.
+
+On `ShardedExecutor`, a sharded scheduling group is represented as one
+executor-local scheduling group per shard. Creating a group on all shards does
+not introduce a global scheduler or shared runtime state; it is a convenience
+for giving matching per-shard groups the same name and shares. Grouped fan-out
+spawns and grouped submitter calls still place work explicitly on each shard.
+Sharded scheduling group handles are tied to the runtime that created them;
+using a group handle with another runtime is rejected rather than silently
+targeting same-numbered executor-local groups.
 
 ### TCP helpers
 
@@ -173,7 +205,13 @@ Current responsibilities:
 - `spawn_on` places a future on an explicit `ShardId`;
 - `spawn_named_on` gives observable task names;
 - `spawn_with_handle_on` returns awaitable join handles;
+- grouped single-shard spawn helpers place explicitly addressed work into
+  matching executor-local scheduling groups;
 - `spawn_on_all`, `spawn_named_on_all`, `map_all`, and `map_reduce_all` provide direct runtime-level fan-out and shard-tagged collection helpers;
+- `create_scheduling_group_on_all` and grouped fan-out spawn helpers create
+  matching executor-local scheduling groups across shards without adding
+  implicit load balancing; grouped helpers are available in both named and
+  unnamed forms;
 - `current_executor_shard` exposes the current shard identity from code running on a shard;
 - `current_executor_cpu_placement` exposes that shard thread's observed CPU placement status from code running on a shard;
 - `available_cpu_ids` reports the CPU ids used by sequential placement;
@@ -200,8 +238,12 @@ Supported higher-level forms:
 
 - submit to one shard and await a handle;
 - named submit to one shard;
+- submit into a sharded scheduling group on one shard, with named and unnamed
+  forms;
 - submit to all shards;
 - named submit to all shards;
+- submit into a sharded scheduling group on all shards, with named and unnamed
+  forms;
 - `join_all_shards` returning shard-tagged outputs;
 - `join_all_shards_timeout` for bounded joins that abort still-owned shard work on timeout or join failure;
 - `map_all` and `map_named_all`;
@@ -466,7 +508,7 @@ The current architecture does not yet aim to provide:
   sharded executor;
 - broader BSD `kqueue` support beyond macOS/iOS;
 - generic load balancing;
-- Seastar-like scheduling/resource classes;
+- production-grade Seastar-like scheduling/resource classes;
 - a stable public runtime API;
 - replacing the custom runtime path with Tokio, Glommio, Monoio, or another external runtime.
 
@@ -498,7 +540,8 @@ CPU placement exists as an experimental Linux-supported runtime request. Portabl
    deadline-aware wait path instead of the current priority-based integration.
 4. Generalize the `kqueue` backend beyond macOS/iOS where the platform ABI is
    known.
-5. Add scheduling/resource classes only after the executor and service semantics are stable.
+5. Extend scheduling/resource classes beyond the current minimal weighted
+   cooperative groups only after the executor and service semantics are stable.
 6. Explore network-facing sharded services with explicit key routing.
 
 ## 13. Design stance

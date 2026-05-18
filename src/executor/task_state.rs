@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use super::{BoxFuture, PanicHandler, TaskId, TaskSnapshot, TaskStatus, TaskWait};
+use super::{
+    BoxFuture, PanicHandler, SchedulingGroupId, TaskId, TaskSnapshot, TaskStatus, TaskWait,
+};
 
 pub(super) struct TaskState {
     future: Option<BoxFuture>,
@@ -143,6 +145,7 @@ impl TaskState {
         &self,
         id: TaskId,
         name: Option<String>,
+        scheduling_group_id: SchedulingGroupId,
         created_at: Instant,
     ) -> TaskSnapshot {
         let status = if self.completed && self.cancel_requested {
@@ -160,6 +163,7 @@ impl TaskState {
         TaskSnapshot {
             id,
             name,
+            scheduling_group_id,
             status,
             waiting_for: self.waiting_for,
             poll_count: self.poll_count,
@@ -175,13 +179,19 @@ impl TaskState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::DEFAULT_SCHEDULING_GROUP_ID;
 
     fn boxed_future() -> BoxFuture {
         Box::pin(async {})
     }
 
     fn task_snapshot(state: &TaskState) -> TaskSnapshot {
-        state.snapshot(TaskId(7), Some("task".to_string()), Instant::now())
+        state.snapshot(
+            TaskId(7),
+            Some("task".to_string()),
+            DEFAULT_SCHEDULING_GROUP_ID,
+            Instant::now(),
+        )
     }
 
     #[test]
@@ -191,6 +201,7 @@ mod tests {
 
         assert_eq!(snapshot.id, TaskId(7));
         assert_eq!(snapshot.name.as_deref(), Some("task"));
+        assert_eq!(snapshot.scheduling_group_id, DEFAULT_SCHEDULING_GROUP_ID);
         assert_eq!(snapshot.status, TaskStatus::Waiting);
         assert_eq!(snapshot.waiting_for, None);
         assert_eq!(snapshot.poll_count, 0);

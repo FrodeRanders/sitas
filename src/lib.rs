@@ -55,7 +55,8 @@ pub use counter::{
 };
 pub use error::ShardError;
 pub use executor::{
-    ExecutorObserver, ExecutorSnapshot, TaskId, TaskSnapshot, TaskStatus, TaskWait,
+    ExecutorObserver, ExecutorSnapshot, SchedulingGroup, SchedulingGroupError, SchedulingGroupId,
+    SchedulingGroupSnapshot, TaskId, TaskSnapshot, TaskStatus, TaskWait,
 };
 pub use kv::{
     KvAllKeysReply, KvDeleteManyReply, KvGetManyReply, KvReply, KvShardSnapshotsReply,
@@ -71,7 +72,7 @@ pub use sharded_executor::{
     CpuId, CpuPlacement, CpuPlacementStatus, ShardedExecutor, ShardedExecutorConfig,
     ShardedExecutorObserver, ShardedExecutorShardSnapshot, ShardedExecutorSnapshot,
     ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
-    ShardedSpawnError, ShardedSubmitter, available_cpu_ids, available_parallelism,
-    current_executor_cpu_placement, current_executor_shard, join_all_shards,
-    join_all_shards_timeout,
+    ShardedSchedulingGroup, ShardedSchedulingGroupError, ShardedSpawnError, ShardedSubmitter,
+    available_cpu_ids, available_parallelism, current_executor_cpu_placement,
+    current_executor_shard, join_all_shards, join_all_shards_timeout,
 };

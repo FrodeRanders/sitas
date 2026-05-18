@@ -202,6 +202,8 @@ pub enum ShardedSpawnError {
     InvalidShardId(usize),
     /// The addressed shard has already stopped.
     Stopped(ShardId),
+    /// A sharded scheduling group was created by a different runtime.
+    SchedulingGroupRuntimeMismatch,
     /// The addressed shard executor rejected the task.
     Spawn(SpawnError),
 }
@@ -213,6 +215,9 @@ impl fmt::Display for ShardedSpawnError {
             ShardedSpawnError::Stopped(shard_id) => {
                 write!(f, "executor shard {} has stopped", shard_id.0)
             }
+            ShardedSpawnError::SchedulingGroupRuntimeMismatch => {
+                write!(f, "scheduling group belongs to a different runtime")
+            }
             ShardedSpawnError::Spawn(error) => write!(f, "{error}"),
         }
     }
@@ -222,7 +227,9 @@ impl std::error::Error for ShardedSpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ShardedSpawnError::Spawn(error) => Some(error),
-            ShardedSpawnError::InvalidShardId(_) | ShardedSpawnError::Stopped(_) => None,
+            ShardedSpawnError::InvalidShardId(_)
+            | ShardedSpawnError::Stopped(_)
+            | ShardedSpawnError::SchedulingGroupRuntimeMismatch => None,
         }
     }
 }

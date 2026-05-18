@@ -7,12 +7,14 @@
 
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
 use crate::error::ShardError;
 use crate::executor::{
-    ExecutorObserver, ExecutorSnapshot, JoinHandle, Spawner, executor_and_spawner,
+    ExecutorObserver, ExecutorSnapshot, JoinHandle, SchedulingGroup, SchedulingGroupError, Spawner,
+    executor_and_spawner,
 };
 use crate::runtime::join_all;
 use crate::shard::ShardId;
@@ -25,6 +27,95 @@ pub use join::{
     ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
     ShardedSpawnError, join_all_shards, join_all_shards_timeout,
 };
+
+static NEXT_RUNTIME_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShardedExecutorId(usize);
+
+impl ShardedExecutorId {
+    fn allocate() -> Self {
+        Self(NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Scheduling group created independently on each executor shard.
+#[must_use]
+#[derive(Debug, Clone)]
+pub struct ShardedSchedulingGroup {
+    runtime_id: ShardedExecutorId,
+    name: String,
+    shares: u32,
+    groups: Vec<ShardSchedulingGroup>,
+}
+
+#[derive(Debug, Clone)]
+struct ShardSchedulingGroup {
+    shard_id: ShardId,
+    group: SchedulingGroup,
+}
+
+impl ShardedSchedulingGroup {
+    /// Returns this group's human-readable name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns this group's relative scheduling weight.
+    pub fn shares(&self) -> u32 {
+        self.shares
+    }
+
+    fn group_for(
+        &self,
+        runtime_id: ShardedExecutorId,
+        shard_id: ShardId,
+    ) -> Result<&SchedulingGroup, ShardedSpawnError> {
+        if self.runtime_id != runtime_id {
+            return Err(ShardedSpawnError::SchedulingGroupRuntimeMismatch);
+        }
+
+        let shard_group = self
+            .groups
+            .get(shard_id.0)
+            .ok_or(ShardedSpawnError::InvalidShardId(shard_id.0))?;
+        debug_assert_eq!(shard_group.shard_id, shard_id);
+        Ok(&shard_group.group)
+    }
+}
+
+/// Error returned when a sharded scheduling group cannot be created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardedSchedulingGroupError {
+    /// The addressed shard executor has already stopped.
+    Stopped(ShardId),
+    /// The scheduling group definition is invalid.
+    Group(SchedulingGroupError),
+    /// The shard executor rejected the creation request.
+    Spawn(ShardedSpawnError),
+}
+
+impl fmt::Display for ShardedSchedulingGroupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShardedSchedulingGroupError::Stopped(shard_id) => {
+                write!(f, "shard {} is stopped", shard_id.0)
+            }
+            ShardedSchedulingGroupError::Group(error) => write!(f, "{error}"),
+            ShardedSchedulingGroupError::Spawn(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ShardedSchedulingGroupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ShardedSchedulingGroupError::Group(error) => Some(error),
+            ShardedSchedulingGroupError::Spawn(error) => Some(error),
+            ShardedSchedulingGroupError::Stopped(_) => None,
+        }
+    }
+}
 
 thread_local! {
     static CURRENT_EXECUTOR_SHARD: std::cell::Cell<Option<ShardId>> = const { std::cell::Cell::new(None) };
@@ -183,6 +274,7 @@ impl ShardedExecutorConfig {
 /// exit.
 #[must_use = "dropping the sharded executor stops all owned shard threads"]
 pub struct ShardedExecutor {
+    runtime_id: ShardedExecutorId,
     shards: Vec<AsyncShard>,
     joins: Vec<thread::JoinHandle<()>>,
 }
@@ -231,6 +323,7 @@ impl ShardedExecutor {
         let available_cpus = available_cpu_ids();
         config.validate_cpu_placement_against(&available_cpus)?;
 
+        let runtime_id = ShardedExecutorId::allocate();
         let mut shards = Vec::with_capacity(config.shard_count);
         let mut joins = Vec::with_capacity(config.shard_count);
 
@@ -289,7 +382,11 @@ impl ShardedExecutor {
             joins.push(join);
         }
 
-        Ok(Self { shards, joins })
+        Ok(Self {
+            runtime_id,
+            shards,
+            joins,
+        })
     }
 
     fn cleanup_started_shards(shards: &mut [AsyncShard], joins: &mut Vec<thread::JoinHandle<()>>) {
@@ -312,6 +409,7 @@ impl ShardedExecutor {
     /// all submitters when the runtime should drain and shut down.
     pub fn submitter(&self) -> ShardedSubmitter {
         ShardedSubmitter {
+            runtime_id: self.runtime_id,
             shards: self
                 .shards
                 .iter()
@@ -321,6 +419,43 @@ impl ShardedExecutor {
                 })
                 .collect(),
         }
+    }
+
+    /// Creates a scheduling group with the same name and shares on every
+    /// executor shard.
+    pub fn create_scheduling_group_on_all(
+        &self,
+        name: impl Into<String>,
+        shares: u32,
+    ) -> Result<ShardedSchedulingGroup, ShardedSchedulingGroupError> {
+        let name = name.into();
+        if shares == 0 {
+            return Err(ShardedSchedulingGroupError::Group(
+                SchedulingGroupError::ZeroShares,
+            ));
+        }
+
+        let mut groups = Vec::with_capacity(self.shard_count());
+        for shard in &self.shards {
+            let spawner = shard
+                .spawner
+                .as_ref()
+                .ok_or(ShardedSchedulingGroupError::Stopped(shard.shard_id))?;
+            let group = spawner
+                .create_scheduling_group(name.clone(), shares)
+                .map_err(ShardedSchedulingGroupError::Group)?;
+            groups.push(ShardSchedulingGroup {
+                shard_id: shard.shard_id,
+                group,
+            });
+        }
+
+        Ok(ShardedSchedulingGroup {
+            runtime_id: self.runtime_id,
+            name,
+            shares,
+            groups,
+        })
     }
 
     /// Spawns one task onto each executor shard.
@@ -333,6 +468,36 @@ impl ShardedExecutor {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.spawn_with_handle_on_all(make_future).map(|_| ())
+    }
+
+    /// Spawns one task into a scheduling group on each executor shard.
+    pub fn spawn_in_group_on_all<MakeFuture, Fut>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        make_future: MakeFuture,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_handle_in_group_on_all(group, make_future)
+            .map(|_| ())
+    }
+
+    /// Spawns one named task into a scheduling group on each executor shard.
+    pub fn spawn_named_in_group_on_all<MakeName, MakeFuture, Fut>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        make_name: MakeName,
+        make_future: MakeFuture,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_with_handle_named_in_group_on_all(group, make_name, make_future)
+            .map(|_| ())
     }
 
     /// Spawns one named task onto each executor shard.
@@ -348,6 +513,71 @@ impl ShardedExecutor {
     {
         self.spawn_with_handle_named_on_all(make_name, make_future)
             .map(|_| ())
+    }
+
+    /// Spawns one task into a scheduling group on each executor shard and
+    /// returns shard-tagged join handles.
+    pub fn spawn_with_handle_in_group_on_all<MakeFuture, Fut>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        spawn_with_handle_in_group_on_all_shards(
+            self.shards
+                .iter()
+                .map(|shard| (shard.shard_id, shard.spawner.as_ref())),
+            self.runtime_id,
+            group,
+            self.shard_count(),
+            make_future,
+        )
+    }
+
+    /// Spawns one named task into a scheduling group on each executor shard and
+    /// returns shard-tagged join handles.
+    pub fn spawn_with_handle_named_in_group_on_all<MakeName, MakeFuture, Fut>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        make_name: MakeName,
+        make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        spawn_with_handle_named_in_group_on_all_shards(
+            self.shards
+                .iter()
+                .map(|shard| (shard.shard_id, shard.spawner.as_ref())),
+            self.runtime_id,
+            group,
+            self.shard_count(),
+            make_name,
+            make_future,
+        )
+    }
+
+    /// Spawns a task into a scheduling group on a specific executor shard.
+    pub fn spawn_in_group_on<F>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        shard_id: ShardId,
+        future: F,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let shard_group = group.group_for(self.runtime_id, shard_id)?;
+        self.spawner_for(shard_id)?
+            .spawn_in_group(shard_group, future)
+            .map_err(ShardedSpawnError::Spawn)
     }
 
     /// Spawns one task onto each executor shard and returns shard-tagged join
@@ -368,6 +598,24 @@ impl ShardedExecutor {
             self.shard_count(),
             make_future,
         )
+    }
+
+    /// Spawns a task into a scheduling group on a specific executor shard and
+    /// returns an awaitable handle for its output.
+    pub fn spawn_with_handle_in_group_on<F>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        shard_id: ShardId,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, ShardedSpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let shard_group = group.group_for(self.runtime_id, shard_id)?;
+        self.spawner_for(shard_id)?
+            .spawn_with_handle_in_group(shard_group, future)
+            .map_err(ShardedSpawnError::Spawn)
     }
 
     /// Spawns one named task onto each executor shard and returns shard-tagged
@@ -478,6 +726,24 @@ impl ShardedExecutor {
             .map_err(ShardedSpawnError::Spawn)
     }
 
+    /// Spawns a named task into a scheduling group on a specific executor
+    /// shard.
+    pub fn spawn_named_in_group_on<F>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        shard_id: ShardId,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let shard_group = group.group_for(self.runtime_id, shard_id)?;
+        self.spawner_for(shard_id)?
+            .spawn_named_in_group(shard_group, name, future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
     /// Spawns a task onto a specific executor shard and returns an awaitable
     /// handle for its output.
     pub fn spawn_with_handle_on<F>(
@@ -508,6 +774,25 @@ impl ShardedExecutor {
     {
         self.spawner_for(shard_id)?
             .spawn_with_handle_named(name, future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
+    /// Spawns a named task into a scheduling group on a specific executor shard
+    /// and returns an awaitable handle for its output.
+    pub fn spawn_with_handle_named_in_group_on<F>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        shard_id: ShardId,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, ShardedSpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let shard_group = group.group_for(self.runtime_id, shard_id)?;
+        self.spawner_for(shard_id)?
+            .spawn_with_handle_named_in_group(shard_group, name, future)
             .map_err(ShardedSpawnError::Spawn)
     }
 
@@ -592,6 +877,7 @@ pub fn available_parallelism() -> usize {
 #[must_use = "dropping the submitter releases its shard spawners"]
 #[derive(Debug, Clone)]
 pub struct ShardedSubmitter {
+    runtime_id: ShardedExecutorId,
     shards: Vec<ShardSubmitter>,
 }
 
@@ -632,6 +918,39 @@ impl ShardedSubmitter {
             .map_err(ShardedSpawnError::Spawn)
     }
 
+    /// Submits a task into a scheduling group on a specific shard.
+    pub fn submit_in_group_to<F>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        shard_id: ShardId,
+        future: F,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let shard_group = group.group_for(self.runtime_id, shard_id)?;
+        self.spawner_for(shard_id)?
+            .spawn_in_group(shard_group, future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
+    /// Submits a named task into a scheduling group on a specific shard.
+    pub fn submit_named_in_group_to<F>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        shard_id: ShardId,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let shard_group = group.group_for(self.runtime_id, shard_id)?;
+        self.spawner_for(shard_id)?
+            .spawn_named_in_group(shard_group, name, future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
     /// Submits a task to a specific shard and returns an awaitable handle for
     /// its output.
     pub fn submit_with_handle_to<F>(
@@ -665,6 +984,43 @@ impl ShardedSubmitter {
             .map_err(ShardedSpawnError::Spawn)
     }
 
+    /// Submits a task into a scheduling group on a specific shard and returns
+    /// an awaitable handle for its output.
+    pub fn submit_with_handle_in_group_to<F>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        shard_id: ShardId,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, ShardedSpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let shard_group = group.group_for(self.runtime_id, shard_id)?;
+        self.spawner_for(shard_id)?
+            .spawn_with_handle_in_group(shard_group, future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
+    /// Submits a named task into a scheduling group on a specific shard and
+    /// returns an awaitable handle for its output.
+    pub fn submit_with_handle_named_in_group_to<F>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        shard_id: ShardId,
+        name: impl Into<String>,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, ShardedSpawnError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let shard_group = group.group_for(self.runtime_id, shard_id)?;
+        self.spawner_for(shard_id)?
+            .spawn_with_handle_named_in_group(shard_group, name, future)
+            .map_err(ShardedSpawnError::Spawn)
+    }
+
     /// Submits one task to each shard.
     pub fn submit_to_all<MakeFuture, Fut>(
         &self,
@@ -689,6 +1045,36 @@ impl ShardedSubmitter {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.submit_with_handle_named_to_all(make_name, make_future)
+            .map(|_| ())
+    }
+
+    /// Submits one task into a scheduling group on each shard.
+    pub fn submit_in_group_to_all<MakeFuture, Fut>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        make_future: MakeFuture,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.submit_with_handle_in_group_to_all(group, make_future)
+            .map(|_| ())
+    }
+
+    /// Submits one named task into a scheduling group on each shard.
+    pub fn submit_named_in_group_to_all<MakeName, MakeFuture, Fut>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        make_name: MakeName,
+        make_future: MakeFuture,
+    ) -> Result<(), ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.submit_with_handle_named_in_group_to_all(group, make_name, make_future)
             .map(|_| ())
     }
 
@@ -728,6 +1114,55 @@ impl ShardedSubmitter {
             self.shards
                 .iter()
                 .map(|shard| (shard.shard_id, shard.spawner.as_ref())),
+            self.shard_count(),
+            make_name,
+            make_future,
+        )
+    }
+
+    /// Submits one task into a scheduling group on each shard and returns
+    /// shard-tagged join handles.
+    pub fn submit_with_handle_in_group_to_all<MakeFuture, Fut>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        spawn_with_handle_in_group_on_all_shards(
+            self.shards
+                .iter()
+                .map(|shard| (shard.shard_id, shard.spawner.as_ref())),
+            self.runtime_id,
+            group,
+            self.shard_count(),
+            make_future,
+        )
+    }
+
+    /// Submits one named task into a scheduling group on each shard and returns
+    /// shard-tagged join handles.
+    pub fn submit_with_handle_named_in_group_to_all<MakeName, MakeFuture, Fut>(
+        &self,
+        group: &ShardedSchedulingGroup,
+        make_name: MakeName,
+        make_future: MakeFuture,
+    ) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        spawn_with_handle_named_in_group_on_all_shards(
+            self.shards
+                .iter()
+                .map(|shard| (shard.shard_id, shard.spawner.as_ref())),
+            self.runtime_id,
+            group,
             self.shard_count(),
             make_name,
             make_future,
@@ -851,6 +1286,66 @@ where
         let spawner = spawner.ok_or(ShardedSpawnError::Stopped(shard_id))?;
         let handle = spawner
             .spawn_with_handle_named(make_name(shard_id), make_future(shard_id))
+            .map_err(ShardedSpawnError::Spawn)?;
+        handles.push(ShardedJoinHandle::new(shard_id, handle));
+    }
+
+    Ok(handles)
+}
+
+fn spawn_with_handle_in_group_on_all_shards<'a, I, MakeFuture, Fut>(
+    shards: I,
+    runtime_id: ShardedExecutorId,
+    group: &ShardedSchedulingGroup,
+    capacity: usize,
+    mut make_future: MakeFuture,
+) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+where
+    I: IntoIterator<Item = (ShardId, Option<&'a Spawner>)>,
+    MakeFuture: FnMut(ShardId) -> Fut,
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    let mut handles = Vec::with_capacity(capacity);
+
+    for (shard_id, spawner) in shards {
+        let spawner = spawner.ok_or(ShardedSpawnError::Stopped(shard_id))?;
+        let shard_group = group.group_for(runtime_id, shard_id)?;
+        let handle = spawner
+            .spawn_with_handle_in_group(shard_group, make_future(shard_id))
+            .map_err(ShardedSpawnError::Spawn)?;
+        handles.push(ShardedJoinHandle::new(shard_id, handle));
+    }
+
+    Ok(handles)
+}
+
+fn spawn_with_handle_named_in_group_on_all_shards<'a, I, MakeName, MakeFuture, Fut>(
+    shards: I,
+    runtime_id: ShardedExecutorId,
+    group: &ShardedSchedulingGroup,
+    capacity: usize,
+    mut make_name: MakeName,
+    mut make_future: MakeFuture,
+) -> Result<Vec<ShardedJoinHandle<Fut::Output>>, ShardedSpawnError>
+where
+    I: IntoIterator<Item = (ShardId, Option<&'a Spawner>)>,
+    MakeName: FnMut(ShardId) -> String,
+    MakeFuture: FnMut(ShardId) -> Fut,
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    let mut handles = Vec::with_capacity(capacity);
+
+    for (shard_id, spawner) in shards {
+        let spawner = spawner.ok_or(ShardedSpawnError::Stopped(shard_id))?;
+        let shard_group = group.group_for(runtime_id, shard_id)?;
+        let handle = spawner
+            .spawn_with_handle_named_in_group(
+                shard_group,
+                make_name(shard_id),
+                make_future(shard_id),
+            )
             .map_err(ShardedSpawnError::Spawn)?;
         handles.push(ShardedJoinHandle::new(shard_id, handle));
     }
@@ -1337,6 +1832,94 @@ mod tests {
     }
 
     #[test]
+    fn spawn_with_handle_named_in_group_on_runs_on_requested_shard() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let group = runtime
+            .create_scheduling_group_on_all("latency", 150)
+            .unwrap();
+        let handle = runtime
+            .spawn_with_handle_named_in_group_on(&group, ShardId(1), "latency-single", async {
+                sleep(Duration::from_millis(50)).await;
+                current_executor_shard().unwrap()
+            })
+            .unwrap();
+
+        let task_names = wait_for_task_names(&runtime, [&String::from("latency-single")]);
+        assert!(task_names.contains(&String::from("latency-single")));
+
+        let snapshot = runtime.snapshot();
+        let shard = snapshot
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == ShardId(1))
+            .unwrap();
+        let executor = shard.executor.as_ref().unwrap();
+        let group_snapshot = executor
+            .scheduling_groups
+            .iter()
+            .find(|group| group.name == "latency")
+            .unwrap();
+        let task = executor
+            .tasks
+            .iter()
+            .find(|task| task.name.as_deref() == Some("latency-single"))
+            .unwrap();
+        assert_eq!(group_snapshot.shares, 150);
+        assert_eq!(task.scheduling_group_id, group_snapshot.id);
+
+        assert_eq!(block_on(handle).unwrap(), ShardId(1));
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn spawn_with_handle_in_group_on_runs_on_requested_shard() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let group = runtime
+            .create_scheduling_group_on_all("unnamed-latency", 175)
+            .unwrap();
+        let handle = runtime
+            .spawn_with_handle_in_group_on(&group, ShardId(1), async {
+                sleep(Duration::from_millis(50)).await;
+                current_executor_shard().unwrap()
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = runtime.snapshot();
+            let shard = snapshot
+                .shards
+                .iter()
+                .find(|shard| shard.shard_id == ShardId(1))
+                .unwrap();
+            let executor = shard.executor.as_ref().unwrap();
+            let group_snapshot = executor
+                .scheduling_groups
+                .iter()
+                .find(|group| group.name == "unnamed-latency")
+                .unwrap();
+
+            if executor
+                .tasks
+                .iter()
+                .any(|task| task.scheduling_group_id == group_snapshot.id)
+            {
+                assert_eq!(group_snapshot.shares, 175);
+                break;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "unnamed grouped task was not observable"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(block_on(handle).unwrap(), ShardId(1));
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn runtime_can_spawn_on_all_shards_and_join_outputs() {
         let runtime = ShardedExecutor::start(4).unwrap();
 
@@ -1488,6 +2071,113 @@ mod tests {
     }
 
     #[test]
+    fn runtime_can_spawn_named_scheduling_group_tasks_on_all_shards() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let group = runtime
+            .create_scheduling_group_on_all("foreground", 200)
+            .unwrap();
+
+        assert_eq!(group.name(), "foreground");
+        assert_eq!(group.shares(), 200);
+
+        let handles = runtime
+            .spawn_with_handle_named_in_group_on_all(
+                &group,
+                |shard_id| format!("foreground-{}", shard_id.0),
+                |shard_id| async move {
+                    sleep(Duration::from_millis(50)).await;
+                    current_executor_shard().unwrap_or(shard_id)
+                },
+            )
+            .unwrap();
+
+        let expected_0 = String::from("foreground-0");
+        let expected_1 = String::from("foreground-1");
+        let task_names = wait_for_task_names(&runtime, [&expected_0, &expected_1]);
+        assert!(task_names.contains(&expected_0));
+        assert!(task_names.contains(&expected_1));
+
+        let snapshot = runtime.snapshot();
+        for shard in &snapshot.shards {
+            let executor = shard.executor.as_ref().unwrap();
+            let group_snapshot = executor
+                .scheduling_groups
+                .iter()
+                .find(|group| group.name == "foreground")
+                .unwrap();
+            assert_eq!(group_snapshot.shares, 200);
+
+            let task = executor
+                .tasks
+                .iter()
+                .find(|task| {
+                    task.name.as_deref() == Some(&format!("foreground-{}", shard.shard_id.0))
+                })
+                .unwrap();
+            assert_eq!(task.scheduling_group_id, group_snapshot.id);
+        }
+
+        let outputs = block_on(super::join_all_shards(handles)).unwrap();
+        assert_eq!(
+            outputs,
+            vec![(ShardId(0), ShardId(0)), (ShardId(1), ShardId(1))]
+        );
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn sharded_scheduling_group_rejects_zero_shares() {
+        let runtime = ShardedExecutor::start(1).unwrap();
+        let error = runtime
+            .create_scheduling_group_on_all("invalid", 0)
+            .expect_err("zero shares should be rejected");
+
+        assert!(matches!(
+            error,
+            super::ShardedSchedulingGroupError::Group(
+                crate::executor::SchedulingGroupError::ZeroShares
+            )
+        ));
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn runtime_rejects_scheduling_group_from_another_runtime() {
+        let first = ShardedExecutor::start(1).unwrap();
+        let second = ShardedExecutor::start(1).unwrap();
+        let group = first
+            .create_scheduling_group_on_all("foreign", 100)
+            .unwrap();
+
+        let error = second
+            .spawn_with_handle_in_group_on(&group, ShardId(0), async { 1usize })
+            .expect_err("foreign scheduling group should be rejected");
+
+        assert_eq!(error, ShardedSpawnError::SchedulingGroupRuntimeMismatch);
+        first.stop().unwrap();
+        second.stop().unwrap();
+    }
+
+    #[test]
+    fn submitter_rejects_scheduling_group_from_another_runtime() {
+        let first = ShardedExecutor::start(1).unwrap();
+        let second = ShardedExecutor::start(1).unwrap();
+        let submitter = second.submitter();
+        let group = first
+            .create_scheduling_group_on_all("foreign-submit", 100)
+            .unwrap();
+
+        let error = submitter
+            .submit_with_handle_in_group_to(&group, ShardId(0), async { 1usize })
+            .expect_err("foreign scheduling group should be rejected");
+
+        assert_eq!(error, ShardedSpawnError::SchedulingGroupRuntimeMismatch);
+        drop(submitter);
+        first.stop().unwrap();
+        second.stop().unwrap();
+    }
+
+    #[test]
     fn runtime_spawn_on_all_rejects_stopped_shards() {
         let mut runtime = ShardedExecutor::start(1).unwrap();
         runtime.shutdown().unwrap();
@@ -1633,6 +2323,97 @@ mod tests {
     }
 
     #[test]
+    fn shard_task_can_submit_grouped_work_to_another_shard() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+        let group = runtime
+            .create_scheduling_group_on_all("remote-io", 75)
+            .unwrap();
+        let task_submitter = submitter.clone();
+        let task_group = group.clone();
+
+        let handle = runtime
+            .spawn_with_handle_on(ShardId(0), async move {
+                let remote = task_submitter
+                    .submit_with_handle_named_in_group_to(
+                        &task_group,
+                        ShardId(1),
+                        "remote-grouped-work",
+                        async { current_executor_shard().unwrap() },
+                    )
+                    .unwrap();
+                remote.await.unwrap()
+            })
+            .unwrap();
+
+        assert_eq!(block_on(handle).unwrap(), ShardId(1));
+
+        let snapshot = runtime.snapshot();
+        let shard = snapshot
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == ShardId(1))
+            .unwrap();
+        let executor = shard.executor.as_ref().unwrap();
+        let group_snapshot = executor
+            .scheduling_groups
+            .iter()
+            .find(|group| group.name == "remote-io")
+            .unwrap();
+        assert_eq!(group_snapshot.shares, 75);
+
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn submitter_can_submit_grouped_work_to_all_shards() {
+        let runtime = ShardedExecutor::start(3).unwrap();
+        let submitter = runtime.submitter();
+        let group = runtime
+            .create_scheduling_group_on_all("broadcast", 125)
+            .unwrap();
+        let task_submitter = submitter.clone();
+        let task_group = group.clone();
+
+        let handle = runtime
+            .spawn_with_handle_on(ShardId(0), async move {
+                let handles = task_submitter
+                    .submit_with_handle_named_in_group_to_all(
+                        &task_group,
+                        |shard_id| format!("broadcast-grouped-{}", shard_id.0),
+                        |shard_id| async move {
+                            assert_eq!(current_executor_shard(), Some(shard_id));
+                            shard_id.0 + 100
+                        },
+                    )
+                    .unwrap();
+
+                super::join_all_shards(handles).await.unwrap()
+            })
+            .unwrap();
+
+        assert_eq!(
+            block_on(handle).unwrap(),
+            vec![(ShardId(0), 100), (ShardId(1), 101), (ShardId(2), 102)]
+        );
+
+        let snapshot = runtime.snapshot();
+        for shard in &snapshot.shards {
+            let executor = shard.executor.as_ref().unwrap();
+            let group_snapshot = executor
+                .scheduling_groups
+                .iter()
+                .find(|group| group.name == "broadcast")
+                .unwrap();
+            assert_eq!(group_snapshot.shares, 125);
+        }
+
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn submitter_rejects_invalid_shard() {
         let runtime = ShardedExecutor::start(1).unwrap();
         let submitter = runtime.submitter();
@@ -1729,6 +2510,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(block_on(handle).unwrap(), 10);
+
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn submitter_can_submit_unnamed_grouped_work_to_all_shards() {
+        let runtime = ShardedExecutor::start(3).unwrap();
+        let submitter = runtime.submitter();
+        let group = runtime
+            .create_scheduling_group_on_all("unnamed-broadcast", 80)
+            .unwrap();
+        let task_submitter = submitter.clone();
+        let task_group = group.clone();
+
+        let handle = runtime
+            .spawn_with_handle_on(ShardId(0), async move {
+                let handles = task_submitter
+                    .submit_with_handle_in_group_to_all(&task_group, |shard_id| async move {
+                        assert_eq!(current_executor_shard(), Some(shard_id));
+                        shard_id.0 + 200
+                    })
+                    .unwrap();
+
+                super::join_all_shards(handles).await.unwrap()
+            })
+            .unwrap();
+
+        assert_eq!(
+            block_on(handle).unwrap(),
+            vec![(ShardId(0), 200), (ShardId(1), 201), (ShardId(2), 202)]
+        );
+
+        let snapshot = runtime.snapshot();
+        for shard in &snapshot.shards {
+            let executor = shard.executor.as_ref().unwrap();
+            let group_snapshot = executor
+                .scheduling_groups
+                .iter()
+                .find(|group| group.name == "unnamed-broadcast")
+                .unwrap();
+            assert_eq!(group_snapshot.shares, 80);
+        }
 
         drop(submitter);
         runtime.stop().unwrap();
