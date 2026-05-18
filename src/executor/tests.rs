@@ -157,6 +157,38 @@ fn task_scope_waits_for_children() {
 }
 
 #[test]
+fn task_scope_can_spawn_children_in_scheduling_group() {
+    let (executor, spawner) = executor_and_spawner();
+    let group = spawner.create_scheduling_group("scoped", 50).unwrap();
+    let group_id = group.id();
+    let mut scope = TaskScope::new(spawner.clone());
+    let notify = Notify::new();
+
+    scope
+        .spawn_in_group(&group, notify.notified())
+        .expect("grouped scoped task should spawn");
+
+    executor.run_until(async {
+        yield_now().await;
+    });
+
+    let snapshot = spawner.snapshot();
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .any(|task| task.scheduling_group_id == group_id)
+    );
+
+    notify.notify_waiters();
+    executor.run_until(async move {
+        scope.wait().await.unwrap();
+    });
+
+    drop(spawner);
+}
+
+#[test]
 fn task_scope_shutdown_wakes_stop_token_children() {
     let (executor, spawner) = executor_and_spawner();
     let mut scope = TaskScope::new(spawner.clone());
@@ -178,6 +210,59 @@ fn task_scope_shutdown_wakes_stop_token_children() {
     drop(spawner);
 
     assert!(*stopped.lock().unwrap());
+}
+
+#[test]
+fn task_scope_stop_children_can_run_in_scheduling_group() {
+    let (executor, spawner) = executor_and_spawner();
+    let group = spawner.create_scheduling_group("scoped-stop", 25).unwrap();
+    let group_id = group.id();
+    let mut scope = TaskScope::new(spawner.clone());
+    let stopped = Arc::new(Mutex::new(false));
+    let stopped_for_task = Arc::clone(&stopped);
+
+    scope
+        .spawn_with_stop_in_group(&group, move |stop| async move {
+            stop.await;
+            *stopped_for_task.lock().unwrap() = true;
+        })
+        .expect("grouped scoped stop task should spawn");
+
+    executor.run_until(async {
+        yield_now().await;
+    });
+
+    let snapshot = spawner.snapshot();
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .any(|task| task.scheduling_group_id == group_id)
+    );
+
+    executor.run_until(async move {
+        scope.shutdown().await.unwrap();
+    });
+
+    drop(spawner);
+
+    assert!(*stopped.lock().unwrap());
+}
+
+#[test]
+fn task_scope_rejects_scheduling_group_from_another_executor() {
+    let (_first_executor, first_spawner) = executor_and_spawner();
+    let (_second_executor, second_spawner) = executor_and_spawner();
+    let group = first_spawner
+        .create_scheduling_group("foreign-scope", 100)
+        .unwrap();
+    let mut scope = TaskScope::new(second_spawner);
+
+    let error = scope
+        .spawn_in_group(&group, async {})
+        .expect_err("foreign scheduling group should be rejected");
+
+    assert_eq!(error, SpawnError::SchedulingGroupExecutorMismatch);
 }
 
 #[test]

@@ -165,6 +165,11 @@ include the scheduling group id. The `scheduling_group_demo` example first runs
 all work in the default group as a baseline, then repeats the workload with
 weighted groups.
 
+`TaskScope` can spawn ordinary children or cooperative stop-token children into
+a scheduling group. The scope does not own scheduling policy itself; it keeps
+structured child lifetime management while delegating group ownership checks to
+the underlying `Spawner`.
+
 On `ShardedExecutor`, a sharded scheduling group is represented as one
 executor-local scheduling group per shard. Creating a group on all shards does
 not introduce a global scheduler or shared runtime state; it is a convenience

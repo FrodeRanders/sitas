@@ -4,8 +4,8 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use super::{
-    JoinError, JoinHandle, SpawnError, Spawner, StopSource, StopToken, TimeoutError, stop_pair,
-    timeout,
+    JoinError, JoinHandle, SchedulingGroup, SpawnError, Spawner, StopSource, StopToken,
+    TimeoutError, stop_pair, timeout,
 };
 
 /// Error returned when a task scope cannot shut down cleanly.
@@ -111,6 +111,20 @@ impl TaskScope {
         Ok(())
     }
 
+    /// Spawns a child task into a scheduling group owned by this scope.
+    pub fn spawn_in_group<F>(
+        &mut self,
+        group: &SchedulingGroup,
+        future: F,
+    ) -> Result<(), SpawnError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.handles
+            .push(self.spawner.spawn_with_handle_in_group(group, future)?);
+        Ok(())
+    }
+
     /// Spawns a child task that receives this scope's stop token.
     pub fn spawn_with_stop<F, Fut>(&mut self, make_future: F) -> Result<(), SpawnError>
     where
@@ -118,6 +132,19 @@ impl TaskScope {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.spawn(make_future(self.stop_token()))
+    }
+
+    /// Spawns a child task into a scheduling group with this scope's stop token.
+    pub fn spawn_with_stop_in_group<F, Fut>(
+        &mut self,
+        group: &SchedulingGroup,
+        make_future: F,
+    ) -> Result<(), SpawnError>
+    where
+        F: FnOnce(StopToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_in_group(group, make_future(self.stop_token()))
     }
 
     /// Aborts all child tasks still owned by this scope.
