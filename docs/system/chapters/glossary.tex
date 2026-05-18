@@ -1,0 +1,185 @@
+\chapter{Mechanism Glossary}
+
+\section{Why this chapter exists}
+
+The same words appear repeatedly in the runtime: task, shard, waker, readiness,
+completion, submitter, snapshot, and scheduling group. This chapter is a short
+field guide for those words. It is not a replacement for the implementation
+chapters; it is a map to keep beside the code while reading.
+
+\section{Runtime terms}
+
+\begin{description}
+    \item[Shard] A single ownership domain. In the standard-library services it
+        is a worker thread with a mailbox. In \texttt{ShardedExecutor} it is a
+        thread running one single-threaded executor.
+
+    \item[Executor] A single-threaded async kernel. It owns tasks, timers,
+        readiness registrations, optional \texttt{io\_uring} dispatcher state,
+        and scheduler counters.
+
+    \item[Task] The executor-owned wrapper around a pinned future. A task has
+        an id, optional name, scheduling group id, lifecycle state, poll
+        counters, timestamps, and a waker path back to its executor.
+
+    \item[Root future] The future passed to \texttt{run\_until}. The executor
+        drives it while also polling spawned tasks. When the root future
+        completes, \texttt{run\_until} returns its output.
+
+    \item[Spawner] A handle that submits new tasks to one executor. Cloned
+        spawners keep the executor accepting work until they are dropped.
+
+    \item[Submitter] A sharded capability for explicit cross-shard async
+        submission. It owns the ability to place work on shard executors.
+
+    \item[Join handle] An awaitable handle for a spawned task result. It is
+        also the cancellation handle: aborting it requests that the task be
+        dropped if it has not completed.
+
+    \item[Task scope] A structured owner for child tasks. It gives a group of
+        children one cooperative stop source and one bounded shutdown path.
+\end{description}
+
+\section{Scheduling terms}
+
+\begin{description}
+    \item[Ready queue] A queue of tasks that should be polled. In the current
+        executor, each scheduling group owns its own ready queue.
+
+    \item[Waker] The object a future uses to ask the executor to poll it again.
+        In \texttt{sitas}, waking a task requeues it on the same executor.
+
+    \item[Poll] One call into a future. A future either returns
+        \texttt{Ready(output)} or \texttt{Pending}. Long polls block the whole
+        executor thread, so cooperative code must yield or await.
+
+    \item[Scheduling group] An executor-local resource class with a name and
+        relative shares. Tasks in a group are charged for observed poll time.
+
+    \item[Virtual runtime] A weighted counter used to compare scheduling
+        groups. More shares make the same poll duration charge less virtual
+        runtime.
+
+    \item[Ready-poll budget] The maximum number of ready tasks polled before
+        the executor checks timers, readiness, and completions again.
+\end{description}
+
+\section{I/O terms}
+
+\begin{description}
+    \item[Readiness] The operating system reports that a descriptor may be
+        ready for reading or writing. The runtime must still retry the
+        operation and handle partial progress or \texttt{WouldBlock}.
+
+    \item[Completion] The operating system reports that a submitted operation
+        has finished. Linux \texttt{io\_uring} is completion-based.
+
+    \item[Interest] A registered wish to be woken when a descriptor becomes
+        readable or writable. Interests are task/waker bookkeeping, not file
+        descriptor ownership.
+
+    \item[Dispatcher] The executor-local \texttt{io\_uring} state machine that
+        owns submission tracking, completion buffering, waker registration, and
+        abandoned operation cleanup.
+
+    \item[Abandoned operation] A completion operation whose future was dropped
+        before the kernel completion was observed. The dispatcher must keep
+        enough state to dispose of buffers safely later.
+\end{description}
+
+\section{Ownership terms}
+
+\begin{description}
+    \item[Owned value] A value that can safely cross a boundary because no
+        borrowed reference into local runtime or service state escapes with it.
+
+    \item[Shard-local value] One owned value per shard, accessed only on the
+        owning shard and only through synchronous closures.
+
+    \item[Snapshot] An owned point-in-time copy of runtime state. A snapshot is
+        not live and does not keep the runtime alive.
+
+    \item[Runtime identity] A private identity used to reject handles from a
+        different runtime, such as a sharded scheduling group created by
+        another \texttt{ShardedExecutor}.
+\end{description}
+
+\section{Mechanism maps}
+
+\subsection{Wake path}
+
+\begin{lstlisting}[language={},caption={Wake path}]
+Future stores Waker
+    |
+external event or explicit wake
+    |
+Task waker marks task queued
+    |
+Scheduler pushes task into its scheduling group queue
+    |
+Executor polls ready work later
+\end{lstlisting}
+
+\subsection{Timer path}
+
+\begin{lstlisting}[language={},caption={Timer path}]
+sleep(duration)
+    |
+register deadline and waker
+    |
+executor waits until earliest deadline or another event
+    |
+expired timer wakes task
+    |
+task is requeued and polled
+\end{lstlisting}
+
+\subsection{Readiness path}
+
+\begin{lstlisting}[language={},caption={Readiness path}]
+read/write future tries non-blocking operation
+    |
+WouldBlock
+    |
+register fd interest and task waker
+    |
+reactor reports readiness
+    |
+task retries operation
+\end{lstlisting}
+
+\subsection{Completion path}
+
+\begin{lstlisting}[language={},caption={Completion path}]
+io_uring future submits operation with owned buffer
+    |
+dispatcher tracks operation id, buffer, and waker
+    |
+kernel completes operation
+    |
+dispatcher buffers completion or wakes task
+    |
+future takes result and buffer
+\end{lstlisting}
+
+\section{Common confusions}
+
+\begin{description}
+    \item[Readiness is not completion] Readiness says retrying may work.
+        Completion says submitted work has finished.
+
+    \item[Shared-nothing is not synchronization-free] The runtime uses locks
+        and atomics internally. The application-state model remains
+        shared-nothing.
+
+    \item[A scheduling group is not a thread] It is a queue and accounting
+        class inside one executor. On the sharded runtime, a sharded group is
+        one matching local group per shard.
+
+    \item[A snapshot is not a subscription] It is an owned copy. To observe
+        progress over time, take repeated snapshots and compare them.
+
+    \item[CPU placement is not load balancing] Placement asks the operating
+        system where shard threads should run. It does not redistribute work
+        between shards.
+\end{description}
