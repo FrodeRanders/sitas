@@ -130,3 +130,103 @@ pub(super) fn complete_join<T>(shared: &Arc<Mutex<JoinState<T>>>, result: JoinRe
         waker.wake();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Wake};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct CountWake {
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn shared<T>() -> Arc<Mutex<JoinState<T>>> {
+        Arc::new(Mutex::new(JoinState {
+            result: None,
+            waker: None,
+        }))
+    }
+
+    #[test]
+    fn complete_join_stores_first_result_only() {
+        let shared = shared();
+
+        complete_join(&shared, Ok(1));
+        complete_join(&shared, Ok(2));
+
+        let mut state = shared.lock().expect("join handle state mutex poisoned");
+        assert!(matches!(state.result.take(), Some(Ok(1))));
+    }
+
+    #[test]
+    fn complete_join_wakes_registered_waiter_once() {
+        let shared = shared();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Arc::new(CountWake {
+            wakes: Arc::clone(&wakes),
+        })
+        .into();
+
+        shared
+            .lock()
+            .expect("join handle state mutex poisoned")
+            .waker = Some(waker);
+
+        complete_join(&shared, Ok(()));
+        complete_join(&shared, Ok(()));
+
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_join_handle_replaces_waiter_waker() {
+        #[cfg(unix)]
+        {
+            use crate::os::OsReactor;
+
+            use super::super::TaskId;
+            use super::super::scheduler::Scheduler;
+            use super::super::task::Task;
+
+            let reactor = OsReactor::new().expect("failed to create test reactor");
+            let scheduler = Arc::new(Scheduler::new(reactor.waker()));
+            let task = Arc::new(Task::new(
+                TaskId(0),
+                None,
+                Box::pin(async {}),
+                scheduler,
+                None,
+            ));
+            let shared = shared();
+            let mut handle = JoinHandle::new(Arc::clone(&shared), task);
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let waker = Arc::new(CountWake {
+                wakes: Arc::clone(&wakes),
+            })
+            .into();
+            let mut context = Context::from_waker(&waker);
+
+            assert!(Pin::new(&mut handle).poll(&mut context).is_pending());
+            complete_join(&shared, Ok(3));
+
+            assert_eq!(wakes.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                Pin::new(&mut handle).poll(&mut context),
+                Poll::Ready(Ok(3))
+            ));
+        }
+    }
+}
