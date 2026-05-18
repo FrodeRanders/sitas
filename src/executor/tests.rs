@@ -1636,6 +1636,33 @@ fn serve_tcp_n_in_group_spawns_handlers_in_scheduling_group() {
 
 #[cfg(unix)]
 #[test]
+fn serve_tcp_n_in_group_rejects_scheduling_group_from_another_executor() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (_first_executor, first_spawner) = executor_and_spawner();
+    let group = first_spawner
+        .create_scheduling_group("foreign-tcp-handlers", 75)
+        .unwrap();
+    let (executor, spawner) = executor_and_spawner();
+    let server_spawner = spawner.clone();
+    let _client = TcpStream::connect(address).unwrap();
+
+    let error = executor.run_until(serve_tcp_n_in_group(
+        listener,
+        server_spawner,
+        &group,
+        1,
+        |_stream, _peer| async { Ok(()) },
+    ));
+
+    drop(spawner);
+
+    assert_eq!(error.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+}
+
+#[cfg(unix)]
+#[test]
 fn serve_tcp_n_returns_handler_error() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -2104,6 +2131,34 @@ fn serve_tcp_until_stopped_scoped_in_group_spawns_handlers_in_scheduling_group()
     stop_source.stop();
     drop(spawner);
     executor.run();
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_tcp_until_stopped_scoped_in_group_rejects_scheduling_group_from_another_executor() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (_first_executor, first_spawner) = executor_and_spawner();
+    let group = first_spawner
+        .create_scheduling_group("foreign-scoped-tcp-handlers", 75)
+        .unwrap();
+    let (_stop_source, stop_token) = stop_pair();
+    let (executor, spawner) = executor_and_spawner();
+    let server_spawner = spawner.clone();
+    let _client = TcpStream::connect(address).unwrap();
+
+    let error = executor.run_until(serve_tcp_until_stopped_scoped_in_group(
+        listener,
+        server_spawner,
+        &group,
+        stop_token,
+        |_stream, _peer, _handler_stop| async { Ok(()) },
+    ));
+
+    drop(spawner);
+
+    assert_eq!(error.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
 }
 
 #[cfg(unix)]
