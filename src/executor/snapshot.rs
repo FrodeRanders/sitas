@@ -18,12 +18,20 @@ pub(super) struct ExecutorSnapshotParts {
 }
 
 pub(super) fn build_executor_snapshot(parts: ExecutorSnapshotParts) -> ExecutorSnapshot {
+    let groups = parts.tasks.groups;
     let mut tasks = parts
         .tasks
         .tasks
         .into_iter()
         .filter_map(|task| task.upgrade())
-        .map(|task| task.snapshot())
+        .map(|task| {
+            let mut snapshot = task.snapshot();
+            snapshot.scheduling_group_name = groups
+                .iter()
+                .find(|group| group.id == snapshot.scheduling_group_id)
+                .map(|group| group.name.clone());
+            snapshot
+        })
         .collect::<Vec<_>>();
     tasks.sort_by_key(|task| task.id);
 
@@ -32,7 +40,7 @@ pub(super) fn build_executor_snapshot(parts: ExecutorSnapshotParts) -> ExecutorS
         spawner_count: parts.tasks.spawner_count,
         task_count: parts.tasks.task_count,
         ready_queue_len: parts.tasks.ready_queue_len,
-        scheduling_groups: parts.tasks.groups,
+        scheduling_groups: groups,
         timer_count: parts.timer_count,
         #[cfg(unix)]
         read_interest_count: parts.read_interest_count,
@@ -188,6 +196,14 @@ mod tests {
 
         assert_eq!(snapshot.tasks.len(), 2);
         assert_eq!(snapshot.tasks[0].id, TaskId(1));
+        assert_eq!(
+            snapshot.tasks[0].scheduling_group_name.as_deref(),
+            Some("default")
+        );
         assert_eq!(snapshot.tasks[1].id, TaskId(9));
+        assert_eq!(
+            snapshot.tasks[1].scheduling_group_name.as_deref(),
+            Some("default")
+        );
     }
 }

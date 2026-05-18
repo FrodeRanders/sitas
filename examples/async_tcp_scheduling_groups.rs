@@ -86,11 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("live task scheduling groups:");
     for task in &snapshot.tasks {
-        let group_name = snapshot
-            .scheduling_groups
-            .iter()
-            .find(|group| group.id == task.scheduling_group_id)
-            .map_or("<unknown>", |group| group.name.as_str());
+        let group_name = task.scheduling_group_name.as_deref().unwrap_or("<unknown>");
         println!(
             "  task {:>2} {:<24} status={:?}",
             task.id.0, group_name, task.status

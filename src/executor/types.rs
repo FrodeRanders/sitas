@@ -72,6 +72,8 @@ pub struct TaskSnapshot {
     pub name: Option<String>,
     /// Scheduling group this task belongs to.
     pub scheduling_group_id: SchedulingGroupId,
+    /// Name of the scheduling group this task belongs to, if known.
+    pub scheduling_group_name: Option<String>,
     /// Current coarse task lifecycle state.
     pub status: TaskStatus,
     /// Last wait interest registered by this task, if known.

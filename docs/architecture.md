@@ -161,7 +161,8 @@ load balancing, or a production resource controller.
 
 Scheduling group snapshots are owned values and include group id, name, shares,
 ready queue length, total charged poll time, and virtual runtime. Task snapshots
-include the scheduling group id. The `scheduling_group_demo` example first runs
+include the scheduling group id and the owned scheduling group name when the
+snapshot builder can resolve it. The `scheduling_group_demo` example first runs
 all work in the default group as a baseline, then repeats the workload with
 weighted groups.
 
