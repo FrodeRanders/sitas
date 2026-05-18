@@ -225,3 +225,111 @@ impl Future for Notified {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct CountWake {
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn count_waker() -> (Waker, Arc<AtomicUsize>) {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Arc::new(CountWake {
+            wakes: Arc::clone(&wakes),
+        })
+        .into();
+
+        (waker, wakes)
+    }
+
+    #[test]
+    fn stop_source_is_idempotent_and_wakes_waiters_once() {
+        let (source, mut token) = stop_pair();
+        let (waker, wakes) = count_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut token).poll(&mut context).is_pending());
+        assert!(source.stop());
+        assert!(!source.stop());
+
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(source.is_stopped());
+        assert!(token.is_stopped());
+        assert!(Pin::new(&mut token).poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn stop_token_coalesces_repeated_polls_with_same_waker() {
+        let (source, mut token) = stop_pair();
+        let (waker, _wakes) = count_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut token).poll(&mut context).is_pending());
+        assert!(Pin::new(&mut token).poll(&mut context).is_pending());
+        assert_eq!(
+            token
+                .shared
+                .lock()
+                .expect("stop token mutex poisoned")
+                .wakers
+                .len(),
+            1
+        );
+
+        assert!(source.stop());
+    }
+
+    #[test]
+    fn notify_is_idempotent_and_wakes_waiters_once() {
+        let notify = Notify::new();
+        let mut notified = notify.notified();
+        let (waker, wakes) = count_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut notified).poll(&mut context).is_pending());
+        assert!(notify.notify_waiters());
+        assert!(!notify.notify_waiters());
+
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(notify.is_notified());
+        assert!(Pin::new(&mut notified).poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn notify_future_coalesces_repeated_polls_with_same_waker() {
+        let notify = Notify::new();
+        let mut notified = notify.notified();
+        let (waker, _wakes) = count_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut notified).poll(&mut context).is_pending());
+        assert!(Pin::new(&mut notified).poll(&mut context).is_pending());
+        assert_eq!(
+            notified
+                .shared
+                .lock()
+                .expect("notify mutex poisoned")
+                .wakers
+                .len(),
+            1
+        );
+
+        assert!(notify.notify_waiters());
+    }
+}
