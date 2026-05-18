@@ -229,3 +229,131 @@ impl Future for YieldNow {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct CountWake {
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn count_waker() -> (Waker, Arc<AtomicUsize>) {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Arc::new(CountWake {
+            wakes: Arc::clone(&wakes),
+        })
+        .into();
+
+        (waker, wakes)
+    }
+
+    #[derive(Debug)]
+    struct PendingFuture;
+
+    impl Future for PendingFuture {
+        type Output = usize;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadyFuture(usize);
+
+    impl Future for ReadyFuture {
+        type Output = usize;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(self.0)
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropFlag {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Future for DropFlag {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn yield_now_wakes_once_then_completes() {
+        let mut future = yield_now();
+        let (waker, wakes) = count_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut future).poll(&mut context).is_pending());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(Pin::new(&mut future).poll(&mut context).is_ready());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn race_returns_first_ready_future() {
+        let mut future = race(ReadyFuture(1), ReadyFuture(2));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Ready(RaceOutput::First(1))
+        ));
+    }
+
+    #[test]
+    fn race_returns_second_ready_future_after_first_pending() {
+        let mut future = race(PendingFuture, ReadyFuture(2));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Ready(RaceOutput::Second(2))
+        ));
+    }
+
+    #[test]
+    fn race_drops_losing_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let loser = DropFlag {
+            dropped: Arc::clone(&dropped),
+        };
+        let mut future = race(ReadyFuture(1), loser);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Ready(RaceOutput::First(1))
+        ));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+}
