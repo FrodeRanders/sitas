@@ -21,6 +21,21 @@ thread_local! {
     static CURRENT_IO_URING: RefCell<Option<SharedDispatcher>> = const { RefCell::new(None) };
 }
 
+pub(super) struct ExecutorIoUringScope;
+
+impl ExecutorIoUringScope {
+    pub(super) fn enter() -> Self {
+        install_current_io_uring();
+        Self
+    }
+}
+
+impl Drop for ExecutorIoUringScope {
+    fn drop(&mut self) {
+        clear_current_io_uring();
+    }
+}
+
 /// Returns a future that reads up to `buffer.len()` bytes from `fd` at
 /// `offset` through the current executor's Linux `io_uring` backend.
 ///

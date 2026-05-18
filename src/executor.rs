@@ -94,7 +94,7 @@ impl Executor {
     /// Runs tasks until all spawners and runnable tasks are gone.
     pub fn run(&self) {
         #[cfg(target_os = "linux")]
-        let _io_uring_scope = IoUringScope::enter();
+        let _io_uring_scope = uring::ExecutorIoUringScope::enter();
         self.refresh_io_uring_snapshot();
 
         loop {
@@ -118,7 +118,7 @@ impl Executor {
         F: Future,
     {
         #[cfg(target_os = "linux")]
-        let _io_uring_scope = IoUringScope::enter();
+        let _io_uring_scope = uring::ExecutorIoUringScope::enter();
         self.refresh_io_uring_snapshot();
 
         let root = Arc::new(RootWaker::new(Arc::clone(&self.scheduler)));
@@ -191,24 +191,6 @@ impl Executor {
     fn refresh_io_uring_snapshot(&self) {
         #[cfg(target_os = "linux")]
         self.scheduler.record_io_uring_snapshot(uring::snapshot());
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct IoUringScope;
-
-#[cfg(target_os = "linux")]
-impl IoUringScope {
-    fn enter() -> Self {
-        uring::install_current_io_uring();
-        Self
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for IoUringScope {
-    fn drop(&mut self) {
-        uring::clear_current_io_uring();
     }
 }
 
