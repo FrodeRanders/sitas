@@ -176,6 +176,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interest_ids_are_allocated_monotonically() {
+        let mut set = InterestSet::new();
+
+        assert_eq!(set.allocate_id(), 0);
+        assert_eq!(set.allocate_id(), 1);
+        assert_eq!(set.allocate_id(), 2);
+    }
+
+    #[test]
     fn interest_set_reports_unique_fds_but_wakes_all_waiters() {
         let mut set = InterestSet::new();
         let waker = Waker::noop().clone();
@@ -192,5 +201,97 @@ mod tests {
         assert!(set.take_ready(1));
         assert!(!set.take_ready(2));
         assert_eq!(set.fds(), vec![11]);
+    }
+
+    #[test]
+    fn registering_existing_interest_replaces_its_fd() {
+        let mut set = InterestSet::new();
+        let waker = Waker::noop().clone();
+
+        set.register(0, 10, waker.clone());
+        set.register(0, 11, waker);
+
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.fds(), vec![11]);
+        assert_eq!(set.wake_ready(&[10]).len(), 0);
+        assert!(!set.take_ready(0));
+        assert_eq!(set.wake_ready(&[11]).len(), 1);
+        assert!(set.take_ready(0));
+    }
+
+    #[test]
+    fn remove_drops_pending_and_ready_interest() {
+        let mut set = InterestSet::new();
+        let waker = Waker::noop().clone();
+
+        set.register(0, 10, waker.clone());
+        set.register(1, 11, waker);
+        set.remove(0);
+
+        assert_eq!(set.len(), 1);
+        assert_eq!(set.fds(), vec![11]);
+
+        assert_eq!(set.wake_ready(&[11]).len(), 1);
+        set.remove(1);
+        assert!(!set.take_ready(1));
+        assert_eq!(set.len(), 0);
+    }
+
+    #[test]
+    fn clear_drops_pending_and_ready_interests() {
+        let mut set = InterestSet::new();
+        let waker = Waker::noop().clone();
+
+        set.register(0, 10, waker.clone());
+        set.register(1, 11, waker);
+        assert_eq!(set.wake_ready(&[10]).len(), 1);
+        set.clear();
+
+        assert_eq!(set.len(), 0);
+        assert_eq!(set.fds(), Vec::<RawFd>::new());
+        assert!(!set.take_ready(0));
+        assert!(!set.take_ready(1));
+    }
+
+    #[test]
+    fn readiness_interests_keep_read_and_write_sets_separate() {
+        let mut interests = ReadinessInterests::new();
+        let waker = Waker::noop().clone();
+        let read_id = interests.allocate_read_id();
+        let write_id = interests.allocate_write_id();
+
+        interests.register_read(read_id, 10, waker.clone());
+        interests.register_write(write_id, 10, waker);
+
+        assert_eq!(interests.read_len(), 1);
+        assert_eq!(interests.write_len(), 1);
+        assert_eq!(interests.read_fds(), vec![10]);
+        assert_eq!(interests.write_fds(), vec![10]);
+
+        assert_eq!(interests.wake_readable(&[10]).len(), 1);
+        assert!(interests.take_ready_read(read_id));
+        assert!(!interests.take_ready_write(write_id));
+        assert_eq!(interests.write_len(), 1);
+
+        assert_eq!(interests.wake_writable(&[10]).len(), 1);
+        assert!(interests.take_ready_write(write_id));
+    }
+
+    #[test]
+    fn readiness_interests_clear_both_directions() {
+        let mut interests = ReadinessInterests::new();
+        let waker = Waker::noop().clone();
+
+        interests.register_read(0, 10, waker.clone());
+        interests.register_write(0, 11, waker);
+        assert_eq!(interests.wake_readable(&[10]).len(), 1);
+        assert_eq!(interests.wake_writable(&[11]).len(), 1);
+
+        interests.clear();
+
+        assert_eq!(interests.read_len(), 0);
+        assert_eq!(interests.write_len(), 0);
+        assert!(!interests.take_ready_read(0));
+        assert!(!interests.take_ready_write(0));
     }
 }
