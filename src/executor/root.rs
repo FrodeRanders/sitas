@@ -49,3 +49,51 @@ impl Wake for RootWaker {
         self.mark_ready();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::task::Waker;
+
+    use crate::os::OsReactor;
+
+    use super::*;
+
+    fn root_waker() -> Arc<RootWaker> {
+        let reactor = OsReactor::new().expect("failed to create test reactor");
+        Arc::new(RootWaker::new(Arc::new(Scheduler::new(reactor.waker()))))
+    }
+
+    #[test]
+    fn root_waker_starts_ready_and_take_ready_clears_it() {
+        let root = root_waker();
+
+        assert!(root.is_ready());
+        assert!(root.take_ready());
+        assert!(!root.is_ready());
+        assert!(!root.take_ready());
+    }
+
+    #[test]
+    fn wake_by_ref_marks_root_ready() {
+        let root = root_waker();
+        assert!(root.take_ready());
+
+        let waker = Waker::from(Arc::clone(&root));
+        waker.wake_by_ref();
+
+        assert!(root.is_ready());
+        assert!(root.take_ready());
+    }
+
+    #[test]
+    fn wake_marks_root_ready() {
+        let root = root_waker();
+        assert!(root.take_ready());
+
+        let waker = Waker::from(Arc::clone(&root));
+        waker.wake();
+
+        assert!(root.is_ready());
+        assert!(root.take_ready());
+    }
+}
