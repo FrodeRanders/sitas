@@ -49,3 +49,59 @@ impl SchedulerCounters {
         self.total_completion_events += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_lifecycle_counters_accumulate() {
+        let mut counters = SchedulerCounters::default();
+
+        counters.record_spawned_task();
+        counters.record_spawned_task();
+        counters.record_completed_task();
+
+        assert_eq!(counters.total_spawned_tasks, 2);
+        assert_eq!(counters.total_completed_tasks, 1);
+    }
+
+    #[test]
+    fn ready_poll_batch_counts_polls_and_budget_exhaustions() {
+        let mut counters = SchedulerCounters::default();
+
+        counters.record_ready_poll_batch(3, false);
+        counters.record_ready_poll_batch(5, true);
+
+        assert_eq!(counters.total_task_polls, 8);
+        assert_eq!(counters.ready_poll_budget_exhaustions, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_events_count_driver_and_direction_progress() {
+        let mut counters = SchedulerCounters::default();
+
+        counters.record_readiness_driver_event(true, false);
+        counters.record_readiness_driver_event(false, true);
+        counters.record_readiness_driver_event(true, true);
+        counters.record_readiness_driver_event(false, false);
+
+        assert_eq!(counters.total_driver_events, 4);
+        assert_eq!(counters.total_readiness_events, 4);
+        assert_eq!(counters.total_readable_events, 2);
+        assert_eq!(counters.total_writable_events, 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_events_count_driver_and_completion_progress() {
+        let mut counters = SchedulerCounters::default();
+
+        counters.record_completion_driver_event();
+        counters.record_completion_driver_event();
+
+        assert_eq!(counters.total_driver_events, 2);
+        assert_eq!(counters.total_completion_events, 2);
+    }
+}
