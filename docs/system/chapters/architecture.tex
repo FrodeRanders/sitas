@@ -21,6 +21,58 @@ The project is guided by a small set of invariants:
     \item Unsafe code is isolated behind small safe APIs.
 \end{enumerate}
 
+\section{The shared-nothing rule}
+
+The central design rule is simple: application state has one owner. In the
+standard-library services that owner is a shard thread receiving typed
+commands. In the async runtime exploration that owner is an executor shard
+polling futures assigned to it. The form changes, but the rule is the same.
+
+This is why the project avoids turning service state into
+\texttt{Arc<Mutex<Service>>}. A mutex would make mutation mechanically safe,
+but it would hide the runtime question that the project is trying to study:
+which shard owns this state, where does work run, and when does the ownership
+boundary get crossed?
+
+The shared-nothing model does not mean the runtime never uses synchronization.
+It does. Wakers, reply state, lifecycle flags, counters, and submission queues
+are runtime machinery. The important distinction is that application service
+state is not normally protected by those locks. It stays local to its shard.
+
+\begin{lstlisting}[language={},caption={State ownership model}]
+Caller thread or task
+    |
+    | owned command / owned future / typed submitter call
+    v
+Owning shard
+    |
+    | synchronous local mutation
+    v
+Owned reply or owned snapshot
+\end{lstlisting}
+
+\section{Boundaries and lifetimes}
+
+Most runtime bugs in systems like this are boundary bugs. A value crosses to
+another thread without being owned. A reference to local state escapes a
+closure. A future keeps a borrowed value across \texttt{.await}. A completion
+operation drops a buffer before the kernel has finished with it.
+
+\texttt{sitas} tries to make those boundaries visible:
+
+\begin{description}
+    \item[Cross-shard transfer] uses owned values and explicit
+        \texttt{Send + 'static} requirements where a future can move to another
+        thread.
+    \item[Shard-local access] gives a closure synchronous access to
+        \texttt{\&mut T}; the closure returns an owned result and cannot
+        suspend.
+    \item[Observability] returns owned snapshots. A monitoring thread can keep
+        a snapshot after the runtime has moved on.
+    \item[Kernel I/O] stores owned buffers until completions are observed or
+        until abandoned operation cleanup proves they can be discarded.
+\end{description}
+
 \section{Layered model}
 
 The current runtime can be read as a layered system:
@@ -62,3 +114,23 @@ same shared-nothing service direction.
     \item[\texttt{shard\_local}] One owned value per executor shard with
         checked local access.
 \end{description}
+
+\section{How to trace a feature through the layers}
+
+When learning or extending the runtime, trace one feature down the stack. For
+example, a named task in a scheduling group passes through several layers:
+
+\begin{enumerate}
+    \item user code calls a typed spawn API;
+    \item the spawner validates that the scheduling group belongs to this
+          executor;
+    \item a task is allocated with a name and group id;
+    \item the scheduler places the task into the group's ready queue;
+    \item the executor polls the selected task;
+    \item the task records status, wait interest, poll count, and timestamps;
+    \item a snapshot later resolves the group id back to an owned group name.
+\end{enumerate}
+
+This kind of trace is more useful than reading modules in isolation. It shows
+which layer owns validation, which layer owns scheduling, which layer owns
+observability, and where the public API remains safe.

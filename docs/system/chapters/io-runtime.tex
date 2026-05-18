@@ -11,6 +11,55 @@ This path is readiness-based, not completion-based. It is used by the current
 TCP helpers and remains separate from the experimental \texttt{io\_uring}
 completion path.
 
+Readiness means that the operating system says an operation is likely to make
+progress. It does not mean the runtime has the bytes. A readable TCP stream
+may still return fewer bytes than requested. A writable stream may accept only
+part of a buffer. The future must attempt the operation, handle
+\texttt{WouldBlock}, and register interest again when necessary.
+
+\begin{lstlisting}[language={},caption={Readiness future shape}]
+poll future:
+    try non-blocking operation
+    if operation succeeds:
+        return Ready(result)
+    if operation would block:
+        register fd interest and waker
+        return Pending
+
+reactor wait:
+    OS reports fd readiness
+    scheduler wakes interested task
+\end{lstlisting}
+
+This is why readiness futures do not own file descriptors. The caller owns the
+stream or listener. The future only borrows it for the duration of the async
+operation and registers interest in the raw descriptor while pending.
+
+\section{TCP helpers}
+
+The TCP helpers are intentionally written on top of readiness futures rather
+than hiding a separate runtime. They demonstrate the normal async server shape:
+
+\begin{enumerate}
+    \item put the listener or stream in non-blocking mode;
+    \item accept or connect using readiness futures;
+    \item spawn one handler task per accepted connection;
+    \item use \texttt{TaskScope} or join handles to wait for handlers;
+    \item propagate handler errors as ordinary \texttt{io::Result} values.
+\end{enumerate}
+
+Grouped TCP helper variants classify accepted handler tasks into scheduling
+groups. The accept loop remains in the caller's task; only the per-connection
+handler work is moved into the requested group. This is useful for separating
+foreground request handling from background maintenance or low-priority
+connections.
+
+\begin{notabene}[Readiness lesson]
+Readiness is a notification that retrying may be useful. Completion is a
+notification that the operation has already finished. The code keeps those
+concepts separate because the ownership and cancellation rules are different.
+\end{notabene}
+
 \section{\texttt{io\_uring}}
 
 The Linux \texttt{io\_uring} backend is experimental. It currently supports a
@@ -33,6 +82,39 @@ The dispatcher tracks:
     \item cumulative dispatched, buffered, woken, and discarded operation
           counters.
 \end{itemize}
+
+\section{Completion lifecycle}
+
+The \texttt{io\_uring} path is completion-based. A future submits an operation
+and later receives a completion. That changes the ownership problem. With
+readiness, the future borrows a stream and retries ordinary system calls. With
+\texttt{io\_uring}, the kernel may hold a pointer to an owned buffer until the
+completion arrives.
+
+The runtime therefore tracks operation state explicitly:
+
+\begin{lstlisting}[language={},caption={Simplified completion lifecycle}]
+future first poll
+    allocate operation id
+    move owned buffer into dispatcher tracking
+    submit operation to ring
+    register task waker
+    return Pending
+
+completion arrives
+    record result and completed buffer
+    wake registered task
+
+future next poll
+    take completion
+    return Ready(result, buffer)
+\end{lstlisting}
+
+If the future is dropped before completion, the operation may still exist in
+the kernel. The dispatcher marks it abandoned and defers buffer cleanup until a
+completion or safe discard point is observed. This is one of the most important
+differences between readiness and completion: cancellation is not just removing
+a waker; it also involves kernel-owned in-flight work.
 
 \section{Current limitation}
 

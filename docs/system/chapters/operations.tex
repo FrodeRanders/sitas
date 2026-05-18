@@ -12,6 +12,12 @@ make
 The output is \filepath{docs/system/sysdoc.pdf}. The build uses
 \texttt{pdflatex} twice so the table of contents and references settle.
 
+If the build fails, first check that the LaTeX distribution has the standard
+packages used by \filepath{sitasdoc.cls}: \texttt{geometry}, \texttt{fancyhdr},
+\texttt{titlesec}, \texttt{titletoc}, \texttt{listings}, \texttt{xcolor}, and
+\texttt{hyperref}. The manual intentionally avoids project-specific generated
+assets so it can be rebuilt from text alone.
+
 \section{Cleaning generated files}
 
 \begin{lstlisting}[language=bash]
@@ -36,3 +42,39 @@ SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test os::uring::tests -- --n
 When the host or container configuration cannot provide \texttt{io\_uring}, the
 Linux-only examples report that the backend is unavailable rather than faking a
 successful run.
+
+\section{Validation strategy}
+
+Use narrow tests first, then broaden. This keeps iteration fast while still
+protecting the runtime invariants.
+
+\begin{lstlisting}[language=bash,caption={Typical focused-to-broad workflow}]
+cargo test task_snapshot -- --nocapture
+cargo test scheduling_group -- --nocapture
+cargo test serve_tcp -- --nocapture
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo doc --no-deps
+\end{lstlisting}
+
+For changes touching Linux-only code, use the Docker helper after local macOS
+validation:
+
+\begin{lstlisting}[language=bash,caption={Linux platform pass}]
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo clippy --all-targets -- -D warnings
+\end{lstlisting}
+
+\section{Interpreting unsupported features}
+
+Unsupported is a valid result when the platform cannot provide a feature. CPU
+placement is unsupported on non-Linux platforms. \texttt{io\_uring} may be
+unavailable if the host kernel, container runtime, or security profile blocks
+ring setup. The project should report those cases honestly instead of hiding
+them behind a fake success path.
+
+This matters for learning. A runtime experiment should make platform boundaries
+visible: readiness works on several Unix backends, hard CPU affinity is
+Linux-specific, and \texttt{io\_uring} is both Linux-specific and dependent on
+host/container permissions.

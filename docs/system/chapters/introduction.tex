@@ -15,6 +15,42 @@ primitives, TCP helpers, sharded async execution, shard-local values,
 observability snapshots, CPU placement, and experimental Linux \texttt{io\_uring}
 support.
 
+\section{How to read this project}
+
+The easiest way to understand \texttt{sitas} is to read it from the outside
+in, then return from the inside out.
+
+From the outside, the important idea is that application code should see
+typed, owned boundaries. A caller asks a service or a shard to do work. The
+runtime decides which shard owns that work. The owning shard mutates its local
+state and returns an owned reply. This is the same mental shape as a service
+call, but the implementation deliberately avoids hiding service state behind a
+global mutex.
+
+From the inside, the interesting question is how the runtime keeps that model
+honest:
+
+\begin{enumerate}
+    \item futures are owned by executor tasks;
+    \item tasks are assigned to one executor shard;
+    \item wakers only requeue tasks on that executor;
+    \item cross-shard work must be submitted explicitly;
+    \item shard-local values can be borrowed only inside synchronous closures;
+    \item observability returns copies, not borrowed internals.
+\end{enumerate}
+
+This manual follows that path. The architecture chapter explains the ownership
+rules. The executor chapter explains how futures become runnable work. The
+sharding chapter explains how one executor becomes many independent shards.
+The I/O chapter explains why readiness and completion are different mechanisms
+and how both appear in the runtime.
+
+\begin{notabene}[Learning goal]
+If you can explain where a future is polled, who owns the state it mutates,
+what wakes it, and what happens when it is dropped, you understand the most
+important parts of this code base.
+\end{notabene}
+
 \section{Scope of this manual}
 
 This manual is a LaTeX companion to the Markdown architecture notes. It is
@@ -36,3 +72,23 @@ It focuses on:
 The project is still deliberately experimental. APIs are allowed to move when
 that exposes cleaner runtime internals or a better teaching surface.
 \end{notabene}
+
+\section{What this project is not}
+
+\texttt{sitas} is not trying to become a production replacement for mature
+Rust runtimes. It is also not trying to copy Seastar line by line. The point is
+to keep the mechanisms small enough that they can be inspected:
+
+\begin{itemize}
+    \item no Tokio, async-std, Glommio, Monoio, or actor framework is used as
+          the core runtime;
+    \item blocking standard-library service APIs remain distinct from
+          awaitable executor APIs;
+    \item unsafe and FFI code is kept near the operating-system boundary;
+    \item mechanisms are introduced only after their semantics can be tested.
+\end{itemize}
+
+This makes the project useful as a learning resource. It has enough machinery
+to demonstrate timers, wakers, readiness, \texttt{io\_uring}, shard-local
+values, scheduling groups, and CPU placement, while still leaving those
+mechanisms visible in ordinary Rust modules.

@@ -9,6 +9,19 @@ APIs for submitting work to one shard, all shards, or a map/reduce over shards.
 The model is explicit: work does not migrate implicitly. A future runs on its
 assigned shard until code deliberately submits work elsewhere.
 
+This mirrors the most important Seastar idea without copying its C++ API:
+parallelism comes from many mostly-independent shards, not from many threads
+mutating the same service object. Each shard has its own executor, task queues,
+timers, readiness registrations, and shard-local values.
+
+\begin{lstlisting}[language={},caption={Shard-per-core runtime shape}]
+Shard 0 thread        Shard 1 thread        Shard 2 thread
+  Executor              Executor              Executor
+  local tasks           local tasks           local tasks
+  local timers          local timers          local timers
+  local state           local state           local state
+\end{lstlisting}
+
 \section{Cross-shard submission}
 
 \texttt{ShardedSubmitter} is the explicit cross-shard async mechanism. A task
@@ -18,6 +31,28 @@ resumes on its original shard after the remote work completes.
 
 Submitters own spawner clones. They are lifetime capabilities and must be
 dropped before a runtime can fully drain.
+
+The important detail is the return path. A task on shard 0 can submit work to
+shard 1 and await the join handle. The submitted future is polled on shard 1.
+When it completes, the awaiting future on shard 0 is woken and continues on
+shard 0. The result crosses the boundary as an owned value.
+
+\begin{lstlisting}[language={},caption={Cross-shard async flow}]
+Shard 0 task
+    submit future to Shard 1
+    await JoinHandle
+
+Shard 1 executor
+    poll submitted future
+    complete owned result
+
+Shard 0 task
+    wakes and receives result
+\end{lstlisting}
+
+This is why cross-shard APIs require \texttt{Send + 'static} where a future or
+value can move to another thread. It is also why references into shard-local
+state cannot be submitted.
 
 \section{Shard-local values}
 
@@ -30,6 +65,36 @@ The critical rule is that references to local state cannot escape the closure
 and cannot cross \texttt{.await}. This keeps ownership local even when the
 runtime itself uses synchronization for task bookkeeping.
 
+There are two useful ways to read \texttt{ShardLocal<T>}:
+
+\begin{itemize}
+    \item as a safe teaching model for shared-nothing state, because each shard
+          owns exactly one \texttt{T};
+    \item as a runtime boundary test, because the code must prevent references
+          to \texttt{T} from becoming async state.
+\end{itemize}
+
+The API therefore prefers closures returning owned results. If a computation
+needs to wait, split it into two phases: first copy or compute an owned value
+from the shard-local state, then \texttt{await} using that owned value outside
+the access closure.
+
+\section{Sharded scheduling groups}
+
+A sharded scheduling group is not a global queue. It is a convenience handle
+containing one executor-local scheduling group per shard. Creating a group
+called \texttt{foreground} on a four-shard runtime creates four independent
+executor-local \texttt{foreground} groups, all with the same shares.
+
+This preserves the shared-nothing model. Each shard still schedules only its
+own tasks. The sharded group handle simply lets callers use one typed API to
+spawn or submit matching classes of work across shards.
+
+Runtime identity matters. A sharded group created by one
+\texttt{ShardedExecutor} is rejected by another runtime, even if both runtimes
+have a group with the same name. This prevents accidental targeting of
+same-numbered executor-local group ids in the wrong runtime.
+
 \section{CPU placement}
 
 CPU placement is an experimental Linux-supported runtime request. Linux applies
@@ -39,3 +104,10 @@ platforms report unsupported placement honestly.
 
 By default, placement failures are recorded in shard snapshots and startup can
 still succeed. Required placement turns that into fail-fast startup behavior.
+
+CPU placement is best understood as an explicit request, not as a finished
+portable scheduler. On Linux, the runtime asks the kernel to pin shard threads
+to particular CPUs. In containers, the available CPU set may already be
+restricted, so the runtime first observes what the kernel says is available.
+On macOS and other unsupported platforms, placement reports unsupported rather
+than pretending that pinning happened.

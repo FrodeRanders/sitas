@@ -15,6 +15,53 @@ show the runtime pieces in isolation before combining them:
     \item standard-file and \texttt{io\_uring} index-building demos.
 \end{itemize}
 
+\section{Suggested reading path}
+
+The examples are easiest to learn from in layers:
+
+\begin{enumerate}
+    \item Start with \filepath{executor_sleep.rs},
+          \filepath{executor_timeout.rs}, and \filepath{executor_race.rs}.
+          These show futures, timers, and combinators before sharding enters
+          the picture.
+    \item Move to \filepath{async_readable.rs}, \filepath{async_write.rs}, and
+          \filepath{async_tcp_pair.rs}. These show readiness and non-blocking
+          file descriptor behavior.
+    \item Read \filepath{async_tcp_server.rs},
+          \filepath{async_tcp_scoped_server.rs}, and
+          \filepath{async_tcp_scheduling_groups.rs}. These show handler
+          spawning, scoped shutdown, and scheduling groups.
+    \item Then read \filepath{sharded_executor.rs},
+          \filepath{sharded_submit.rs}, and \filepath{sharded_map_reduce.rs}.
+          These show explicit placement of async work on shards.
+    \item Finally read \filepath{shard_local.rs} and
+          \filepath{shard_local_worker_observability.rs}. These show local
+          state access and owned runtime snapshots.
+\end{enumerate}
+
+Treat examples as executable documentation. Run them, then inspect the modules
+they use. Most examples intentionally print runtime counters or snapshots so
+that the mechanism is visible rather than merely implied.
+
+\section{Observability examples}
+
+\filepath{sharded_observability.rs} samples task state while named shard tasks
+sleep and wake. The interesting columns are:
+
+\begin{description}
+    \item[\texttt{status}] the coarse task lifecycle state;
+    \item[\texttt{age\_ms}] how long the task has existed;
+    \item[\texttt{state\_ms}] how long it has been in the current state;
+    \item[\texttt{polls}] how many times the future has been polled;
+    \item[\texttt{wait}] the last known wait interest.
+\end{description}
+
+\filepath{async_tcp_scheduling_groups.rs} shows a different form of
+observability. It starts two TCP accept loops, parks accepted handlers, takes a
+snapshot, and prints which scheduling group each live task belongs to. This is
+a small substitute for a console UI: the snapshot is just owned data, so a tool
+can render it however it wants.
+
 \section{Sharded index build}
 
 The sharded index example uses two files: a fixed-size record data file and a
@@ -26,6 +73,12 @@ The \texttt{io\_uring} variant performs partition reads, run writes, and merge
 run reads/writes through the executor-backed Linux completion path. Final
 verification still uses ordinary file I/O because it checks the externally
 visible result rather than the runtime path that produced it.
+
+The index examples are intentionally more involved than the small teaching
+examples. They exercise the Seastar-like direction: split work by shard, keep
+partition-local state local while sorting, materialize intermediate runs, and
+merge owned outputs. They are useful for studying where the project is heading,
+but they are not the first examples to read.
 
 \section{Representative commands}
 

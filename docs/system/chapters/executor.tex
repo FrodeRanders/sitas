@@ -30,6 +30,90 @@ registration, cancellation, and completion dispatch all live in this code base.
           futures.
 \end{itemize}
 
+\section{Task lifecycle}
+
+A spawned future is stored inside a task. The task has a stable executor-local
+\texttt{TaskId}, an optional name, a scheduling group id, and internal state
+describing whether it is queued, polling, waiting, completed, or cancelled.
+
+The lifecycle is intentionally explicit:
+
+\begin{lstlisting}[language={},caption={Simplified task lifecycle}]
+spawn
+  -> create Task with pinned Future
+  -> queue Task in a scheduling group
+  -> poll Future
+       Ready(())  -> completed
+       Pending    -> waiting until waker fires
+  -> wake
+  -> queue Task again
+\end{lstlisting}
+
+A repeated wake does not create repeated queue entries for the same task. The
+task records that it is already queued, so repeated wakeups coalesce. This is a
+small but important executor property: a chatty future should not multiply
+itself in the ready queue.
+
+Cancellation is normal future dropping. Aborting a join handle or dropping an
+executor eventually drops the owned future. Timer and readiness futures must
+therefore clean up their registrations in \texttt{Drop}; otherwise the reactor
+would keep stale interests for tasks that no longer exist.
+
+\section{Wakers and the ready queue}
+
+The custom waker does one job: make the task runnable again on the same
+executor. It does not move the task to another shard, does not poll the task
+directly, and does not borrow application state. It marks the task queued and
+hands it back to the scheduler.
+
+The executor loop then decides when to poll ready work. It does so in batches
+bounded by \texttt{READY\_POLL\_BUDGET}. That budget is a fairness valve. A
+self-waking task can keep itself ready, but it cannot prevent the executor from
+checking timers, readiness, and completions forever.
+
+\section{Scheduling groups}
+
+Scheduling groups are the first resource-class mechanism in the executor. Each
+group owns a ready queue and has a relative share count. Ordinary spawn calls
+use the default group. Explicit group APIs let code classify work such as
+foreground request handling and background maintenance.
+
+The selection rule is deliberately simple. The scheduler chooses a non-empty
+group with the lowest weighted virtual runtime, pops one task from that
+group's FIFO queue, polls it, and charges the group for the observed wall-clock
+poll duration. The charge is scaled by the group's shares.
+
+\begin{lstlisting}[language={},caption={Weighted group selection}]
+for each poll:
+    group = non_empty_group_with_lowest_virtual_runtime()
+    task = group.pop_front()
+    duration = poll(task)
+    group.virtual_runtime += duration * default_shares / group.shares
+\end{lstlisting}
+
+This is not preemption. A long poll still blocks the executor thread until the
+future returns \texttt{Poll::Pending} or \texttt{Poll::Ready}. The mechanism is
+cooperative: futures must yield, await I/O, await timers, or otherwise return
+control to the executor.
+
+Scheduling group handles are executor-local. A group created by one executor is
+rejected by another. The default group handle is special because it names the
+built-in default queue in any executor. The same idea appears in the sharded
+runtime as a \texttt{ShardedSchedulingGroup}, which is one executor-local group
+per shard plus a runtime identity check.
+
+\section{Structured child tasks}
+
+\texttt{TaskScope} groups child tasks under one owner. Dropping the scope
+requests cooperative stop and aborts still-owned children. Calling
+\texttt{shutdown} asks children to stop and waits for them. Calling
+\texttt{shutdown\_timeout} bounds that wait and aborts uncooperative children.
+
+Scopes can also spawn children into scheduling groups. This matters when a
+server accepts work that should be both lifetime-scoped and resource-classified.
+The scope does not implement scheduling itself; it delegates group validation
+and task creation to the underlying \texttt{Spawner}.
+
 \section{Wait ordering}
 
 Each loop iteration polls ready work, wakes expired timers, dispatches locally
@@ -46,3 +130,18 @@ readiness, and completion waiting without giving any source accidental priority.
 Executor snapshots are owned values. They include task counts, named task
 state, polling counters, timer counts, readiness counts, and Linux
 \texttt{io\_uring} dispatcher counters when the dispatcher is installed.
+
+Task snapshots include the task name, scheduling group id and name, lifecycle
+state, wait interest, poll count, accumulated poll time, and key timestamps.
+Helper methods derive task age and current state duration from a caller-supplied
+\texttt{Instant}. This keeps the snapshot itself factual while making progress
+views easy to write.
+
+\begin{lstlisting}[language={},caption={Reading a task snapshot}]
+task name:              useful for humans
+status:                 queued, polling, waiting, completed, cancelled
+waiting_for:            timer, readable fd, writable fd, unknown, none
+poll_count:             how many times the future was polled
+total_poll_time:        how much executor time the task consumed
+state_duration_at(now): how long it has been in the current state
+\end{lstlisting}
