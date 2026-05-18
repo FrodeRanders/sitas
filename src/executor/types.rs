@@ -92,6 +92,48 @@ pub struct TaskSnapshot {
     pub last_poll_finished_at: Option<Instant>,
 }
 
+impl TaskSnapshot {
+    /// Returns how long this task had existed at `now`.
+    pub fn age_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.created_at)
+    }
+
+    /// Returns how long ago this task was last queued, if it has been queued.
+    pub fn time_since_last_scheduled_at(&self, now: Instant) -> Option<Duration> {
+        self.last_scheduled_at
+            .map(|instant| now.saturating_duration_since(instant))
+    }
+
+    /// Returns how long ago this task's most recent poll started, if it has
+    /// been polled.
+    pub fn time_since_last_poll_started_at(&self, now: Instant) -> Option<Duration> {
+        self.last_poll_started_at
+            .map(|instant| now.saturating_duration_since(instant))
+    }
+
+    /// Returns how long ago this task's most recent poll finished, if a poll
+    /// has finished.
+    pub fn time_since_last_poll_finished_at(&self, now: Instant) -> Option<Duration> {
+        self.last_poll_finished_at
+            .map(|instant| now.saturating_duration_since(instant))
+    }
+
+    /// Returns how long this task had been in its current coarse state at
+    /// `now`.
+    pub fn state_duration_at(&self, now: Instant) -> Duration {
+        let entered_state_at = match self.status {
+            TaskStatus::Queued => self.last_scheduled_at,
+            TaskStatus::Polling => self.last_poll_started_at,
+            TaskStatus::Waiting | TaskStatus::Completed | TaskStatus::Cancelled => {
+                self.last_poll_finished_at
+            }
+        }
+        .unwrap_or(self.created_at);
+
+        now.saturating_duration_since(entered_state_at)
+    }
+}
+
 /// Owned point-in-time summary of one scheduling group.
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,4 +203,90 @@ pub struct ExecutorSnapshot {
     pub total_completion_events: u64,
     /// Owned snapshots for tasks that are still externally observable.
     pub tasks: Vec<TaskSnapshot>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_snapshot(status: TaskStatus) -> TaskSnapshot {
+        let created_at = Instant::now();
+        TaskSnapshot {
+            id: TaskId(7),
+            name: Some(String::from("worker")),
+            scheduling_group_id: DEFAULT_SCHEDULING_GROUP_ID,
+            scheduling_group_name: Some(String::from("default")),
+            status,
+            waiting_for: None,
+            poll_count: 3,
+            total_poll_time: Duration::from_millis(2),
+            created_at,
+            last_scheduled_at: Some(created_at + Duration::from_millis(10)),
+            last_poll_started_at: Some(created_at + Duration::from_millis(20)),
+            last_poll_finished_at: Some(created_at + Duration::from_millis(30)),
+        }
+    }
+
+    #[test]
+    fn task_snapshot_duration_helpers_report_elapsed_times() {
+        let task = task_snapshot(TaskStatus::Waiting);
+        let now = task.created_at + Duration::from_millis(45);
+
+        assert_eq!(task.age_at(now), Duration::from_millis(45));
+        assert_eq!(
+            task.time_since_last_scheduled_at(now),
+            Some(Duration::from_millis(35))
+        );
+        assert_eq!(
+            task.time_since_last_poll_started_at(now),
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(
+            task.time_since_last_poll_finished_at(now),
+            Some(Duration::from_millis(15))
+        );
+    }
+
+    #[test]
+    fn task_snapshot_state_duration_uses_current_state_timestamp() {
+        let queued = task_snapshot(TaskStatus::Queued);
+        let now = queued.created_at + Duration::from_millis(45);
+        assert_eq!(queued.state_duration_at(now), Duration::from_millis(35));
+
+        let polling = task_snapshot(TaskStatus::Polling);
+        let now = polling.created_at + Duration::from_millis(45);
+        assert_eq!(polling.state_duration_at(now), Duration::from_millis(25));
+
+        for status in [
+            TaskStatus::Waiting,
+            TaskStatus::Completed,
+            TaskStatus::Cancelled,
+        ] {
+            let task = task_snapshot(status);
+            let now = task.created_at + Duration::from_millis(45);
+            assert_eq!(task.state_duration_at(now), Duration::from_millis(15));
+        }
+    }
+
+    #[test]
+    fn task_snapshot_state_duration_falls_back_to_created_at() {
+        let created_at = Instant::now();
+        let task = TaskSnapshot {
+            id: TaskId(7),
+            name: None,
+            scheduling_group_id: DEFAULT_SCHEDULING_GROUP_ID,
+            scheduling_group_name: None,
+            status: TaskStatus::Queued,
+            waiting_for: None,
+            poll_count: 0,
+            total_poll_time: Duration::ZERO,
+            created_at,
+            last_scheduled_at: None,
+            last_poll_started_at: None,
+            last_poll_finished_at: None,
+        };
+        let now = created_at + Duration::from_millis(5);
+
+        assert_eq!(task.state_duration_at(now), Duration::from_millis(5));
+    }
 }

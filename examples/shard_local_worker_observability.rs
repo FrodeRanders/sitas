@@ -3,7 +3,7 @@
 //! The names and snapshot counters show why observability is owned data: a
 //! monitoring thread can inspect progress without borrowing runtime internals.
 use sitas::{ShardLocal, ShardedExecutor, TaskSnapshot, TaskStatus, TaskWait, executor::sleep};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = ShardedExecutor::start(2)?;
@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for sample_idx in 0..4 {
         std::thread::sleep(Duration::from_millis(20));
         let snapshot = observer.snapshot();
+        let now = Instant::now();
 
         println!("sample {sample_idx}: running={}", snapshot.running);
         for shard in &snapshot.shards {
@@ -50,10 +51,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for task in &executor.tasks {
                 println!(
-                    "    task {} {} status={} polls={} wait={}",
+                    "    task {} {} status={} age_ms={} state_ms={} polls={} wait={}",
                     task.id.0,
                     task.name.as_deref().unwrap_or("<unnamed>"),
                     status_name(task.status),
+                    task.age_at(now).as_millis(),
+                    task.state_duration_at(now).as_millis(),
                     task.poll_count,
                     wait_name(task)
                 );

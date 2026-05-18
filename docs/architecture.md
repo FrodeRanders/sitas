@@ -352,7 +352,9 @@ Executor snapshots expose:
 - last known wait interest;
 - poll count;
 - accumulated poll time;
-- key timestamps.
+- key timestamps;
+- helper methods for deriving age, time since last scheduling/poll activity,
+  and current coarse-state duration from a caller-supplied `Instant`.
 
 Snapshots are designed to support simple progress views without adding a logging framework, Tokio console, or third-party observability dependency.
 
