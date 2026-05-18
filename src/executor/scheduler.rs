@@ -14,6 +14,7 @@ use super::counters::SchedulerCounters;
 use super::current::set_current_task_waiting_for;
 #[cfg(unix)]
 use super::io_interest::ReadinessInterests;
+use super::scheduling_group::ExecutorId;
 use super::snapshot::{ExecutorSnapshotParts, build_executor_snapshot};
 use super::task::Task;
 use super::task_set::SchedulerTaskSet;
@@ -22,6 +23,7 @@ use super::{ExecutorSnapshot, SchedulingGroupId, SpawnError, TaskId, TaskWait};
 
 #[derive(Debug)]
 pub(super) struct Scheduler {
+    id: ExecutorId,
     state: Mutex<SchedulerState>,
     #[cfg(unix)]
     waker: OsWaker,
@@ -41,6 +43,7 @@ struct SchedulerState {
 impl Scheduler {
     pub(super) fn new(#[cfg(unix)] waker: OsWaker) -> Self {
         Self {
+            id: ExecutorId::allocate(),
             state: Mutex::new(SchedulerState {
                 tasks: SchedulerTaskSet::new(),
                 timers: TimerSet::new(),
@@ -53,6 +56,10 @@ impl Scheduler {
             #[cfg(unix)]
             waker,
         }
+    }
+
+    pub(super) fn id(&self) -> ExecutorId {
+        self.id
     }
 
     pub(super) fn allocate_task_id(&self) -> TaskId {

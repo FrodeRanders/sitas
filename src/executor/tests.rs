@@ -1,6 +1,6 @@
 use super::{
-    Notify, RaceOutput, TaskScope, TaskScopeError, TimeoutError, block_on, executor_and_spawner,
-    race, sleep, stop_pair, timeout, yield_now,
+    Notify, RaceOutput, SpawnError, TaskScope, TaskScopeError, TimeoutError, block_on,
+    executor_and_spawner, race, sleep, stop_pair, timeout, yield_now,
 };
 #[cfg(unix)]
 use super::{
@@ -2031,6 +2031,21 @@ fn spawner_reports_closed_executor() {
     drop(executor);
 
     assert!(spawner.spawn(async {}).is_err());
+}
+
+#[test]
+fn spawner_rejects_scheduling_group_from_another_executor() {
+    let (_first_executor, first_spawner) = executor_and_spawner();
+    let (_second_executor, second_spawner) = executor_and_spawner();
+    let group = first_spawner
+        .create_scheduling_group("foreign", 100)
+        .unwrap();
+
+    let error = second_spawner
+        .spawn_in_group(&group, async {})
+        .expect_err("foreign scheduling group should be rejected");
+
+    assert_eq!(error, SpawnError::SchedulingGroupExecutorMismatch);
 }
 
 #[test]

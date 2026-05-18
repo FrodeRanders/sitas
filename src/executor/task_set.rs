@@ -94,12 +94,12 @@ impl SchedulerTaskSet {
     pub(super) fn schedule_new(&mut self, task: Arc<Task>) -> Result<(), SpawnError> {
         if !self.accepting {
             task.clear_queued();
-            return Err(SpawnError);
+            return Err(SpawnError::Closed);
         }
 
         let Some(group_idx) = self.group_index(task.scheduling_group_id()) else {
             task.clear_queued();
-            return Err(SpawnError);
+            return Err(SpawnError::Closed);
         };
 
         self.task_count += 1;
@@ -111,12 +111,12 @@ impl SchedulerTaskSet {
     pub(super) fn schedule_existing(&mut self, task: Arc<Task>) -> Result<(), SpawnError> {
         if !self.accepting {
             task.clear_queued();
-            return Err(SpawnError);
+            return Err(SpawnError::Closed);
         }
 
         let Some(group_idx) = self.group_index(task.scheduling_group_id()) else {
             task.clear_queued();
-            return Err(SpawnError);
+            return Err(SpawnError::Closed);
         };
 
         self.groups[group_idx].queue.push_back(task);

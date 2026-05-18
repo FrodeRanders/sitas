@@ -146,7 +146,10 @@ The executor is intentionally small and dependency-free. It is a semantic experi
 Scheduling groups are the first small Seastar-like resource-class mechanism in
 the custom executor. A [`Spawner`](../src/executor/spawner.rs) can create an
 executor-local group with a name and relative share count, then spawn tasks into
-that group. Ordinary `spawn` calls use the default group with 100 shares.
+that group. Ordinary `spawn` calls use the default group with 100 shares. A
+group handle created by one executor is rejected by other executors; the default
+group handle is the only portable single-executor group handle because it names
+the built-in default queue rather than an allocated executor-local queue.
 
 Each group owns its own ready queue. When the executor chooses the next ready
 task, it selects a non-empty group with the lowest weighted virtual runtime,

@@ -34,11 +34,21 @@ impl ExecutorObserver {
 
 /// Error returned when a task cannot be submitted to an executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SpawnError;
+pub enum SpawnError {
+    /// The executor is no longer accepting tasks.
+    Closed,
+    /// The scheduling group belongs to a different executor.
+    SchedulingGroupExecutorMismatch,
+}
 
 impl fmt::Display for SpawnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "executor is not accepting tasks")
+        match self {
+            SpawnError::Closed => write!(f, "executor is not accepting tasks"),
+            SpawnError::SchedulingGroupExecutorMismatch => {
+                write!(f, "scheduling group belongs to a different executor")
+            }
+        }
     }
 }
 
@@ -83,7 +93,7 @@ impl Spawner {
 
         let name = name.into();
         let id = self.scheduler.create_scheduling_group(name.clone(), shares);
-        Ok(SchedulingGroup::new(id, name, shares))
+        Ok(SchedulingGroup::new(self.scheduler.id(), id, name, shares))
     }
 
     /// Spawns a future onto the executor's ready queue.
@@ -107,6 +117,7 @@ impl Spawner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.ensure_group_belongs_to_executor(group)?;
         self.spawn_with_name_and_group(None, group.id(), future)
     }
 
@@ -120,6 +131,7 @@ impl Spawner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.ensure_group_belongs_to_executor(group)?;
         self.spawn_with_name_and_group(Some(name.into()), group.id(), future)
     }
 
@@ -175,6 +187,7 @@ impl Spawner {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        self.ensure_group_belongs_to_executor(group)?;
         self.spawn_with_handle_name_and_group(None, group.id(), future)
     }
 
@@ -190,6 +203,7 @@ impl Spawner {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        self.ensure_group_belongs_to_executor(group)?;
         self.spawn_with_handle_name_and_group(Some(name.into()), group.id(), future)
     }
 
@@ -269,5 +283,13 @@ impl Spawner {
     /// Returns a weak observer handle for this spawner's executor.
     pub fn observer(&self) -> ExecutorObserver {
         ExecutorObserver::new(Arc::downgrade(&self.scheduler))
+    }
+
+    fn ensure_group_belongs_to_executor(&self, group: &SchedulingGroup) -> Result<(), SpawnError> {
+        if group.belongs_to(self.scheduler.id()) {
+            Ok(())
+        } else {
+            Err(SpawnError::SchedulingGroupExecutorMismatch)
+        }
     }
 }
