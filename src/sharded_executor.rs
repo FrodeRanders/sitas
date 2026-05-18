@@ -1865,7 +1865,7 @@ mod tests {
             .find(|task| task.name.as_deref() == Some("latency-single"))
             .unwrap();
         assert_eq!(group_snapshot.shares, 150);
-        assert_eq!(task.scheduling_group_id, group_snapshot.id);
+        assert_eq!(task.scheduling_group_name.as_deref(), Some("latency"));
 
         assert_eq!(block_on(handle).unwrap(), ShardId(1));
         runtime.stop().unwrap();
@@ -1902,7 +1902,7 @@ mod tests {
             if executor
                 .tasks
                 .iter()
-                .any(|task| task.scheduling_group_id == group_snapshot.id)
+                .any(|task| task.scheduling_group_name.as_deref() == Some("unnamed-latency"))
             {
                 assert_eq!(group_snapshot.shares, 175);
                 break;
@@ -2114,7 +2114,7 @@ mod tests {
                     task.name.as_deref() == Some(&format!("foreground-{}", shard.shard_id.0))
                 })
                 .unwrap();
-            assert_eq!(task.scheduling_group_id, group_snapshot.id);
+            assert_eq!(task.scheduling_group_name.as_deref(), Some("foreground"));
         }
 
         let outputs = block_on(super::join_all_shards(handles)).unwrap();

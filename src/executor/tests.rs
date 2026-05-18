@@ -160,7 +160,6 @@ fn task_scope_waits_for_children() {
 fn task_scope_can_spawn_children_in_scheduling_group() {
     let (executor, spawner) = executor_and_spawner();
     let group = spawner.create_scheduling_group("scoped", 50).unwrap();
-    let group_id = group.id();
     let mut scope = TaskScope::new(spawner.clone());
     let notify = Notify::new();
 
@@ -177,7 +176,7 @@ fn task_scope_can_spawn_children_in_scheduling_group() {
         snapshot
             .tasks
             .iter()
-            .any(|task| task.scheduling_group_id == group_id)
+            .any(|task| task.scheduling_group_name.as_deref() == Some("scoped"))
     );
 
     notify.notify_waiters();
@@ -216,7 +215,6 @@ fn task_scope_shutdown_wakes_stop_token_children() {
 fn task_scope_stop_children_can_run_in_scheduling_group() {
     let (executor, spawner) = executor_and_spawner();
     let group = spawner.create_scheduling_group("scoped-stop", 25).unwrap();
-    let group_id = group.id();
     let mut scope = TaskScope::new(spawner.clone());
     let stopped = Arc::new(Mutex::new(false));
     let stopped_for_task = Arc::clone(&stopped);
@@ -237,7 +235,7 @@ fn task_scope_stop_children_can_run_in_scheduling_group() {
         snapshot
             .tasks
             .iter()
-            .any(|task| task.scheduling_group_id == group_id)
+            .any(|task| task.scheduling_group_name.as_deref() == Some("scoped-stop"))
     );
 
     executor.run_until(async move {
@@ -1589,7 +1587,6 @@ fn serve_tcp_n_in_group_spawns_handlers_in_scheduling_group() {
     let (executor, spawner) = executor_and_spawner();
     let server_spawner = spawner.clone();
     let group = spawner.create_scheduling_group("tcp-handlers", 75).unwrap();
-    let group_id = group.id();
     let group_for_server = group.clone();
     let handler_started = Notify::new();
     let handler_started_for_server = handler_started.clone();
@@ -1626,7 +1623,7 @@ fn serve_tcp_n_in_group_spawns_handlers_in_scheduling_group() {
         snapshot
             .tasks
             .iter()
-            .any(|task| task.scheduling_group_id == group_id)
+            .any(|task| task.scheduling_group_name.as_deref() == Some("tcp-handlers"))
     );
 
     release_handler.notify_waiters();
@@ -2090,7 +2087,6 @@ fn serve_tcp_until_stopped_scoped_in_group_spawns_handlers_in_scheduling_group()
     let group = spawner
         .create_scheduling_group("scoped-tcp-handlers", 40)
         .unwrap();
-    let group_id = group.id();
     let group_for_server = group.clone();
     let handler_started = Notify::new();
     let handler_started_for_server = handler_started.clone();
@@ -2125,7 +2121,7 @@ fn serve_tcp_until_stopped_scoped_in_group_spawns_handlers_in_scheduling_group()
         snapshot
             .tasks
             .iter()
-            .any(|task| task.scheduling_group_id == group_id)
+            .any(|task| task.scheduling_group_name.as_deref() == Some("scoped-tcp-handlers"))
     );
 
     stop_source.stop();
