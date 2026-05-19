@@ -1,0 +1,234 @@
+\chapter{Guided Walkthroughs}
+
+\section{Purpose}
+
+This chapter gives concrete source-reading paths. Each walkthrough starts from
+a visible API or example and follows the mechanism down through the runtime.
+The goal is to make the code base approachable without flattening the design
+into prose only.
+
+\begin{notabene}[How to use these walkthroughs]
+Keep the source tree open while reading. The paths are intentionally explicit.
+Read the public function first, then follow the listed modules in order.
+\end{notabene}
+
+\section{Walkthrough: spawning one task}
+
+Start with the smallest async unit: a task spawned onto one executor.
+
+\begin{lstlisting}[language={},caption={Task spawn reading path}]
+examples/executor_sleep.rs
+src/executor.rs
+src/executor/spawner.rs
+src/executor/task.rs
+src/executor/task_state.rs
+src/executor/scheduler.rs
+src/executor/task_set.rs
+\end{lstlisting}
+
+The public surface is \texttt{executor\_and\_spawner}. It returns one executor
+and one spawner. The spawner creates tasks; the executor polls them.
+
+The useful questions to ask while reading are:
+
+\begin{enumerate}
+    \item Where is the future boxed and pinned?
+    \item Where does the task get its id and optional name?
+    \item What prevents repeated wakes from putting the same task into the
+          ready queue many times?
+    \item What state is recorded before and after each poll?
+    \item What happens if the executor is dropped before the task completes?
+\end{enumerate}
+
+The mechanism is deliberately local. A task spawned by a \texttt{Spawner} is
+owned by that spawner's executor. Its waker requeues it there. Nothing in this
+path migrates the task to another thread.
+
+\section{Walkthrough: sleeping and timers}
+
+The timer path starts with examples such as \filepath{executor_sleep.rs} and
+\filepath{executor_timeout.rs}. Then read:
+
+\begin{lstlisting}[language={},caption={Timer reading path}]
+src/executor/future.rs
+src/executor/timer.rs
+src/executor/scheduler.rs
+src/executor/driver.rs
+\end{lstlisting}
+
+\texttt{sleep} creates a future that registers a deadline. When polled before
+the deadline, the future stores the task waker and returns
+\texttt{Poll::Pending}. The scheduler keeps timer state separate from the ready
+queues. On each loop iteration the executor checks expired timers and wakes the
+registered tasks.
+
+\texttt{timeout} is useful for learning because it demonstrates cancellation by
+drop. If the deadline wins, the inner future is dropped. Any timer or readiness
+registration owned by that future must clean itself up. This is why the runtime
+has tests for drop behavior rather than only success paths.
+
+\section{Walkthrough: readiness-driven TCP}
+
+Start from the server helpers rather than the raw reactor:
+
+\begin{lstlisting}[language={},caption={TCP readiness reading path}]
+examples/async_tcp_server.rs
+examples/async_tcp_scoped_server.rs
+src/executor/tcp.rs
+src/executor/unix_io.rs
+src/executor/io_interest.rs
+src/os/reactor.rs
+\end{lstlisting}
+
+The TCP helper shows the application shape: accept a connection, spawn a
+handler, wait for handlers, and propagate errors. The lower layers show the
+runtime shape: try a non-blocking operation, register interest on
+\texttt{WouldBlock}, sleep in the OS reactor, and wake the task when readiness
+is reported.
+
+When reading \filepath{src/executor/tcp.rs}, notice that the accept loop and
+the handler tasks are distinct. Grouped TCP helpers use this distinction:
+the accept loop stays in the caller's current task, while accepted handler
+tasks are spawned into an explicit scheduling group.
+
+\section{Walkthrough: scheduling groups}
+
+The fastest way to see scheduling groups is to run:
+
+\begin{lstlisting}[language=bash,caption={Scheduling group examples}]
+cargo run --example scheduling_group_demo -- 1
+cargo run --example async_tcp_scheduling_groups
+cargo run --example sharded_scheduling_groups
+\end{lstlisting}
+
+Then read:
+
+\begin{lstlisting}[language={},caption={Scheduling group reading path}]
+src/executor/scheduling_group.rs
+src/executor/spawner.rs
+src/executor/task_set.rs
+src/executor/snapshot.rs
+src/sharded_executor.rs
+\end{lstlisting}
+
+\texttt{scheduling\_group.rs} defines the public handle and its executor
+ownership. \texttt{spawner.rs} validates that a group belongs to the executor
+before creating a task in that group. \texttt{task\_set.rs} owns the queues and
+weighted virtual runtime accounting. \texttt{snapshot.rs} resolves group names
+into task snapshots for observability.
+
+On the sharded runtime, the interesting extra step is runtime identity. A
+\texttt{ShardedSchedulingGroup} is a bundle of executor-local groups, one per
+shard. It must not be accepted by a different runtime even if names and ids
+look similar.
+
+\section{Walkthrough: cross-shard submission}
+
+Start with:
+
+\begin{lstlisting}[language={},caption={Cross-shard reading path}]
+examples/sharded_submit.rs
+examples/sharded_map_reduce.rs
+src/sharded_executor.rs
+src/sharded_executor/join.rs
+src/executor/spawner.rs
+\end{lstlisting}
+
+A cross-shard submit is not a function call into borrowed remote state. It is
+owned work sent to another executor shard. The submitted future is polled on
+the target shard. Its owned output completes a join handle. The original task
+wakes and resumes on its original shard.
+
+While reading the submitter APIs, look for the \texttt{Send + 'static}
+boundaries. They are not incidental. They mark where work can cross threads.
+
+\section{Walkthrough: shard-local state}
+
+Read \filepath{examples/shard_local.rs} first, then:
+
+\begin{lstlisting}[language={},caption={Shard-local reading path}]
+src/shard_local.rs
+src/sharded_executor.rs
+src/runtime.rs
+\end{lstlisting}
+
+\texttt{ShardLocal<T>} is the clearest example of the shared-nothing idea in
+the async runtime. Each shard owns one \texttt{T}. Access is routed to the
+owning shard. The closure receives \texttt{\&mut T} synchronously and returns
+an owned result.
+
+The important rule is negative: a reference to \texttt{T} must not become part
+of a future that later awaits. The API design enforces this by giving local
+access through synchronous closures rather than async callbacks.
+
+\section{Walkthrough: \texttt{io\_uring} lifecycle}
+
+This path is Linux-specific. When available, start with:
+
+\begin{lstlisting}[language=bash,caption={io\_uring examples}]
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo run --example os_uring
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo run --example os_uring_abandon
+\end{lstlisting}
+
+Then read:
+
+\begin{lstlisting}[language={},caption={io\_uring reading path}]
+src/os/uring.rs
+src/executor/uring.rs
+src/executor/driver.rs
+src/executor/tests.rs
+\end{lstlisting}
+
+The key distinction is ownership. A readiness future borrows a descriptor and
+retries ordinary system calls. An \texttt{io\_uring} future submits owned
+buffers to the kernel and must keep them alive until completion or safe
+abandonment cleanup.
+
+\filepath{os_uring_abandon.rs} is especially useful because success paths can
+hide lifetime complexity. Abandonment forces the dispatcher to keep enough
+state to clean up operations whose futures no longer exist.
+
+\section{Walkthrough: reading observability output}
+
+Run:
+
+\begin{lstlisting}[language=bash,caption={Observability examples}]
+cargo run --example sharded_observability
+cargo run --example shard_local_worker_observability
+\end{lstlisting}
+
+The columns are a compact runtime story:
+
+\begin{description}
+    \item[\texttt{ready}] how many tasks are queued to be polled;
+    \item[\texttt{tasks}] how many tasks are still unfinished;
+    \item[\texttt{timers}] how many timer registrations exist;
+    \item[\texttt{polls}] how many task polls the executor has performed;
+    \item[\texttt{done}] how many tasks completed or were cancelled;
+    \item[\texttt{age\_ms}] how long the task has existed;
+    \item[\texttt{state\_ms}] how long it has been in the current state;
+    \item[\texttt{wait}] the last known wait interest.
+\end{description}
+
+The output is not tracing. There is no event stream. It is repeated sampling of
+owned snapshots. This is less powerful than a full console, but it is simple,
+portable, and keeps runtime internals inspectable.
+
+\section{Debugging checklist}
+
+When something behaves unexpectedly, ask these questions in order:
+
+\begin{enumerate}
+    \item Which shard owns the state being mutated?
+    \item Which executor polls the future?
+    \item Is the task queued, polling, waiting, completed, or cancelled?
+    \item If waiting, is it waiting for a timer, fd readiness, completion, or
+          an unknown waker?
+    \item Did a handle from another executor or runtime cross a boundary?
+    \item If using \texttt{io\_uring}, who owns the buffer until completion?
+    \item If shutdown hangs, which spawner, submitter, join handle, or scoped
+          child is still alive?
+\end{enumerate}
+
+These questions match the runtime's own invariants. They are usually more
+productive than starting with performance guesses.
