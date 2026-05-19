@@ -1,0 +1,279 @@
+\chapter{Hands-on Labs}
+
+\section{Purpose}
+
+This chapter turns the manual into a workbook. Each lab has a command to run,
+something specific to observe, and a small modification to try. The goal is not
+to benchmark the runtime. The goal is to connect visible behavior to the
+mechanisms described earlier.
+
+\begin{notabene}[Lab style]
+Run one lab at a time. After each command, inspect the example source and the
+runtime module it exercises. The examples are intentionally small enough that
+changing them should be part of learning them.
+\end{notabene}
+
+\section{Lab 1: Timers and cooperative polling}
+
+Run:
+
+\begin{lstlisting}[language=bash,caption={Timer examples}]
+cargo run --example executor_sleep
+cargo run --example executor_timeout
+cargo run --example executor_race
+\end{lstlisting}
+
+Observe that the executor can drive futures that suspend and resume without
+using a third-party runtime. Then read \filepath{src/executor/future.rs} and
+\filepath{src/executor/timer.rs}.
+
+Try this:
+
+\begin{enumerate}
+    \item Change the sleep duration in \filepath{executor_sleep.rs}.
+    \item Add a second spawned task that sleeps for a different duration.
+    \item Print which task completes first.
+\end{enumerate}
+
+The lesson is that timers do not run in their own thread. The executor records
+deadlines, waits until the next interesting event, and wakes tasks whose
+deadlines expire.
+
+\section{Lab 2: Wake coalescing}
+
+Run the unit tests that mention repeated wakes:
+
+\begin{lstlisting}[language=bash,caption={Wake tests}]
+cargo test repeated_wakes_share_one_ready_queue_entry -- --nocapture
+\end{lstlisting}
+
+Then read the task queueing code in \filepath{src/executor/task.rs} and
+\filepath{src/executor/task\_set.rs}.
+
+Try this:
+
+\begin{enumerate}
+    \item Add a tiny future that calls its waker multiple times before
+          returning \texttt{Pending}.
+    \item Spawn it and inspect the executor snapshot's ready queue length.
+    \item Confirm that repeated wake calls do not create repeated ready queue
+          entries for the same task.
+\end{enumerate}
+
+The lesson is that a waker requests another poll; it is not permission to flood
+the scheduler with duplicate queue entries.
+
+\section{Lab 3: Readiness-driven TCP}
+
+Run:
+
+\begin{lstlisting}[language=bash,caption={TCP readiness examples}]
+cargo run --example async_tcp_pair
+cargo run --example async_tcp_server
+cargo run --example async_tcp_scoped_server
+\end{lstlisting}
+
+Observe the server shape: an accept loop receives a stream, a handler future
+owns that stream, and shutdown waits for handlers.
+
+Try this:
+
+\begin{enumerate}
+    \item Change a handler to write two chunks instead of one.
+    \item Add a short sleep between chunks.
+    \item Watch how the client still observes ordered bytes even though the
+          server task suspends between writes.
+\end{enumerate}
+
+The lesson is that readiness is retry-oriented. A writable notification does
+not mean every byte has been written; the helper must keep retrying until the
+operation is complete.
+
+\section{Lab 4: Scheduling groups}
+
+Run:
+
+\begin{lstlisting}[language=bash,caption={Scheduling group demos}]
+cargo run --example scheduling_group_demo -- 1
+cargo run --example async_tcp_scheduling_groups
+cargo run --example sharded_scheduling_groups
+\end{lstlisting}
+
+Observe the difference between task placement and scheduling accounting. The
+TCP scheduling example shows which group live handler tasks belong to. The CPU
+demo shows virtual runtime and charged poll time changing over time.
+
+Try this:
+
+\begin{enumerate}
+    \item Change the shares in \filepath{scheduling\_group\_demo.rs}.
+    \item Increase the runtime from one second to three seconds.
+    \item Compare the \texttt{executed}, \texttt{charged}, and
+          \texttt{vruntime} columns.
+\end{enumerate}
+
+The lesson is that scheduling groups are cooperative accounting classes, not
+preemptive priorities. Long-running futures still need to yield.
+
+\section{Lab 5: Observability snapshots}
+
+Run:
+
+\begin{lstlisting}[language=bash,caption={Observability examples}]
+cargo run --example sharded_observability
+cargo run --example shard_local_worker_observability
+\end{lstlisting}
+
+Observe the task rows. Focus on \texttt{status}, \texttt{age\_ms},
+\texttt{state\_ms}, \texttt{polls}, and \texttt{wait}.
+
+Try this:
+
+\begin{enumerate}
+    \item Increase the sleep duration inside the worker tasks.
+    \item Add one more worker per shard.
+    \item Observe how task count, timer count, and state duration change.
+\end{enumerate}
+
+The lesson is that snapshots are owned samples. They are not tracing events.
+To build a console-like view, sample repeatedly and compute differences.
+
+\section{Lab 6: Cross-shard submission}
+
+Run:
+
+\begin{lstlisting}[language=bash,caption={Cross-shard examples}]
+cargo run --example sharded_submit
+cargo run --example sharded_map_reduce
+cargo run --example sharded_broadcast
+\end{lstlisting}
+
+Observe that each example explicitly names where work should run. Nothing
+migrates implicitly.
+
+Try this:
+
+\begin{enumerate}
+    \item Submit work from shard 0 to shard 1.
+    \item Have the remote future return \texttt{current\_executor\_shard()}.
+    \item Assert that the returned shard id is the target shard, not the
+          caller's shard.
+\end{enumerate}
+
+The lesson is that the remote future is polled remotely, and the result crosses
+back as an owned value.
+
+\section{Lab 7: Shard-local state}
+
+Run:
+
+\begin{lstlisting}[language=bash,caption={Shard-local examples}]
+cargo run --example shard_local
+cargo run --example shard_local_current
+cargo run --example shard_local_stoppable_workers
+\end{lstlisting}
+
+Observe that local values are accessed on owning shards and that workers can be
+stopped cooperatively.
+
+Try this:
+
+\begin{enumerate}
+    \item Add a second field to the shard-local value.
+    \item Update it inside \texttt{with\_current}.
+    \item Return an owned summary instead of a reference.
+\end{enumerate}
+
+The lesson is that shard-local access is synchronous. If you need to await,
+first produce an owned value and await outside the local-state closure.
+
+\section{Lab 8: CPU placement}
+
+Run:
+
+\begin{lstlisting}[language=bash,caption={CPU placement example}]
+cargo run --example sharded_cpu_placement
+\end{lstlisting}
+
+On Linux, also try the Docker helper:
+
+\begin{lstlisting}[language=bash,caption={Linux CPU placement through Docker}]
+tools/linux-docker.sh cargo run --example sharded_cpu_placement
+\end{lstlisting}
+
+Observe whether placement is applied, unsupported, or rejected. The exact
+result depends on platform and container CPU permissions.
+
+Try this:
+
+\begin{enumerate}
+    \item Request more shards than the container allows CPUs.
+    \item Compare best-effort placement with required placement.
+    \item Inspect the shard snapshots printed by the example.
+\end{enumerate}
+
+The lesson is that CPU placement is an explicit request to the operating
+system. It is not a load balancer.
+
+\section{Lab 9: Linux \texttt{io\_uring}}
+
+This lab requires a Linux host or container where \texttt{io\_uring} setup is
+allowed.
+
+\begin{lstlisting}[language=bash,caption={io\_uring labs}]
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo run --example os_uring
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo run --example os_uring_batch
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo run --example os_uring_abandon
+\end{lstlisting}
+
+Observe the dispatcher snapshots. Focus on pending submissions, tracked
+operations, buffered completions, registered wakers, and abandoned operations.
+
+Try this:
+
+\begin{enumerate}
+    \item Increase the number of submitted operations in
+          \filepath{os\_uring\_batch.rs}.
+    \item Drop a future before completion in a small variant of the abandon
+          example.
+    \item Watch how abandonment and deferred buffer counters change.
+\end{enumerate}
+
+The lesson is that completion-based I/O has a different cancellation problem
+than readiness-based I/O. The kernel may still own an operation after the
+future is gone.
+
+\section{Lab 10: Sharded index build}
+
+Run:
+
+\begin{lstlisting}[language=bash,caption={Sharded index build}]
+cargo run --example sharded_index_build -- --records 512 --shards 4 --seed 0xbeef --cleanup
+\end{lstlisting}
+
+On Linux with \texttt{io\_uring}:
+
+\begin{lstlisting}[language=bash,caption={io\_uring index build}]
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo run --example sharded_index_build_uring -- --records 512 --shards 4 --seed 0xbeef --cleanup
+\end{lstlisting}
+
+Observe how partition work is spread across shards, then merged into one final
+sorted index.
+
+Try this:
+
+\begin{enumerate}
+    \item Change the record count.
+    \item Change the shard count.
+    \item Compare per-shard partition summaries and final verification output.
+\end{enumerate}
+
+The lesson is that the runtime's value appears when a problem can be split into
+owned shard-local work, then combined through explicit owned results.
+
+\section{After the labs}
+
+After running these labs, return to the walkthrough chapter and read the
+modules again. The source is easier to understand after seeing the runtime's
+observable behavior. If a lab result is surprising, use the debugging checklist
+from the walkthrough chapter before changing code.
