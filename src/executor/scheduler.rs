@@ -199,7 +199,7 @@ impl Scheduler {
         state.tasks.record_task_poll(group_id, poll_duration);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     pub(super) fn record_readiness_driver_event(&self, readable: bool, writable: bool) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
         state
@@ -208,9 +208,17 @@ impl Scheduler {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn record_completion_driver_event(&self) {
+    pub(super) fn record_driver_event(
+        &self,
+        readiness: bool,
+        readable: bool,
+        writable: bool,
+        completion: bool,
+    ) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
-        state.counters.record_completion_driver_event();
+        state
+            .counters
+            .record_driver_event(readiness, readable, writable, completion);
     }
 
     #[cfg(target_os = "linux")]

@@ -236,6 +236,15 @@ impl IoUring {
         })
     }
 
+    /// Returns the raw ring descriptor used for readiness-style completion
+    /// notification.
+    ///
+    /// The descriptor remains owned by this `IoUring`; callers may only borrow
+    /// it for polling.
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd.raw()
+    }
+
     /// Submits a no-op operation tagged with `user_data`.
     pub fn submit_nop(&mut self, user_data: u64) -> io::Result<()> {
         self.queue_nop(user_data)?;
@@ -935,9 +944,21 @@ impl IoUringDispatcher {
         &self.ring
     }
 
+    /// Returns the raw ring descriptor used for readiness-style completion
+    /// notification.
+    pub fn raw_fd(&self) -> RawFd {
+        self.ring.raw_fd()
+    }
+
     /// Returns mutable access to the owned ring for queuing operations.
     pub fn ring_mut(&mut self) -> &mut IoUring {
         &mut self.ring
+    }
+
+    /// Submits all currently queued SQEs to the kernel without waiting for a
+    /// completion.
+    pub fn submit_pending(&mut self) -> io::Result<u32> {
+        self.ring.submit_pending()
     }
 
     /// Registers or replaces the waker for a tracked operation.

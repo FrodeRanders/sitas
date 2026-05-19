@@ -94,6 +94,13 @@ allows ring setup. Executor-backed \texttt{io\_uring} futures store operation
 ids and owned buffers. When polled on a shard, they queue an operation against
 the thread-local dispatcher and register their task waker.
 
+When the executor becomes idle, it submits pending ring entries and polls the
+ring descriptor through the same reactor wait that handles fd readiness and
+timer deadlines. The ring descriptor readiness is only a notification that
+completion queue entries may be harvested. The completed operation still flows
+through the dispatcher, which matches operation ids, returns owned buffers, and
+wakes the waiting futures.
+
 The dispatcher tracks:
 
 \begin{itemize}
@@ -147,7 +154,8 @@ before the kernel answered.
 
 \section{Current limitation}
 
-Timers, readiness waits, and \texttt{io\_uring} waits are not yet unified into
-one production event source with deadline-aware completion waiting. The current
-executor gives pending \texttt{io\_uring} work priority when there are no ready
-tasks, which is useful and test-covered, but it is still a staged integration.
+Timers, readiness waits, and \texttt{io\_uring} completions now share one
+executor idle wait shape on Linux. This is still a staged integration rather
+than a production event loop. The runtime does not yet expose a portable
+completion source, a completion batching policy, or a deeper shutdown drain
+policy for mixed readiness and completion workloads.

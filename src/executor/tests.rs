@@ -422,11 +422,15 @@ fn io_uring_read_and_write_are_driven_by_executor_loop() -> io::Result<()> {
         .write(true)
         .open(&path)?;
 
-    let (bytes, snapshot) = block_on(async {
+    let (executor, spawner) = executor_and_spawner();
+    drop(spawner);
+
+    let (bytes, snapshot) = executor.run_until(async {
         write_all_at_uring(file.as_raw_fd(), 0, b"abcdef".to_vec()).await?;
         let bytes = read_exact_at_uring(file.as_raw_fd(), 2, 3).await?;
         Ok::<_, io::Error>((bytes, super::uring::snapshot()))
     })?;
+    let executor_snapshot = executor.snapshot();
 
     assert_eq!(bytes, b"cde");
     let snapshot = snapshot.expect("io_uring dispatcher is installed");
@@ -434,6 +438,7 @@ fn io_uring_read_and_write_are_driven_by_executor_loop() -> io::Result<()> {
     assert_eq!(snapshot.total_dispatched_operation_kinds.writes, 1);
     assert_eq!(snapshot.total_dispatched_operations, 2);
     assert!(snapshot.is_idle());
+    assert!(executor_snapshot.total_completion_events >= 2);
     drop(file);
     fs::remove_file(path)?;
     Ok(())

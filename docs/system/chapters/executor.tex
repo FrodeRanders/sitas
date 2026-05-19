@@ -152,11 +152,17 @@ and task creation to the underlying \texttt{Spawner}.
 Each loop iteration polls ready work, wakes expired timers, dispatches locally
 available \texttt{io\_uring} completions, and then decides how to wait.
 
-Pending \texttt{io\_uring} work now takes the executor wait slot when the shard
-has no ready tasks. That prevents unrelated timers or readiness interests from
-delaying completion-based file I/O. This is still not the final form: the long
-term goal is a single deadline-aware wait path that can combine timers,
-readiness, and completion waiting without giving any source accidental priority.
+On Linux, pending \texttt{io\_uring} submissions are first submitted to the
+kernel without blocking. The executor then includes the ring descriptor in the
+same reactor wait as read interests, write interests, reactor wakes, and the
+next timer deadline. When the ring descriptor becomes readable, the dispatcher
+harvests completions and wakes the registered task wakers.
+
+This gives the executor one idle wait shape instead of a separate
+\texttt{io\_uring}-first wait path. The important semantic point is not that
+\texttt{io\_uring} has become readiness I/O; it has not. Completion ownership
+and buffer lifetime are still handled by the dispatcher. The reactor only tells
+the executor that completion queue progress is available.
 
 \section{Observability}
 

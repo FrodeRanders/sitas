@@ -366,12 +366,21 @@ pub(super) fn should_wait() -> bool {
     })
 }
 
-pub(super) fn wait_and_dispatch() -> io::Result<usize> {
+pub(super) fn completion_fd() -> Option<RawFd> {
+    CURRENT_IO_URING.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .map(|dispatcher| dispatcher.borrow().raw_fd())
+    })
+}
+
+pub(super) fn submit_pending() -> io::Result<u32> {
     CURRENT_IO_URING.with(|current| {
         let Some(dispatcher) = current.borrow().as_ref().cloned() else {
             return Ok(0);
         };
-        dispatcher.borrow_mut().wait_and_dispatch(1)
+        dispatcher.borrow_mut().submit_pending()
     })
 }
 

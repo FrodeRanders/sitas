@@ -31,7 +31,7 @@ impl SchedulerCounters {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     pub(super) fn record_readiness_driver_event(&mut self, readable: bool, writable: bool) {
         self.total_driver_events += 1;
         self.total_readiness_events += 1;
@@ -44,9 +44,26 @@ impl SchedulerCounters {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn record_completion_driver_event(&mut self) {
+    pub(super) fn record_driver_event(
+        &mut self,
+        readiness: bool,
+        readable: bool,
+        writable: bool,
+        completion: bool,
+    ) {
         self.total_driver_events += 1;
-        self.total_completion_events += 1;
+        if readiness {
+            self.total_readiness_events += 1;
+            if readable {
+                self.total_readable_events += 1;
+            }
+            if writable {
+                self.total_writable_events += 1;
+            }
+        }
+        if completion {
+            self.total_completion_events += 1;
+        }
     }
 }
 
@@ -77,7 +94,7 @@ mod tests {
         assert_eq!(counters.ready_poll_budget_exhaustions, 1);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn readiness_events_count_driver_and_direction_progress() {
         let mut counters = SchedulerCounters::default();
@@ -95,13 +112,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn completion_events_count_driver_and_completion_progress() {
+    fn combined_driver_event_counts_one_wait_with_split_progress() {
         let mut counters = SchedulerCounters::default();
 
-        counters.record_completion_driver_event();
-        counters.record_completion_driver_event();
+        counters.record_driver_event(true, true, false, true);
 
-        assert_eq!(counters.total_driver_events, 2);
-        assert_eq!(counters.total_completion_events, 2);
+        assert_eq!(counters.total_driver_events, 1);
+        assert_eq!(counters.total_readiness_events, 1);
+        assert_eq!(counters.total_readable_events, 1);
+        assert_eq!(counters.total_writable_events, 0);
+        assert_eq!(counters.total_completion_events, 1);
     }
 }
