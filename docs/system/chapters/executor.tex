@@ -169,6 +169,9 @@ the executor that completion queue progress is available.
 Executor snapshots are owned values. They include task counts, named task
 state, polling counters, timer counts, readiness counts, and Linux
 \texttt{io\_uring} dispatcher counters when the dispatcher is installed.
+Scheduling group snapshots include ready queue length, total charged poll
+count, total charged poll time, weighted virtual runtime, average poll time,
+and helper methods for computing each group's share of executor poll time.
 
 Task snapshots include the task name, scheduling group id and name, lifecycle
 state, wait interest, poll count, accumulated poll time, and key timestamps.

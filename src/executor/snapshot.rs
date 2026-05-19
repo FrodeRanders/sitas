@@ -115,6 +115,7 @@ mod tests {
             shares: super::super::DEFAULT_SCHEDULING_GROUP_SHARES,
             ready_queue_len: task_snapshot.ready_queue_len,
             virtual_runtime: 5,
+            total_polls: 4,
             total_poll_time: std::time::Duration::from_millis(2),
         };
 
@@ -153,6 +154,7 @@ mod tests {
         assert_eq!(snapshot.ready_queue_len, 1);
         assert_eq!(snapshot.scheduling_groups.len(), 1);
         assert_eq!(snapshot.scheduling_groups[0].name, "default");
+        assert_eq!(snapshot.scheduling_groups[0].total_polls, 4);
         assert_eq!(snapshot.timer_count, 3);
         assert_eq!(snapshot.ready_poll_budget, super::super::READY_POLL_BUDGET);
         assert_eq!(snapshot.total_spawned_tasks, 10);

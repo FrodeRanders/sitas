@@ -203,29 +203,57 @@ fn summarize(
 }
 
 fn print_rows(results: &[GroupResult]) {
+    let total_charged = results
+        .iter()
+        .filter_map(|result| {
+            result
+                .group_snapshot
+                .as_ref()
+                .map(|group| group.total_poll_time)
+        })
+        .sum();
+
     println!(
-        "{:8} {:>8} {:>15} {:>10} {:>12} {:>14} {:>12}",
-        "group", "shares", "task_time(us)", "executed", "runtime(ms)", "charged(ms)", "vruntime"
+        "{:8} {:>8} {:>15} {:>10} {:>12} {:>8} {:>12} {:>10} {:>12}",
+        "group",
+        "shares",
+        "task_time(us)",
+        "executed",
+        "runtime(ms)",
+        "polls",
+        "charged(ms)",
+        "share(%)",
+        "vruntime"
     );
 
     for result in results {
+        let polls = result
+            .group_snapshot
+            .as_ref()
+            .map_or(0, |group| group.total_polls);
         let charged_ms = result
             .group_snapshot
             .as_ref()
             .map_or(0, |group| group.total_poll_time.as_millis());
+        let poll_share = result
+            .group_snapshot
+            .as_ref()
+            .map_or(0.0, |group| group.poll_time_share_of(total_charged) * 100.0);
         let vruntime = result
             .group_snapshot
             .as_ref()
             .map_or(0, |group| group.virtual_runtime);
 
         println!(
-            "{:8} {:>8} {:>15} {:>10} {:>12} {:>14} {:>12}",
+            "{:8} {:>8} {:>15} {:>10} {:>12} {:>8} {:>12} {:>9.1} {:>12}",
             result.label,
             result.shares,
             result.task_time_us,
             result.executed,
             result.runtime.as_millis(),
+            polls,
             charged_ms,
+            poll_share,
             vruntime
         );
     }

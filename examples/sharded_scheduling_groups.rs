@@ -113,16 +113,26 @@ fn print_group_snapshots(snapshot: &sitas::ShardedExecutorSnapshot) {
 }
 
 fn print_executor_groups(shard_id: ShardId, executor: &ExecutorSnapshot) {
+    let total_poll_time = executor.total_scheduling_group_poll_time();
     println!(
-        "  shard {}: tasks={} polls={}",
-        shard_id.0, executor.task_count, executor.total_task_polls
+        "  shard {}: tasks={} task_polls={} group_polls={}",
+        shard_id.0,
+        executor.task_count,
+        executor.total_task_polls,
+        executor.total_scheduling_group_polls()
     );
     for group in &executor.scheduling_groups {
+        let average_us = group
+            .average_poll_time()
+            .map_or(0, |duration| duration.as_micros());
         println!(
-            "    {:>10}: shares={:>3} charged_ms={:>4} vruntime={}",
+            "    {:>10}: shares={:>3} polls={:>5} avg_us={:>5} charged_ms={:>4} share={:>5.1}% vruntime={}",
             group.name,
             group.shares,
+            group.total_polls,
+            average_us,
             group.total_poll_time.as_millis(),
+            group.poll_time_share_of(total_poll_time) * 100.0,
             group.virtual_runtime
         );
     }

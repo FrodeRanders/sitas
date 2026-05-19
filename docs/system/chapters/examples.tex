@@ -72,6 +72,12 @@ snapshot, and prints which scheduling group each live task belongs to. This is
 a small substitute for a console UI: the snapshot is just owned data, so a tool
 can render it however it wants.
 
+\filepath{scheduling\_group\_demo.rs} and
+\filepath{sharded\_scheduling\_groups.rs} expose group-level progress as well:
+charged poll count, charged poll time, average poll duration, and poll-time
+share. These fields make long-running cooperative work easier to inspect
+without adding a tracing subsystem or global scheduler.
+
 \section{Sharded index build}
 
 The sharded index example uses two files: a fixed-size record data file and a

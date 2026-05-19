@@ -109,6 +109,11 @@ This preserves the shared-nothing model. Each shard still schedules only its
 own tasks. The sharded group handle simply lets callers use one typed API to
 spawn or submit matching classes of work across shards.
 
+Per-shard snapshots keep the same boundary. They report each shard's local
+group poll count, charged poll time, average poll duration, and poll-time
+share. A monitoring tool can compare those owned values across shards, but the
+runtime does not introduce a global scheduling queue to produce them.
+
 Runtime identity matters. A sharded group created by one
 \texttt{ShardedExecutor} is rejected by another runtime, even if both runtimes
 have a group with the same name. This prevents accidental targeting of

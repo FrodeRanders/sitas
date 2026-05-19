@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!(
-                "  shard {}: ready={} tasks={} timers={} read={} write={} polls={} done={} budget_hits={}",
+                "  shard {}: ready={} tasks={} timers={} read={} write={} task_polls={} group_polls={} done={} budget_hits={}",
                 shard.shard_id.0,
                 executor.ready_queue_len,
                 executor.task_count,
@@ -43,9 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 executor.read_interest_count,
                 executor.write_interest_count,
                 executor.total_task_polls,
+                executor.total_scheduling_group_polls(),
                 executor.total_completed_tasks,
                 executor.ready_poll_budget_exhaustions
             );
+            print_scheduling_groups(executor);
             print_io_uring(executor);
 
             for task in &executor.tasks {
@@ -65,6 +67,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     runtime.stop()?;
     Ok(())
+}
+
+fn print_scheduling_groups(executor: &ExecutorSnapshot) {
+    let total_poll_time = executor.total_scheduling_group_poll_time();
+    for group in &executor.scheduling_groups {
+        if group.total_polls == 0 && group.ready_queue_len == 0 {
+            continue;
+        }
+
+        println!(
+            "      group {} shares={} ready={} polls={} avg_us={} share={:.1}%",
+            group.name,
+            group.shares,
+            group.ready_queue_len,
+            group.total_polls,
+            group
+                .average_poll_time()
+                .map_or(0, |duration| duration.as_micros()),
+            group.poll_time_share_of(total_poll_time) * 100.0
+        );
+    }
 }
 
 fn print_io_uring(executor: &ExecutorSnapshot) {

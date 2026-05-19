@@ -35,6 +35,7 @@ struct SchedulerGroup {
     name: String,
     shares: u32,
     virtual_runtime: u128,
+    total_polls: u64,
     total_poll_time: Duration,
     queue: VecDeque<Arc<Task>>,
 }
@@ -47,6 +48,7 @@ impl SchedulerTaskSet {
                 name: String::from("default"),
                 shares: DEFAULT_SCHEDULING_GROUP_SHARES,
                 virtual_runtime: 0,
+                total_polls: 0,
                 total_poll_time: Duration::ZERO,
                 queue: VecDeque::new(),
             }],
@@ -76,6 +78,7 @@ impl SchedulerTaskSet {
             name,
             shares,
             virtual_runtime,
+            total_polls: 0,
             total_poll_time: Duration::ZERO,
             queue: VecDeque::new(),
         });
@@ -143,6 +146,7 @@ impl SchedulerTaskSet {
         };
 
         group.total_poll_time += poll_duration;
+        group.total_polls += 1;
         let nanos = poll_duration.as_nanos().max(1);
         group.virtual_runtime +=
             nanos * u128::from(DEFAULT_SCHEDULING_GROUP_SHARES) / u128::from(group.shares);
@@ -215,6 +219,7 @@ impl SchedulerTaskSet {
                 shares: group.shares,
                 ready_queue_len: group.queue.len(),
                 virtual_runtime: group.virtual_runtime,
+                total_polls: group.total_polls,
                 total_poll_time: group.total_poll_time,
             })
             .collect()
@@ -337,6 +342,7 @@ mod tests {
         assert_eq!(snapshot.groups[1].name, "bulk");
         assert_eq!(snapshot.groups[1].shares, 25);
         assert_eq!(snapshot.groups[1].ready_queue_len, 1);
+        assert_eq!(snapshot.groups[1].total_polls, 0);
     }
 
     #[test]
@@ -352,6 +358,7 @@ mod tests {
 
         assert!(Arc::ptr_eq(&tasks.next_task().unwrap(), &first_low));
         tasks.record_task_poll(low_share, Duration::from_millis(1));
+        assert_eq!(tasks.snapshot().groups[low_share.0].total_polls, 1);
 
         let second_low = task_in_group(3, low_share);
         let second_high = task_in_group(4, high_share);

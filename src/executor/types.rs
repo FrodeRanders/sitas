@@ -148,8 +148,33 @@ pub struct SchedulingGroupSnapshot {
     pub ready_queue_len: usize,
     /// Weighted virtual runtime accumulated by this group.
     pub virtual_runtime: u128,
+    /// Number of task polls charged to this group.
+    pub total_polls: u64,
     /// Total wall-clock poll time charged to this group.
     pub total_poll_time: Duration,
+}
+
+impl SchedulingGroupSnapshot {
+    /// Returns the group's average charged poll duration, if it has been
+    /// polled at least once.
+    pub fn average_poll_time(&self) -> Option<Duration> {
+        if self.total_polls == 0 {
+            return None;
+        }
+
+        Some(self.total_poll_time.div_f64(self.total_polls as f64))
+    }
+
+    /// Returns this group's share of `total_poll_time` as a value in the range
+    /// `0.0..=1.0`.
+    pub fn poll_time_share_of(&self, total_poll_time: Duration) -> f64 {
+        let total_nanos = total_poll_time.as_nanos();
+        if total_nanos == 0 {
+            return 0.0;
+        }
+
+        self.total_poll_time.as_nanos() as f64 / total_nanos as f64
+    }
 }
 
 /// Owned point-in-time summary of one executor.
@@ -203,6 +228,25 @@ pub struct ExecutorSnapshot {
     pub total_completion_events: u64,
     /// Owned snapshots for tasks that are still externally observable.
     pub tasks: Vec<TaskSnapshot>,
+}
+
+impl ExecutorSnapshot {
+    /// Returns the total charged poll time across all scheduling groups.
+    pub fn total_scheduling_group_poll_time(&self) -> Duration {
+        self.scheduling_groups
+            .iter()
+            .map(|group| group.total_poll_time)
+            .sum()
+    }
+
+    /// Returns the total number of task polls charged across all scheduling
+    /// groups.
+    pub fn total_scheduling_group_polls(&self) -> u64 {
+        self.scheduling_groups
+            .iter()
+            .map(|group| group.total_polls)
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -288,5 +332,86 @@ mod tests {
         let now = created_at + Duration::from_millis(5);
 
         assert_eq!(task.state_duration_at(now), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn scheduling_group_snapshot_reports_average_and_share() {
+        let group = SchedulingGroupSnapshot {
+            id: DEFAULT_SCHEDULING_GROUP_ID,
+            name: String::from("default"),
+            shares: DEFAULT_SCHEDULING_GROUP_SHARES,
+            ready_queue_len: 0,
+            virtual_runtime: 0,
+            total_polls: 4,
+            total_poll_time: Duration::from_millis(10),
+        };
+
+        assert_eq!(group.average_poll_time(), Some(Duration::from_micros(2500)));
+        assert_eq!(group.poll_time_share_of(Duration::from_millis(40)), 0.25);
+
+        let idle = SchedulingGroupSnapshot {
+            total_polls: 0,
+            total_poll_time: Duration::ZERO,
+            ..group
+        };
+        assert_eq!(idle.average_poll_time(), None);
+        assert_eq!(idle.poll_time_share_of(Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn executor_snapshot_sums_scheduling_group_progress() {
+        let first = SchedulingGroupSnapshot {
+            id: DEFAULT_SCHEDULING_GROUP_ID,
+            name: String::from("default"),
+            shares: DEFAULT_SCHEDULING_GROUP_SHARES,
+            ready_queue_len: 0,
+            virtual_runtime: 0,
+            total_polls: 4,
+            total_poll_time: Duration::from_millis(10),
+        };
+        let second = SchedulingGroupSnapshot {
+            id: SchedulingGroupId(1),
+            name: String::from("background"),
+            shares: 25,
+            ready_queue_len: 0,
+            virtual_runtime: 0,
+            total_polls: 2,
+            total_poll_time: Duration::from_millis(5),
+        };
+        let snapshot = ExecutorSnapshot {
+            accepting: true,
+            spawner_count: 0,
+            task_count: 0,
+            ready_queue_len: 0,
+            scheduling_groups: vec![first, second],
+            timer_count: 0,
+            #[cfg(unix)]
+            read_interest_count: 0,
+            #[cfg(unix)]
+            write_interest_count: 0,
+            #[cfg(target_os = "linux")]
+            io_uring: None,
+            ready_poll_budget: 64,
+            total_spawned_tasks: 0,
+            total_completed_tasks: 0,
+            total_task_polls: 0,
+            ready_poll_budget_exhaustions: 0,
+            total_driver_events: 0,
+            #[cfg(unix)]
+            total_readiness_events: 0,
+            #[cfg(unix)]
+            total_readable_events: 0,
+            #[cfg(unix)]
+            total_writable_events: 0,
+            #[cfg(target_os = "linux")]
+            total_completion_events: 0,
+            tasks: Vec::new(),
+        };
+
+        assert_eq!(
+            snapshot.total_scheduling_group_poll_time(),
+            Duration::from_millis(15)
+        );
+        assert_eq!(snapshot.total_scheduling_group_polls(), 6);
     }
 }

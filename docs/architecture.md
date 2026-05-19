@@ -162,11 +162,13 @@ real weighted scheduling signal without introducing preemption, priorities,
 load balancing, or a production resource controller.
 
 Scheduling group snapshots are owned values and include group id, name, shares,
-ready queue length, total charged poll time, and virtual runtime. Task snapshots
-include the scheduling group id and the owned scheduling group name when the
-snapshot builder can resolve it. The `scheduling_group_demo` example first runs
-all work in the default group as a baseline, then repeats the workload with
-weighted groups.
+ready queue length, total charged poll count, total charged poll time, and
+virtual runtime. Snapshot helper methods derive average charged poll time and a
+group's share of executor poll time without exposing live scheduler internals.
+Task snapshots include the scheduling group id and the owned scheduling group
+name when the snapshot builder can resolve it. The `scheduling_group_demo`
+example first runs all work in the default group as a baseline, then repeats the
+workload with weighted groups.
 
 `TaskScope` can spawn ordinary children or cooperative stop-token children into
 a scheduling group. The scope does not own scheduling policy itself; it keeps
