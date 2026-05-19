@@ -10,6 +10,20 @@ The executor deliberately avoids Tokio or another third-party runtime. That
 keeps the interesting internals visible: wakers, task queues, timers, readiness
 registration, cancellation, and completion dispatch all live in this code base.
 
+\section{Why a custom executor}
+
+The custom executor exists because the project needs to control the meaning of
+``where work runs.'' In a shard-per-core runtime, a future is not just an async
+computation; it is also part of a placement decision. The executor must be able
+to say that this task belongs to this shard, this scheduling group, this ready
+queue, and this local reactor state.
+
+A third-party runtime would solve many engineering problems, but it would also
+move the most interesting questions behind someone else's scheduler. Here the
+small executor is the laboratory. It makes it possible to inspect how a waker
+requeues one task, how a dropped timeout removes timer state, how a TCP future
+records fd interest, and how a completion future keeps buffers alive.
+
 \section{Responsibilities}
 
 \begin{itemize}
@@ -59,6 +73,14 @@ executor eventually drops the owned future. Timer and readiness futures must
 therefore clean up their registrations in \texttt{Drop}; otherwise the reactor
 would keep stale interests for tasks that no longer exist.
 
+\begin{notabene}[Why cancellation is treated as ordinary]
+Rust futures are cancelled by being dropped. The runtime cannot rely on a
+separate cancellation callback running later. Cleanup must therefore be owned by
+the future, task, join handle, or dispatcher state that is being dropped. This
+is why many tests exercise timeout, abort, and dropped-future paths rather than
+only successful completion.
+\end{notabene}
+
 \section{Wakers and the ready queue}
 
 The custom waker does one job: make the task runnable again on the same
@@ -71,12 +93,23 @@ bounded by \texttt{READY\_POLL\_BUDGET}. That budget is a fairness valve. A
 self-waking task can keep itself ready, but it cannot prevent the executor from
 checking timers, readiness, and completions forever.
 
+The ready queue is intentionally executor-local. Cross-thread wakeups may need
+to notify an executor that work became ready, but the task itself is still
+polled by the executor that owns it. This keeps local task state, scheduling
+group accounting, and reactor registrations aligned.
+
 \section{Scheduling groups}
 
 Scheduling groups are the first resource-class mechanism in the executor. Each
 group owns a ready queue and has a relative share count. Ordinary spawn calls
 use the default group. Explicit group APIs let code classify work such as
 foreground request handling and background maintenance.
+
+The reason to add groups before more advanced load balancing is that resource
+classification is a local scheduling problem. A shard can decide how to divide
+its own polling time among foreground and background tasks without moving
+application state to another shard. That makes scheduling groups a natural fit
+for the shared-nothing model.
 
 The selection rule is deliberately simple. The scheduler chooses a non-empty
 group with the lowest weighted virtual runtime, pops one task from that

@@ -7,6 +7,12 @@ something specific to observe, and a small modification to try. The goal is not
 to benchmark the runtime. The goal is to connect visible behavior to the
 mechanisms described earlier.
 
+The labs are organized around ``why'' questions rather than feature coverage.
+Why does a timer need a waker? Why does readiness require retrying the system
+call? Why does cross-shard submission return an owned result? Why does
+\texttt{io\_uring} need abandonment tracking? Running the examples first makes
+those design choices less abstract.
+
 \begin{notabene}[Lab style]
 Run one lab at a time. After each command, inspect the example source and the
 runtime module it exercises. The examples are intentionally small enough that

@@ -15,6 +15,12 @@ show the runtime pieces in isolation before combining them:
     \item standard-file and \texttt{io\_uring} index-building demos.
 \end{itemize}
 
+The examples are deliberately not just smoke tests. Each one is a small
+experiment with a visible runtime question: what wakes this future, which shard
+polls it, what state does the snapshot show, or what happens when the work is
+cancelled? That is why several examples print more internal state than a normal
+library example would.
+
 \section{Suggested reading path}
 
 The examples are easiest to learn from in layers:
@@ -42,6 +48,10 @@ The examples are easiest to learn from in layers:
 Treat examples as executable documentation. Run them, then inspect the modules
 they use. Most examples intentionally print runtime counters or snapshots so
 that the mechanism is visible rather than merely implied.
+
+If an example feels a little verbose, that is usually intentional. The output
+is meant to connect a user-visible event to an internal mechanism. A compact
+demo that hides the executor state would be less useful for this project.
 
 \section{Observability examples}
 
@@ -79,6 +89,12 @@ examples. They exercise the Seastar-like direction: split work by shard, keep
 partition-local state local while sorting, materialize intermediate runs, and
 merge owned outputs. They are useful for studying where the project is heading,
 but they are not the first examples to read.
+
+The reason the index build is a good larger example is that it is naturally
+partitionable. Each shard can sort a portion of the data without sharing a
+mutable index structure with other shards. The merge phase then makes the
+coordination cost explicit by exchanging owned run files and summaries rather
+than borrowing another shard's working set.
 
 \section{Representative commands}
 

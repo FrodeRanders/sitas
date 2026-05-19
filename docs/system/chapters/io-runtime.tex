@@ -11,6 +11,12 @@ This path is readiness-based, not completion-based. It is used by the current
 TCP helpers and remains separate from the experimental \texttt{io\_uring}
 completion path.
 
+Readiness is the first I/O layer because it matches Unix non-blocking sockets
+well and it is portable across the platforms used for development. It also
+keeps ownership simple: the stream or listener remains owned by user code, and
+the runtime only remembers which task should be woken when the descriptor may
+make progress.
+
 Readiness means that the operating system says an operation is likely to make
 progress. It does not mean the runtime has the bytes. A readable TCP stream
 may still return fewer bytes than requested. A writable stream may accept only
@@ -35,6 +41,10 @@ This is why readiness futures do not own file descriptors. The caller owns the
 stream or listener. The future only borrows it for the duration of the async
 operation and registers interest in the raw descriptor while pending.
 
+That borrowing model is useful for TCP. A connection handler can own a stream
+and call several helper futures against it in sequence. The reactor does not
+become the owner of the connection; it is only the waiting mechanism.
+
 \section{TCP helpers}
 
 The TCP helpers are intentionally written on top of readiness futures rather
@@ -54,6 +64,13 @@ handler work is moved into the requested group. This is useful for separating
 foreground request handling from background maintenance or low-priority
 connections.
 
+This split is important because accepting connections and serving connections
+have different lifecycle and scheduling needs. The accept loop is usually one
+long-lived task. Handlers are many shorter-lived tasks whose resource class may
+depend on the service being provided. Keeping those roles separate makes
+shutdown, observability, and scheduling group assignment easier to reason
+about.
+
 \begin{notabene}[Readiness lesson]
 Readiness is a notification that retrying may be useful. Completion is a
 notification that the operation has already finished. The code keeps those
@@ -65,6 +82,12 @@ concepts separate because the ownership and cancellation rules are different.
 The Linux \texttt{io\_uring} backend is experimental. It currently supports a
 narrow executor integration for owned-buffer \texttt{read\_at},
 \texttt{read\_exact\_at}, and \texttt{write\_at} style file I/O.
+
+\texttt{io\_uring} is included because it exercises a harder runtime problem
+than readiness. The kernel can own an operation after the Rust future that
+submitted it has been dropped. That forces the runtime to model operation ids,
+owned buffers, late completions, and abandonment. Those are exactly the kinds
+of internals this project wants to make visible.
 
 Each Linux executor run loop installs a thread-local dispatcher when the host
 allows ring setup. Executor-backed \texttt{io\_uring} futures store operation
@@ -115,6 +138,12 @@ the kernel. The dispatcher marks it abandoned and defers buffer cleanup until a
 completion or safe discard point is observed. This is one of the most important
 differences between readiness and completion: cancellation is not just removing
 a waker; it also involves kernel-owned in-flight work.
+
+The dispatcher is intentionally a lifecycle object, not only a syscall wrapper.
+A thin wrapper around \texttt{io\_uring\_enter} would not be enough for async
+Rust integration. The runtime needs somewhere to hold buffers, match
+completions back to futures, wake tasks, and account for futures that vanished
+before the kernel answered.
 
 \section{Current limitation}
 

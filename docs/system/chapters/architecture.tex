@@ -39,6 +39,14 @@ It does. Wakers, reply state, lifecycle flags, counters, and submission queues
 are runtime machinery. The important distinction is that application service
 state is not normally protected by those locks. It stays local to its shard.
 
+\begin{notabene}[Why avoid a service mutex?]
+A service mutex answers only one question: can two threads mutate this value at
+the same time? The runtime is asking a stronger question: which shard is
+responsible for this value, which work is allowed to touch it, and how does
+another shard request a change? Keeping service state shard-owned preserves
+that answer in the program structure.
+\end{notabene}
+
 \begin{lstlisting}[language={},caption={State ownership model}]
 Caller thread or task
     |
@@ -72,6 +80,19 @@ operation drops a buffer before the kernel has finished with it.
     \item[Kernel I/O] stores owned buffers until completions are observed or
         until abandoned operation cleanup proves they can be discarded.
 \end{description}
+
+\section{Why owned snapshots}
+
+Observability could expose references into executor internals, but that would
+make a diagnostic API participate in the same lifetime and locking problems as
+the runtime itself. The project instead treats observation as a copy boundary.
+A snapshot is a point-in-time fact value that can be sorted, printed, diffed,
+or sent to another thread without keeping the executor borrowed.
+
+This matters because long-running runtime work needs inspection while it is
+still changing. Owned snapshots let monitoring code be ordinary application
+code. They also prevent a debugging tool from accidentally extending the
+lifetime of task, timer, or shard-local internals.
 
 \section{Layered model}
 

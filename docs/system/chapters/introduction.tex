@@ -51,6 +51,32 @@ what wakes it, and what happens when it is dropped, you understand the most
 important parts of this code base.
 \end{notabene}
 
+\section{Why the project has this shape}
+
+The runtime is intentionally built from small visible pieces because the
+project is as much about explanation as about capability. A mature runtime can
+hide task allocation, reactor registration, cross-thread wakeups, cancellation,
+and kernel ownership behind polished APIs. That is useful in production, but it
+is not ideal when the goal is to understand the machinery.
+
+\texttt{sitas} therefore accepts some explicitness that a general-purpose
+runtime might smooth over:
+
+\begin{description}
+    \item[Explicit shards] make ownership visible. If work runs on shard 2,
+        shard 2 owns the mutation.
+    \item[Explicit submitters] make cross-shard movement visible. A future does
+        not silently migrate just because another shard is less busy.
+    \item[Explicit snapshots] make observation visible. Monitoring is a read of
+        owned runtime facts, not a borrowed view into live internals.
+    \item[Explicit OS boundaries] make platform behavior visible. A readiness
+        wait, an \texttt{io\_uring} completion, and a CPU affinity request are
+        different contracts with the operating system.
+\end{description}
+
+This is the main design tradeoff in the code base. The project prefers APIs
+that teach the boundary they cross over APIs that hide the boundary too early.
+
 \section{Scope of this manual}
 
 This manual is a LaTeX companion to the Markdown architecture notes. It is

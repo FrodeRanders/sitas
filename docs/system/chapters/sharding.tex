@@ -14,6 +14,12 @@ parallelism comes from many mostly-independent shards, not from many threads
 mutating the same service object. Each shard has its own executor, task queues,
 timers, readiness registrations, and shard-local values.
 
+The reason for this shape is cache locality and ownership clarity. If each
+shard owns its state and mostly works on its own queue, the runtime does not
+need a global lock around application data. Cross-shard communication still
+exists, but it becomes an explicit cost in the design instead of an accidental
+side effect of shared references.
+
 \begin{lstlisting}[language={},caption={Shard-per-core runtime shape}]
 Shard 0 thread        Shard 1 thread        Shard 2 thread
   Executor              Executor              Executor
@@ -54,6 +60,12 @@ This is why cross-shard APIs require \texttt{Send + 'static} where a future or
 value can move to another thread. It is also why references into shard-local
 state cannot be submitted.
 
+The submitter API is deliberately more explicit than a general work-stealing
+pool. Work stealing would be interesting later, but it would blur the lesson
+this runtime is trying to preserve: placement is part of the program's
+semantics. When code submits to shard 1, it is saying that shard 1 is the
+correct owner for that unit of work.
+
 \section{Shard-local values}
 
 \texttt{ShardLocal<T>} owns one value per executor shard. Access is routed to
@@ -78,6 +90,13 @@ The API therefore prefers closures returning owned results. If a computation
 needs to wait, split it into two phases: first copy or compute an owned value
 from the shard-local state, then \texttt{await} using that owned value outside
 the access closure.
+
+\begin{notabene}[Why not async closures for local access?]
+An async closure can suspend while holding references captured from its
+environment. That is exactly what shard-local state must avoid. The synchronous
+closure form is less flexible, but it makes the safe pattern obvious: inspect
+or mutate local state now, return an owned value, and only then await.
+\end{notabene}
 
 \section{Sharded scheduling groups}
 
@@ -111,3 +130,9 @@ to particular CPUs. In containers, the available CPU set may already be
 restricted, so the runtime first observes what the kernel says is available.
 On macOS and other unsupported platforms, placement reports unsupported rather
 than pretending that pinning happened.
+
+The feature is useful even in this experimental form because it forces the
+runtime to separate desired placement from observed placement. A shard can say
+which CPU it asked for, which CPU set the host allowed, and whether startup
+treated failure as advisory or fatal. Those facts are more valuable than a
+portable abstraction that hides when pinning did not actually occur.
