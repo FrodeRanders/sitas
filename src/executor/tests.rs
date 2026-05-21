@@ -513,6 +513,34 @@ fn io_uring_completion_is_not_delayed_by_unexpired_timer() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn io_uring_shutdown_drains_abandoned_owned_buffer() -> io::Result<()> {
+    if crate::os::available_io_uring(8)?.is_none() {
+        return Ok(());
+    }
+
+    let (read_stream, _write_stream) = UnixStream::pair()?;
+    let (executor, _spawner) = executor_and_spawner();
+
+    let timeout_result = executor.run_until(timeout(Duration::from_millis(5), async {
+        read_at_uring(read_stream.as_raw_fd(), u64::MAX, vec![0; 5]).await
+    }));
+    assert!(matches!(timeout_result, Err(TimeoutError)));
+
+    let snapshot = executor
+        .snapshot()
+        .io_uring
+        .expect("io_uring dispatcher snapshot is recorded at shutdown");
+    assert_eq!(snapshot.registered_wakers, 0);
+    assert_eq!(snapshot.completed_operations, 0);
+    assert_eq!(snapshot.abandoned_operations, 0);
+    assert_eq!(snapshot.deferred_buffers, 0);
+    assert!(snapshot.is_idle());
+    assert!(snapshot.total_discarded_operations > 0);
+    Ok(())
+}
+
 #[test]
 fn timeout_returns_future_output_before_deadline() {
     let output = block_on(async { timeout(Duration::from_secs(1), async { 7 }).await });

@@ -16,6 +16,8 @@ use crate::os::{
 type SharedDispatcher = crate::os::SharedIoUringDispatcher;
 
 const EXECUTOR_IO_URING_ENTRIES: u32 = 256;
+const EXECUTOR_IO_URING_COMPLETION_BUDGET: usize = 64;
+const EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS: usize = 8;
 
 thread_local! {
     static CURRENT_IO_URING: RefCell<Option<SharedDispatcher>> = const { RefCell::new(None) };
@@ -32,7 +34,7 @@ impl ExecutorIoUringScope {
 
 impl Drop for ExecutorIoUringScope {
     fn drop(&mut self) {
-        clear_current_io_uring();
+        let _ = shutdown_current();
     }
 }
 
@@ -342,18 +344,24 @@ pub(super) fn install_current_io_uring() {
     });
 }
 
-pub(super) fn clear_current_io_uring() {
+pub(super) fn shutdown_current() -> Option<IoUringDispatcherSnapshot> {
     CURRENT_IO_URING.with(|current| {
-        *current.borrow_mut() = None;
-    });
+        let dispatcher = current.borrow_mut().take()?;
+        let mut dispatcher = dispatcher.borrow_mut();
+        if dispatcher.snapshot().registered_wakers == 0 {
+            let _ = dispatcher.drain_until_idle(EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS);
+        }
+        Some(dispatcher.snapshot())
+    })
 }
 
 pub(super) fn dispatch_available() -> usize {
     CURRENT_IO_URING.with(|current| {
-        current
-            .borrow()
-            .as_ref()
-            .map_or(0, |dispatcher| dispatcher.borrow_mut().dispatch_available())
+        current.borrow().as_ref().map_or(0, |dispatcher| {
+            dispatcher
+                .borrow_mut()
+                .dispatch_available_limit(EXECUTOR_IO_URING_COMPLETION_BUDGET)
+        })
     })
 }
 

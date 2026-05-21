@@ -119,6 +119,8 @@ impl Executor {
 
             self.wait_for_idle_driver_event("running executor");
         }
+
+        self.shutdown_io_uring();
     }
 
     /// Runs `future` to completion while also driving spawned executor tasks.
@@ -144,7 +146,10 @@ impl Executor {
                 drop(current_scheduler);
 
                 match poll_result {
-                    Ok(Poll::Ready(output)) => return output,
+                    Ok(Poll::Ready(output)) => {
+                        self.shutdown_io_uring();
+                        return output;
+                    }
                     Ok(Poll::Pending) => {}
                     Err(payload) => panic::resume_unwind(payload),
                 }
@@ -202,6 +207,12 @@ impl Executor {
     fn refresh_io_uring_snapshot(&self) {
         #[cfg(target_os = "linux")]
         self.scheduler.record_io_uring_snapshot(uring::snapshot());
+    }
+
+    fn shutdown_io_uring(&self) {
+        #[cfg(target_os = "linux")]
+        self.scheduler
+            .record_io_uring_snapshot(uring::shutdown_current());
     }
 }
 

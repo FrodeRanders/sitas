@@ -1029,8 +1029,20 @@ impl IoUringDispatcher {
     /// Matching registered wakers are removed and woken. The completions remain
     /// available through [`IoUringDispatcher::take_completion`].
     pub fn dispatch_available(&mut self) -> usize {
+        self.dispatch_available_limit(usize::MAX)
+    }
+
+    /// Dispatches up to `limit` locally available tracked completions.
+    ///
+    /// This is the bounded variant used by executor loops that want completion
+    /// delivery to have an explicit per-tick budget. A zero limit does not
+    /// inspect the completion queue.
+    pub fn dispatch_available_limit(&mut self, limit: usize) -> usize {
         let mut dispatched = 0;
-        while let Some(completion) = self.ring.try_operation_completion() {
+        while dispatched < limit {
+            let Some(completion) = self.ring.try_operation_completion() else {
+                break;
+            };
             let operation = completion.operation;
             self.total_dispatched_operations += 1;
             self.total_dispatched_operation_kinds.add(completion.kind);
@@ -1081,6 +1093,13 @@ impl IoUringDispatcher {
         }
 
         for _ in 0..max_waits {
+            let snapshot = self.snapshot();
+            if snapshot.ring.pending_submissions == 0
+                && snapshot.ring.pending_completions == 0
+                && snapshot.ring.tracked_operations == 0
+            {
+                break;
+            }
             dispatched += self.wait_and_dispatch(1)?;
             if self.is_idle() {
                 return Ok(dispatched);
@@ -2042,6 +2061,33 @@ mod tests {
         assert_eq!(snapshot.total_buffered_operation_kinds.total(), 1);
         assert_eq!(snapshot.total_woken_operation_kinds.total(), 1);
         assert!(snapshot.total_discarded_operation_kinds.is_empty());
+    }
+
+    #[test]
+    fn dispatcher_dispatch_available_limit_caps_tracked_completions() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let mut dispatcher = IoUringDispatcher::new(ring);
+
+        let first = dispatcher.ring_mut().queue_nop_operation().unwrap();
+        let second = dispatcher.ring_mut().queue_nop_operation().unwrap();
+        assert_eq!(dispatcher.ring_mut().submit_pending().unwrap(), 2);
+        dispatcher.ring_mut().wait_completions(2).unwrap();
+
+        assert_eq!(dispatcher.dispatch_available_limit(1), 1);
+        let snapshot = dispatcher.snapshot();
+        assert_eq!(snapshot.total_dispatched_operations, 1);
+        assert_eq!(snapshot.completed_operations, 1);
+        assert!(
+            dispatcher.take_completion(first).is_some()
+                || dispatcher.take_completion(second).is_some()
+        );
+
+        assert_eq!(dispatcher.dispatch_available_limit(1), 1);
+        let snapshot = dispatcher.snapshot();
+        assert_eq!(snapshot.total_dispatched_operations, 2);
+        assert_eq!(snapshot.completed_operations, 1);
     }
 
     #[test]

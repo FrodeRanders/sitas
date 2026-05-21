@@ -416,18 +416,23 @@ operation ids and owned buffers, not `Rc` dispatcher handles, so they can remain
 `Send` before being moved onto a shard thread. When polled on the shard, they
 queue operations against the thread-local dispatcher and register their task
 waker. The executor dispatches locally available completions after ready-task
-polling and gives pending `io_uring` work the executor wait slot when the shard
-has no ready tasks. This avoids hiding completion work behind an unrelated
-timer or readiness wait, but it is still a staged integration rather than one
-combined production wait primitive.
+polling with a fixed per-tick completion budget and gives pending `io_uring`
+work the executor wait slot when the shard has no ready tasks. Executor teardown
+makes a bounded attempt to drain abandoned operations before discarding the
+thread-local dispatcher when no live task wakers remain registered. This avoids
+hiding completion work behind an unrelated timer or readiness wait, but it is
+still a staged integration rather than one combined production wait primitive.
 
 This integration deliberately keeps some limits visible:
 
 - it is Linux-only and reports normal unsupported behavior when `io_uring` is
   unavailable;
 - the dispatcher is per executor thread, not shared across shards;
-- timers, readiness waits, and `io_uring` waits are not yet unified into one
-  production event source with deadline-aware completion waiting;
+- completion dispatch and shutdown draining use fixed internal limits rather
+  than caller-tunable policy;
+- timers, readiness waits, and `io_uring` waits now share the Linux executor
+  idle wait shape, but are not yet exposed as one portable production event
+  source with deadline-aware completion policy;
 - final verification in the index example still uses std file I/O.
 
 It has two layers of completion state:
