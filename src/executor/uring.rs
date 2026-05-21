@@ -351,10 +351,11 @@ pub(super) fn install_current_io_uring(owner: ExecutorId) {
             );
         }
 
-        let dispatcher = available_io_uring(EXECUTOR_IO_URING_ENTRIES)
-            .ok()
-            .flatten()
-            .map(|ring| IoUringDispatcher::new(ring).into_shared());
+        let dispatcher = match available_io_uring(EXECUTOR_IO_URING_ENTRIES) {
+            Ok(Some(ring)) => Some(IoUringDispatcher::new(ring).into_shared()),
+            Ok(None) => None,
+            Err(error) => panic!("executor io_uring setup failed: {error}"),
+        };
         *current.borrow_mut() = dispatcher.map(|dispatcher| CurrentIoUring { owner, dispatcher });
     });
 }

@@ -441,6 +441,8 @@ This integration deliberately keeps some limits visible:
 
 - it is Linux-only and reports normal unsupported behavior when `io_uring` is
   unavailable;
+- executor-owned `io_uring` setup fails fast when strict availability is
+  requested with `SITAS_REQUIRE_IO_URING=1`;
 - the dispatcher is per executor thread, not shared across shards;
 - completion dispatch and shutdown draining use fixed internal limits rather
   than caller-tunable policy;
