@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use super::IoUringExecutorStatus;
 use super::counters::SchedulerCounters;
 use super::task_set::SchedulerTaskSnapshot;
 #[cfg(target_os = "linux")]
@@ -17,6 +19,8 @@ pub(super) struct ExecutorSnapshotParts {
     pub(super) write_interest_count: usize,
     #[cfg(target_os = "linux")]
     pub(super) io_uring: Option<IoUringDispatcherSnapshot>,
+    #[cfg(target_os = "linux")]
+    pub(super) io_uring_status: IoUringExecutorStatus,
 }
 
 pub(super) fn build_executor_snapshot(parts: ExecutorSnapshotParts) -> ExecutorSnapshot {
@@ -50,6 +54,8 @@ pub(super) fn build_executor_snapshot(parts: ExecutorSnapshotParts) -> ExecutorS
         write_interest_count: parts.write_interest_count,
         #[cfg(target_os = "linux")]
         io_uring: parts.io_uring,
+        #[cfg(target_os = "linux")]
+        io_uring_status: parts.io_uring_status,
         ready_poll_budget: READY_POLL_BUDGET,
         #[cfg(target_os = "linux")]
         completion_dispatch_budget: EXECUTOR_IO_URING_COMPLETION_BUDGET,
@@ -150,6 +156,8 @@ mod tests {
             write_interest_count: 7,
             #[cfg(target_os = "linux")]
             io_uring: None,
+            #[cfg(target_os = "linux")]
+            io_uring_status: IoUringExecutorStatus::NotStarted,
         }
     }
 
@@ -190,6 +198,7 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
+            assert_eq!(snapshot.io_uring_status, IoUringExecutorStatus::NotStarted);
             assert_eq!(
                 snapshot.completion_dispatch_budget,
                 super::super::uring::EXECUTOR_IO_URING_COMPLETION_BUDGET

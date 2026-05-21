@@ -13,7 +13,7 @@ use crate::os::{
     IoUringShutdownDrainSnapshot, IoUringShutdownDrainStatus, available_io_uring,
 };
 
-use super::scheduling_group::ExecutorId;
+use super::{IoUringExecutorStatus, scheduling_group::ExecutorId};
 
 type SharedDispatcher = crate::os::SharedIoUringDispatcher;
 
@@ -359,13 +359,17 @@ pub(super) fn install_current_io_uring(owner: ExecutorId) {
     });
 }
 
-pub(super) fn shutdown_current(owner: ExecutorId) -> Option<IoUringDispatcherSnapshot> {
+pub(super) fn shutdown_current(
+    owner: ExecutorId,
+) -> (IoUringExecutorStatus, Option<IoUringDispatcherSnapshot>) {
     CURRENT_IO_URING.with(|current| {
         {
             let current_ref = current.borrow();
-            let installed = current_ref.as_ref()?;
+            let Some(installed) = current_ref.as_ref() else {
+                return (IoUringExecutorStatus::Unavailable, None);
+            };
             if installed.owner != owner {
-                return None;
+                return (IoUringExecutorStatus::Installed, None);
             }
 
             if installed.dispatcher.borrow().snapshot().registered_wakers > 0 {
@@ -375,13 +379,26 @@ pub(super) fn shutdown_current(owner: ExecutorId) -> Option<IoUringDispatcherSna
                     max_waits: EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS,
                     dispatched: 0,
                 });
-                return Some(snapshot);
+                return (IoUringExecutorStatus::Installed, Some(snapshot));
             }
         }
 
         let installed = current.borrow_mut().take().expect("dispatcher exists");
         let mut dispatcher = installed.dispatcher.borrow_mut();
-        Some(shutdown_dispatcher(&mut dispatcher))
+        (
+            IoUringExecutorStatus::Shutdown,
+            Some(shutdown_dispatcher(&mut dispatcher)),
+        )
+    })
+}
+
+pub(super) fn status() -> IoUringExecutorStatus {
+    CURRENT_IO_URING.with(|current| {
+        if current.borrow().is_some() {
+            IoUringExecutorStatus::Installed
+        } else {
+            IoUringExecutorStatus::Unavailable
+        }
     })
 }
 

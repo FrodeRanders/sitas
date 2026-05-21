@@ -10,6 +10,8 @@ use crate::os::IoUringDispatcherSnapshot;
 #[cfg(unix)]
 use crate::os::OsWaker;
 
+#[cfg(target_os = "linux")]
+use super::IoUringExecutorStatus;
 use super::counters::SchedulerCounters;
 use super::current::set_current_task_waiting_for;
 #[cfg(unix)]
@@ -37,6 +39,8 @@ struct SchedulerState {
     io_interests: ReadinessInterests,
     #[cfg(target_os = "linux")]
     io_uring: Option<IoUringDispatcherSnapshot>,
+    #[cfg(target_os = "linux")]
+    io_uring_status: IoUringExecutorStatus,
     counters: SchedulerCounters,
 }
 
@@ -51,6 +55,8 @@ impl Scheduler {
                 io_interests: ReadinessInterests::new(),
                 #[cfg(target_os = "linux")]
                 io_uring: None,
+                #[cfg(target_os = "linux")]
+                io_uring_status: IoUringExecutorStatus::NotStarted,
                 counters: SchedulerCounters::default(),
             }),
             #[cfg(unix)]
@@ -168,6 +174,8 @@ impl Scheduler {
                 write_interest_count: state.io_interests.write_len(),
                 #[cfg(target_os = "linux")]
                 io_uring: state.io_uring,
+                #[cfg(target_os = "linux")]
+                io_uring_status: state.io_uring_status,
             }
         };
 
@@ -234,8 +242,13 @@ impl Scheduler {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn record_io_uring_snapshot(&self, snapshot: Option<IoUringDispatcherSnapshot>) {
+    pub(super) fn record_io_uring_snapshot(
+        &self,
+        status: IoUringExecutorStatus,
+        snapshot: Option<IoUringDispatcherSnapshot>,
+    ) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state.io_uring_status = status;
         state.io_uring = snapshot;
     }
 

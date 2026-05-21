@@ -433,6 +433,10 @@ fn io_uring_read_and_write_are_driven_by_executor_loop() -> io::Result<()> {
     let executor_snapshot = executor.snapshot();
 
     assert_eq!(bytes, b"cde");
+    assert_eq!(
+        executor_snapshot.io_uring_status,
+        super::IoUringExecutorStatus::Shutdown
+    );
     let snapshot = snapshot.expect("io_uring dispatcher is installed");
     assert_eq!(snapshot.total_dispatched_operation_kinds.reads, 1);
     assert_eq!(snapshot.total_dispatched_operation_kinds.writes, 1);
@@ -513,6 +517,10 @@ fn io_uring_completion_is_not_delayed_by_unexpired_timer() -> io::Result<()> {
     assert_eq!(bytes, b"cde");
     assert!(started.elapsed() < Duration::from_millis(150));
     let snapshot = executor.snapshot();
+    assert_eq!(
+        snapshot.io_uring_status,
+        super::IoUringExecutorStatus::Shutdown
+    );
     assert!(snapshot.total_driver_events > 0);
     assert!(snapshot.total_completion_events > 0);
     assert!(snapshot.total_completion_dispatch_batches > 0);
@@ -542,6 +550,10 @@ fn io_uring_shutdown_drains_abandoned_owned_buffer() -> io::Result<()> {
         .snapshot()
         .io_uring
         .expect("io_uring dispatcher snapshot is recorded at shutdown");
+    assert_eq!(
+        executor.snapshot().io_uring_status,
+        super::IoUringExecutorStatus::Shutdown
+    );
     assert_eq!(snapshot.registered_wakers, 0);
     assert_eq!(snapshot.completed_operations, 0);
     assert_eq!(snapshot.abandoned_operations, 0);
@@ -582,6 +594,10 @@ fn io_uring_shutdown_reports_live_wakers_without_blocking() -> io::Result<()> {
         .snapshot()
         .io_uring
         .expect("io_uring dispatcher snapshot is recorded at shutdown");
+    assert_eq!(
+        executor.snapshot().io_uring_status,
+        super::IoUringExecutorStatus::Installed
+    );
     let drain = snapshot
         .shutdown_drain
         .expect("shutdown drain outcome is recorded");
@@ -618,6 +634,10 @@ fn io_uring_spawned_task_can_complete_after_run_until_returns() -> io::Result<()
         .io_uring
         .expect("io_uring dispatcher snapshot is recorded at root completion");
     assert_eq!(
+        executor.snapshot().io_uring_status,
+        super::IoUringExecutorStatus::Installed
+    );
+    assert_eq!(
         suspended
             .shutdown_drain
             .expect("shutdown drain outcome is recorded")
@@ -637,6 +657,10 @@ fn io_uring_spawned_task_can_complete_after_run_until_returns() -> io::Result<()
         .snapshot()
         .io_uring
         .expect("io_uring dispatcher snapshot is recorded after completion");
+    assert_eq!(
+        executor.snapshot().io_uring_status,
+        super::IoUringExecutorStatus::Shutdown
+    );
     assert_eq!(completed.registered_wakers, 0);
     assert!(completed.total_dispatched_operations > suspended.total_dispatched_operations);
     drop(spawner);
@@ -822,6 +846,12 @@ fn repeated_wakes_share_one_ready_queue_entry() {
 #[test]
 fn executor_snapshot_reports_cumulative_scheduler_counters() {
     let (executor, spawner) = executor_and_spawner();
+
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        executor.snapshot().io_uring_status,
+        super::IoUringExecutorStatus::NotStarted
+    );
 
     for _ in 0..3 {
         spawner

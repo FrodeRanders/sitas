@@ -344,6 +344,8 @@ Executor snapshots expose:
 - task count;
 - timer count;
 - I/O interest counts;
+- Linux executor-owned `io_uring` lifecycle status, distinguishing not-started,
+  unavailable, installed, and shutdown states;
 - ready-task and Linux completion-dispatch budgets;
 - Linux completion-dispatch batch, completion count, and budget exhaustion
   counters;

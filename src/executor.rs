@@ -62,6 +62,8 @@ pub use tcp::{
     serve_tcp_until_stopped_scoped_timeout_in_group, serve_tcp_until_stopped_timeout,
     serve_tcp_until_stopped_timeout_in_group,
 };
+#[cfg(target_os = "linux")]
+pub use types::IoUringExecutorStatus;
 pub use types::{
     DEFAULT_SCHEDULING_GROUP_ID, DEFAULT_SCHEDULING_GROUP_SHARES, ExecutorSnapshot,
     SchedulingGroupId, SchedulingGroupSnapshot, TaskId, TaskSnapshot, TaskStatus, TaskWait,
@@ -206,13 +208,16 @@ impl Executor {
 
     fn refresh_io_uring_snapshot(&self) {
         #[cfg(target_os = "linux")]
-        self.scheduler.record_io_uring_snapshot(uring::snapshot());
+        self.scheduler
+            .record_io_uring_snapshot(uring::status(), uring::snapshot());
     }
 
     fn shutdown_io_uring(&self) {
         #[cfg(target_os = "linux")]
-        self.scheduler
-            .record_io_uring_snapshot(uring::shutdown_current(self.scheduler.id()));
+        {
+            let (status, snapshot) = uring::shutdown_current(self.scheduler.id());
+            self.scheduler.record_io_uring_snapshot(status, snapshot);
+        }
     }
 }
 

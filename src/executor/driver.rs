@@ -168,5 +168,5 @@ fn dispatch_io_uring_if_ready(scheduler: &Scheduler, event: &mut DriverEvent, fd
 
 #[cfg(target_os = "linux")]
 fn refresh_io_uring_snapshot(scheduler: &Scheduler) {
-    scheduler.record_io_uring_snapshot(uring::snapshot());
+    scheduler.record_io_uring_snapshot(uring::status(), uring::snapshot());
 }

@@ -202,6 +202,9 @@ pub struct ExecutorSnapshot {
     /// Snapshot of the executor-owned Linux `io_uring` dispatcher, if installed.
     #[cfg(target_os = "linux")]
     pub io_uring: Option<IoUringDispatcherSnapshot>,
+    /// Lifecycle status for the executor-owned Linux `io_uring` dispatcher.
+    #[cfg(target_os = "linux")]
+    pub io_uring_status: IoUringExecutorStatus,
     /// Maximum number of ready tasks polled before timers and readiness are checked.
     pub ready_poll_budget: usize,
     /// Maximum number of Linux `io_uring` completions dispatched in one
@@ -242,6 +245,21 @@ pub struct ExecutorSnapshot {
     pub completion_dispatch_budget_exhaustions: u64,
     /// Owned snapshots for tasks that are still externally observable.
     pub tasks: Vec<TaskSnapshot>,
+}
+
+/// Lifecycle status for the executor-owned Linux `io_uring` dispatcher.
+#[cfg(target_os = "linux")]
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoUringExecutorStatus {
+    /// The executor has not entered a run loop that installs the dispatcher.
+    NotStarted,
+    /// The Linux host or container did not allow creating an `io_uring`.
+    Unavailable,
+    /// A dispatcher is installed and may still have live executor-owned state.
+    Installed,
+    /// The dispatcher was torn down after reaching a terminal snapshot.
+    Shutdown,
 }
 
 impl ExecutorSnapshot {
@@ -405,6 +423,8 @@ mod tests {
             write_interest_count: 0,
             #[cfg(target_os = "linux")]
             io_uring: None,
+            #[cfg(target_os = "linux")]
+            io_uring_status: IoUringExecutorStatus::NotStarted,
             ready_poll_budget: 64,
             #[cfg(target_os = "linux")]
             completion_dispatch_budget: 64,
