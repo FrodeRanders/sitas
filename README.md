@@ -472,3 +472,6 @@ Pass a custom command after the script name to run a narrower Linux check:
 tools/linux-docker.sh cargo test os::tests
 SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test os::uring::tests -- --nocapture
 ```
+
+Custom `cargo fmt` and `cargo clippy` commands automatically install the
+matching rustup component inside the transient container before running.

@@ -64,8 +64,32 @@ if [ "$#" -eq 0 ]; then
         cargo run --example os_uring_abandon
         cargo run --example os_uring_lifecycle
         cargo run --example scheduling_group_demo
-	    cargo run --example sharded_scheduling_groups
+        cargo run --example sharded_scheduling_groups
     '
+else
+    INSTALL_RUSTFMT=0
+    INSTALL_CLIPPY=0
+    if [ "$1" = "cargo" ] && [ "$#" -ge 2 ]; then
+        case "$2" in
+            fmt)
+                INSTALL_RUSTFMT=1
+                ;;
+            clippy)
+                INSTALL_CLIPPY=1
+                ;;
+        esac
+    fi
+    set -- sh -lc '
+        set -eu
+        export PATH="/usr/local/cargo/bin:$PATH"
+        if [ "${SITAS_INSTALL_RUSTFMT:-0}" = "1" ]; then
+            rustup component add rustfmt
+        fi
+        if [ "${SITAS_INSTALL_CLIPPY:-0}" = "1" ]; then
+            rustup component add clippy
+        fi
+        exec "$@"
+    ' sh "$@"
 fi
 
 if [ "$DOCKER_PRIVILEGED" = "1" ]; then
@@ -75,6 +99,8 @@ if [ "$DOCKER_PRIVILEGED" = "1" ]; then
         -w /work \
         -e "CARGO_TARGET_DIR=$TARGET_DIR" \
         -e "SITAS_REQUIRE_IO_URING=$REQUIRE_IO_URING" \
+        -e "SITAS_INSTALL_RUSTFMT=${INSTALL_RUSTFMT:-0}" \
+        -e "SITAS_INSTALL_CLIPPY=${INSTALL_CLIPPY:-0}" \
         "$IMAGE" \
         "$@"
 fi
@@ -86,6 +112,8 @@ if [ "$DOCKER_IO_URING" = "1" ]; then
         -w /work \
         -e "CARGO_TARGET_DIR=$TARGET_DIR" \
         -e "SITAS_REQUIRE_IO_URING=$REQUIRE_IO_URING" \
+        -e "SITAS_INSTALL_RUSTFMT=${INSTALL_RUSTFMT:-0}" \
+        -e "SITAS_INSTALL_CLIPPY=${INSTALL_CLIPPY:-0}" \
         "$IMAGE" \
         "$@"
 fi
@@ -95,5 +123,7 @@ exec docker run --rm \
     -w /work \
     -e "CARGO_TARGET_DIR=$TARGET_DIR" \
     -e "SITAS_REQUIRE_IO_URING=$REQUIRE_IO_URING" \
+    -e "SITAS_INSTALL_RUSTFMT=${INSTALL_RUSTFMT:-0}" \
+    -e "SITAS_INSTALL_CLIPPY=${INSTALL_CLIPPY:-0}" \
     "$IMAGE" \
     "$@"
