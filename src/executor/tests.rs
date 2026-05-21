@@ -538,6 +538,50 @@ fn io_uring_shutdown_drains_abandoned_owned_buffer() -> io::Result<()> {
     assert_eq!(snapshot.deferred_buffers, 0);
     assert!(snapshot.is_idle());
     assert!(snapshot.total_discarded_operations > 0);
+    let drain = snapshot
+        .shutdown_drain
+        .expect("shutdown drain outcome is recorded");
+    assert_eq!(
+        drain.status,
+        crate::os::IoUringShutdownDrainStatus::Completed
+    );
+    assert!(drain.dispatched > 0);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn io_uring_shutdown_reports_live_wakers_without_blocking() -> io::Result<()> {
+    if crate::os::available_io_uring(8)?.is_none() {
+        return Ok(());
+    }
+
+    let (read_stream, _write_stream) = UnixStream::pair()?;
+    let (executor, spawner) = executor_and_spawner();
+    spawner
+        .spawn(async move {
+            let _ = read_at_uring(read_stream.as_raw_fd(), u64::MAX, vec![0; 5]).await;
+        })
+        .unwrap();
+
+    executor.run_until(async {
+        yield_now().await;
+    });
+
+    let snapshot = executor
+        .snapshot()
+        .io_uring
+        .expect("io_uring dispatcher snapshot is recorded at shutdown");
+    let drain = snapshot
+        .shutdown_drain
+        .expect("shutdown drain outcome is recorded");
+    assert_eq!(
+        drain.status,
+        crate::os::IoUringShutdownDrainStatus::SkippedLiveWakers
+    );
+    assert_eq!(drain.dispatched, 0);
+    assert!(snapshot.registered_wakers > 0);
+    drop(spawner);
     Ok(())
 }
 

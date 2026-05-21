@@ -343,7 +343,8 @@ Executor snapshots expose:
 - I/O interest counts;
 - Linux `io_uring` dispatcher snapshots when installed, including pending
   submissions, tracked operations, buffered completions, registered wakers,
-  abandoned buffers, and cumulative operation-kind counters;
+  abandoned buffers, cumulative operation-kind counters, and final executor
+  shutdown drain outcome when teardown has recorded one;
 - shard thread names;
 - CPU placement status;
 - named task states.
@@ -513,6 +514,8 @@ Dispatcher snapshot fields represent async-facing live and historical state:
 - completed operations buffered for futures;
 - abandoned operations;
 - deferred buffers;
+- optional executor shutdown drain outcome, including status, wait budget, and
+  completions dispatched during the drain;
 - total dispatched operations;
 - total buffered operations;
 - total woken operations;

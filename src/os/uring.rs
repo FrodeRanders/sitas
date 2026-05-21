@@ -1143,6 +1143,7 @@ impl IoUringDispatcher {
             total_buffered_operation_kinds: self.total_buffered_operation_kinds,
             total_woken_operation_kinds: self.total_woken_operation_kinds,
             total_discarded_operation_kinds: self.total_discarded_operation_kinds,
+            shutdown_drain: None,
         }
     }
 }
@@ -1539,6 +1540,9 @@ pub struct IoUringDispatcherSnapshot {
     pub total_woken_operation_kinds: IoUringOperationKindCounts,
     /// Total discarded abandoned completions grouped by operation kind.
     pub total_discarded_operation_kinds: IoUringOperationKindCounts,
+    /// Executor-owned shutdown drain outcome, if this snapshot was recorded
+    /// during dispatcher teardown.
+    pub shutdown_drain: Option<IoUringShutdownDrainSnapshot>,
 }
 
 impl IoUringDispatcherSnapshot {
@@ -1551,6 +1555,32 @@ impl IoUringDispatcherSnapshot {
             && self.abandoned_operations == 0
             && self.deferred_buffers == 0
     }
+}
+
+/// Observable outcome for a bounded executor-owned `io_uring` shutdown drain.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoUringShutdownDrainSnapshot {
+    /// Final status of the bounded drain attempt.
+    pub status: IoUringShutdownDrainStatus,
+    /// Maximum number of blocking completion waits allowed by the drain.
+    pub max_waits: usize,
+    /// Number of tracked completions dispatched while draining.
+    pub dispatched: usize,
+}
+
+/// Final status of a bounded executor-owned `io_uring` shutdown drain.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoUringShutdownDrainStatus {
+    /// The dispatcher reached an idle state within the configured wait budget.
+    Completed,
+    /// The dispatcher still had live registered task wakers, so shutdown did
+    /// not block on work that still belonged to live executor tasks.
+    SkippedLiveWakers,
+    /// The dispatcher still had kernel, buffered completion, or abandonment
+    /// state after the wait budget was exhausted.
+    TimedOut,
 }
 
 /// One `io_uring` completion queue entry.

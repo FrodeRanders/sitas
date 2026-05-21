@@ -30,7 +30,8 @@ mod uring;
 pub use uring::{
     IoUring, IoUringCompletion, IoUringDispatcher, IoUringDispatcherSnapshot,
     IoUringOperationCompletion, IoUringOperationFuture, IoUringOperationId, IoUringOperationKind,
-    IoUringOperationKindCounts, IoUringReadCompletion, IoUringReadFuture, IoUringSnapshot,
+    IoUringOperationKindCounts, IoUringReadCompletion, IoUringReadFuture,
+    IoUringShutdownDrainSnapshot, IoUringShutdownDrainStatus, IoUringSnapshot,
     IoUringWriteCompletion, IoUringWriteFuture, SharedIoUringDispatcher, block_on_io_uring,
     block_on_io_uring_all,
 };

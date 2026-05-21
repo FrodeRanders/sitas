@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use crate::os::{
     IoUringDispatcher, IoUringDispatcherSnapshot, IoUringOperationCompletion, IoUringOperationId,
-    available_io_uring,
+    IoUringShutdownDrainSnapshot, IoUringShutdownDrainStatus, available_io_uring,
 };
 
 type SharedDispatcher = crate::os::SharedIoUringDispatcher;
@@ -348,11 +348,60 @@ pub(super) fn shutdown_current() -> Option<IoUringDispatcherSnapshot> {
     CURRENT_IO_URING.with(|current| {
         let dispatcher = current.borrow_mut().take()?;
         let mut dispatcher = dispatcher.borrow_mut();
-        if dispatcher.snapshot().registered_wakers == 0 {
-            let _ = dispatcher.drain_until_idle(EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS);
-        }
-        Some(dispatcher.snapshot())
+        Some(shutdown_dispatcher(&mut dispatcher))
     })
+}
+
+fn shutdown_dispatcher(dispatcher: &mut IoUringDispatcher) -> IoUringDispatcherSnapshot {
+    let mut dispatched = 0;
+    let status = if dispatcher.snapshot().registered_wakers > 0 {
+        IoUringShutdownDrainStatus::SkippedLiveWakers
+    } else {
+        dispatched += dispatcher.dispatch_available();
+        if dispatcher.is_idle() {
+            IoUringShutdownDrainStatus::Completed
+        } else {
+            drain_shutdown_dispatcher(dispatcher, &mut dispatched)
+        }
+    };
+
+    let mut snapshot = dispatcher.snapshot();
+    snapshot.shutdown_drain = Some(IoUringShutdownDrainSnapshot {
+        status,
+        max_waits: EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS,
+        dispatched,
+    });
+    snapshot
+}
+
+fn drain_shutdown_dispatcher(
+    dispatcher: &mut IoUringDispatcher,
+    dispatched: &mut usize,
+) -> IoUringShutdownDrainStatus {
+    for _ in 0..EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS {
+        let snapshot = dispatcher.snapshot();
+        if snapshot.ring.pending_submissions == 0
+            && snapshot.ring.pending_completions == 0
+            && snapshot.ring.tracked_operations == 0
+        {
+            break;
+        }
+
+        match dispatcher.wait_and_dispatch(1) {
+            Ok(count) => *dispatched += count,
+            Err(_) => return IoUringShutdownDrainStatus::TimedOut,
+        }
+
+        if dispatcher.is_idle() {
+            return IoUringShutdownDrainStatus::Completed;
+        }
+    }
+
+    if dispatcher.is_idle() {
+        IoUringShutdownDrainStatus::Completed
+    } else {
+        IoUringShutdownDrainStatus::TimedOut
+    }
 }
 
 pub(super) fn dispatch_available() -> usize {
@@ -403,4 +452,30 @@ pub(super) fn snapshot() -> Option<IoUringDispatcherSnapshot> {
 
 fn current_dispatcher() -> Option<SharedDispatcher> {
     CURRENT_IO_URING.with(|current| current.borrow().as_ref().cloned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_dispatcher_reports_timed_out_when_buffered_completion_remains() {
+        let Some(ring) = available_io_uring(8).unwrap() else {
+            return;
+        };
+        let mut dispatcher = IoUringDispatcher::new(ring);
+        let _operation = dispatcher.ring_mut().queue_nop_operation().unwrap();
+
+        assert_eq!(dispatcher.wait_and_dispatch(1).unwrap(), 1);
+        assert_eq!(dispatcher.snapshot().completed_operations, 1);
+
+        let snapshot = shutdown_dispatcher(&mut dispatcher);
+        let drain = snapshot
+            .shutdown_drain
+            .expect("shutdown drain outcome is recorded");
+
+        assert_eq!(drain.status, IoUringShutdownDrainStatus::TimedOut);
+        assert_eq!(drain.dispatched, 0);
+        assert_eq!(snapshot.completed_operations, 1);
+    }
 }
