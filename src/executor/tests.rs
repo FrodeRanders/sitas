@@ -439,6 +439,13 @@ fn io_uring_read_and_write_are_driven_by_executor_loop() -> io::Result<()> {
     assert_eq!(snapshot.total_dispatched_operations, 2);
     assert!(snapshot.is_idle());
     assert!(executor_snapshot.total_completion_events >= 2);
+    assert_eq!(
+        executor_snapshot.completion_dispatch_budget,
+        super::uring::EXECUTOR_IO_URING_COMPLETION_BUDGET
+    );
+    assert!(executor_snapshot.total_completion_dispatch_batches >= 2);
+    assert_eq!(executor_snapshot.total_dispatched_completions, 2);
+    assert_eq!(executor_snapshot.completion_dispatch_budget_exhaustions, 0);
     drop(file);
     fs::remove_file(path)?;
     Ok(())
@@ -508,6 +515,9 @@ fn io_uring_completion_is_not_delayed_by_unexpired_timer() -> io::Result<()> {
     let snapshot = executor.snapshot();
     assert!(snapshot.total_driver_events > 0);
     assert!(snapshot.total_completion_events > 0);
+    assert!(snapshot.total_completion_dispatch_batches > 0);
+    assert_eq!(snapshot.total_dispatched_completions, 2);
+    assert_eq!(snapshot.completion_dispatch_budget_exhaustions, 0);
     drop(file);
     fs::remove_file(path)?;
     Ok(())
@@ -778,6 +788,11 @@ fn executor_snapshot_reports_cumulative_scheduler_counters() {
 
     let snapshot = executor.snapshot();
     assert_eq!(snapshot.ready_poll_budget, super::READY_POLL_BUDGET);
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        snapshot.completion_dispatch_budget,
+        super::uring::EXECUTOR_IO_URING_COMPLETION_BUDGET
+    );
     assert_eq!(snapshot.total_spawned_tasks, 3);
     assert_eq!(snapshot.total_completed_tasks, 3);
     assert_eq!(snapshot.total_task_polls, 6);
@@ -790,7 +805,12 @@ fn executor_snapshot_reports_cumulative_scheduler_counters() {
         assert_eq!(snapshot.total_writable_events, 0);
     }
     #[cfg(target_os = "linux")]
-    assert_eq!(snapshot.total_completion_events, 0);
+    {
+        assert_eq!(snapshot.total_completion_events, 0);
+        assert_eq!(snapshot.total_completion_dispatch_batches, 0);
+        assert_eq!(snapshot.total_dispatched_completions, 0);
+        assert_eq!(snapshot.completion_dispatch_budget_exhaustions, 0);
+    }
 }
 
 #[test]

@@ -1,5 +1,7 @@
 use super::counters::SchedulerCounters;
 use super::task_set::SchedulerTaskSnapshot;
+#[cfg(target_os = "linux")]
+use super::uring::EXECUTOR_IO_URING_COMPLETION_BUDGET;
 use super::{ExecutorSnapshot, READY_POLL_BUDGET};
 
 #[cfg(target_os = "linux")]
@@ -49,6 +51,8 @@ pub(super) fn build_executor_snapshot(parts: ExecutorSnapshotParts) -> ExecutorS
         #[cfg(target_os = "linux")]
         io_uring: parts.io_uring,
         ready_poll_budget: READY_POLL_BUDGET,
+        #[cfg(target_os = "linux")]
+        completion_dispatch_budget: EXECUTOR_IO_URING_COMPLETION_BUDGET,
         total_spawned_tasks: parts.counters.total_spawned_tasks,
         total_completed_tasks: parts.counters.total_completed_tasks,
         total_task_polls: parts.counters.total_task_polls,
@@ -62,6 +66,14 @@ pub(super) fn build_executor_snapshot(parts: ExecutorSnapshotParts) -> ExecutorS
         total_writable_events: parts.counters.total_writable_events,
         #[cfg(target_os = "linux")]
         total_completion_events: parts.counters.total_completion_events,
+        #[cfg(target_os = "linux")]
+        total_completion_dispatch_batches: parts.counters.total_completion_dispatch_batches,
+        #[cfg(target_os = "linux")]
+        total_dispatched_completions: parts.counters.total_dispatched_completions,
+        #[cfg(target_os = "linux")]
+        completion_dispatch_budget_exhaustions: parts
+            .counters
+            .completion_dispatch_budget_exhaustions,
         tasks,
     }
 }
@@ -107,6 +119,12 @@ mod tests {
             total_writable_events: 2,
             #[cfg(target_os = "linux")]
             total_completion_events: 2,
+            #[cfg(target_os = "linux")]
+            total_completion_dispatch_batches: 3,
+            #[cfg(target_os = "linux")]
+            total_dispatched_completions: 5,
+            #[cfg(target_os = "linux")]
+            completion_dispatch_budget_exhaustions: 1,
         };
 
         let default_group = SchedulingGroupSnapshot {
@@ -172,7 +190,14 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
+            assert_eq!(
+                snapshot.completion_dispatch_budget,
+                super::super::uring::EXECUTOR_IO_URING_COMPLETION_BUDGET
+            );
             assert_eq!(snapshot.total_completion_events, 2);
+            assert_eq!(snapshot.total_completion_dispatch_batches, 3);
+            assert_eq!(snapshot.total_dispatched_completions, 5);
+            assert_eq!(snapshot.completion_dispatch_budget_exhaustions, 1);
             assert!(snapshot.io_uring.is_none());
         }
     }

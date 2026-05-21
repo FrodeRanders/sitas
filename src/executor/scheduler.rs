@@ -222,6 +222,18 @@ impl Scheduler {
     }
 
     #[cfg(target_os = "linux")]
+    pub(super) fn record_completion_dispatch_batch(
+        &self,
+        dispatched: usize,
+        exhausted_budget: bool,
+    ) {
+        let mut state = self.state.lock().expect("scheduler state mutex poisoned");
+        state
+            .counters
+            .record_completion_dispatch_batch(dispatched, exhausted_budget);
+    }
+
+    #[cfg(target_os = "linux")]
     pub(super) fn record_io_uring_snapshot(&self, snapshot: Option<IoUringDispatcherSnapshot>) {
         let mut state = self.state.lock().expect("scheduler state mutex poisoned");
         state.io_uring = snapshot;

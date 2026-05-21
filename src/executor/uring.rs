@@ -16,7 +16,7 @@ use crate::os::{
 type SharedDispatcher = crate::os::SharedIoUringDispatcher;
 
 const EXECUTOR_IO_URING_ENTRIES: u32 = 256;
-const EXECUTOR_IO_URING_COMPLETION_BUDGET: usize = 64;
+pub(super) const EXECUTOR_IO_URING_COMPLETION_BUDGET: usize = 64;
 const EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS: usize = 8;
 
 thread_local! {
@@ -412,6 +412,10 @@ pub(super) fn dispatch_available() -> usize {
                 .dispatch_available_limit(EXECUTOR_IO_URING_COMPLETION_BUDGET)
         })
     })
+}
+
+pub(super) fn completion_budget() -> usize {
+    EXECUTOR_IO_URING_COMPLETION_BUDGET
 }
 
 pub(super) fn should_wait() -> bool {

@@ -40,7 +40,11 @@ impl From<OsEvent> for DriverEvent {
 
 #[cfg(target_os = "linux")]
 pub(super) fn dispatch_available(scheduler: &Scheduler) {
-    uring::dispatch_available();
+    let dispatched = uring::dispatch_available();
+    if dispatched > 0 {
+        scheduler
+            .record_completion_dispatch_batch(dispatched, dispatched == uring::completion_budget());
+    }
     refresh_io_uring_snapshot(scheduler);
 }
 
@@ -150,7 +154,13 @@ fn dispatch_io_uring_if_ready(scheduler: &Scheduler, event: &mut DriverEvent, fd
         .position(|ready_fd| *ready_fd == fd)
     {
         readiness.readable.remove(index);
-        uring::dispatch_available();
+        let dispatched = uring::dispatch_available();
+        if dispatched > 0 {
+            scheduler.record_completion_dispatch_batch(
+                dispatched,
+                dispatched == uring::completion_budget(),
+            );
+        }
         refresh_io_uring_snapshot(scheduler);
         event.completion = true;
     }

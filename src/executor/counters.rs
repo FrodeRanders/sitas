@@ -13,6 +13,12 @@ pub(super) struct SchedulerCounters {
     pub(super) total_writable_events: u64,
     #[cfg(target_os = "linux")]
     pub(super) total_completion_events: u64,
+    #[cfg(target_os = "linux")]
+    pub(super) total_completion_dispatch_batches: u64,
+    #[cfg(target_os = "linux")]
+    pub(super) total_dispatched_completions: u64,
+    #[cfg(target_os = "linux")]
+    pub(super) completion_dispatch_budget_exhaustions: u64,
 }
 
 impl SchedulerCounters {
@@ -28,6 +34,19 @@ impl SchedulerCounters {
         self.total_task_polls += polled as u64;
         if exhausted_budget {
             self.ready_poll_budget_exhaustions += 1;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn record_completion_dispatch_batch(
+        &mut self,
+        dispatched: usize,
+        exhausted_budget: bool,
+    ) {
+        self.total_completion_dispatch_batches += 1;
+        self.total_dispatched_completions += dispatched as u64;
+        if exhausted_budget {
+            self.completion_dispatch_budget_exhaustions += 1;
         }
     }
 
@@ -122,5 +141,18 @@ mod tests {
         assert_eq!(counters.total_readable_events, 1);
         assert_eq!(counters.total_writable_events, 0);
         assert_eq!(counters.total_completion_events, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completion_dispatch_batches_count_completions_and_budget_exhaustions() {
+        let mut counters = SchedulerCounters::default();
+
+        counters.record_completion_dispatch_batch(3, false);
+        counters.record_completion_dispatch_batch(5, true);
+
+        assert_eq!(counters.total_completion_dispatch_batches, 2);
+        assert_eq!(counters.total_dispatched_completions, 8);
+        assert_eq!(counters.completion_dispatch_budget_exhaustions, 1);
     }
 }

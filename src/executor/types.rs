@@ -204,6 +204,10 @@ pub struct ExecutorSnapshot {
     pub io_uring: Option<IoUringDispatcherSnapshot>,
     /// Maximum number of ready tasks polled before timers and readiness are checked.
     pub ready_poll_budget: usize,
+    /// Maximum number of Linux `io_uring` completions dispatched in one
+    /// executor batch.
+    #[cfg(target_os = "linux")]
+    pub completion_dispatch_budget: usize,
     /// Number of tasks accepted by this executor since startup.
     pub total_spawned_tasks: u64,
     /// Number of tasks that have completed, panicked, or been canceled since startup.
@@ -226,6 +230,16 @@ pub struct ExecutorSnapshot {
     /// Number of Linux completion driver events observed by the executor.
     #[cfg(target_os = "linux")]
     pub total_completion_events: u64,
+    /// Number of non-empty Linux completion dispatch batches run by the executor.
+    #[cfg(target_os = "linux")]
+    pub total_completion_dispatch_batches: u64,
+    /// Number of Linux completions dispatched by executor completion batches.
+    #[cfg(target_os = "linux")]
+    pub total_dispatched_completions: u64,
+    /// Number of Linux completion dispatch batches that consumed the full
+    /// completion dispatch budget.
+    #[cfg(target_os = "linux")]
+    pub completion_dispatch_budget_exhaustions: u64,
     /// Owned snapshots for tasks that are still externally observable.
     pub tasks: Vec<TaskSnapshot>,
 }
@@ -392,6 +406,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             io_uring: None,
             ready_poll_budget: 64,
+            #[cfg(target_os = "linux")]
+            completion_dispatch_budget: 64,
             total_spawned_tasks: 0,
             total_completed_tasks: 0,
             total_task_polls: 0,
@@ -405,6 +421,12 @@ mod tests {
             total_writable_events: 0,
             #[cfg(target_os = "linux")]
             total_completion_events: 0,
+            #[cfg(target_os = "linux")]
+            total_completion_dispatch_batches: 0,
+            #[cfg(target_os = "linux")]
+            total_dispatched_completions: 0,
+            #[cfg(target_os = "linux")]
+            completion_dispatch_budget_exhaustions: 0,
             tasks: Vec::new(),
         };
 

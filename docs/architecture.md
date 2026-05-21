@@ -138,6 +138,9 @@ Responsibilities:
 - driver-event counters split readiness wakeups from Linux completion wakeups
   in owned executor snapshots, and further split readiness events by whether
   they carried readable or writable fd progress;
+- Linux completion-dispatch counters report non-empty dispatch batches,
+  dispatched completion count, completion budget, and completion budget
+  exhaustion events;
 - cumulative executor counters for spawned tasks, completed tasks, task polls,
   and ready-poll budget exhaustion events.
 
@@ -341,6 +344,9 @@ Executor snapshots expose:
 - task count;
 - timer count;
 - I/O interest counts;
+- ready-task and Linux completion-dispatch budgets;
+- Linux completion-dispatch batch, completion count, and budget exhaustion
+  counters;
 - Linux `io_uring` dispatcher snapshots when installed, including pending
   submissions, tracked operations, buffered completions, registered wakers,
   abandoned buffers, cumulative operation-kind counters, and final executor

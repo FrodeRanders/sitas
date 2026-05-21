@@ -157,10 +157,12 @@ before the kernel answered.
 Timers, readiness waits, and \texttt{io\_uring} completions now share one
 executor idle wait shape on Linux. This is still a staged integration rather
 than a production event loop. Completion dispatch has a fixed internal
-per-tick budget, and executor teardown makes a bounded attempt to drain
-abandoned completion work before discarding the thread-local dispatcher when no
-live task wakers remain registered. The final dispatcher snapshot records
-whether that drain completed, timed out, or was skipped because live wakers
-remained. The runtime still does not expose a portable completion source,
-tunable completion policy, or a deeper shutdown policy for mixed readiness and
-completion workloads.
+per-tick budget that is exposed in executor snapshots. Those snapshots also
+count non-empty completion dispatch batches, dispatched completions, and
+completion budget exhaustion events. Executor teardown makes a bounded attempt
+to drain abandoned completion work before discarding the thread-local
+dispatcher when no live task wakers remain registered. The final dispatcher
+snapshot records whether that drain completed, timed out, or was skipped
+because live wakers remained. The runtime still does not expose a portable
+completion source, tunable completion policy, or a deeper shutdown policy for
+mixed readiness and completion workloads.
