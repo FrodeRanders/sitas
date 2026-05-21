@@ -83,7 +83,7 @@
 \newenvironment{notabene}[1][Note]{
     \begin{quote}
     \small
-    \noindent\textbf{#1.}\quad
+    \noindent\textbf{#1}\quad
 }
 {
     \end{quote}
