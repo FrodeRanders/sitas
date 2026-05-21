@@ -163,6 +163,9 @@ completion budget exhaustion events. Executor teardown makes a bounded attempt
 to drain abandoned completion work before discarding the thread-local
 dispatcher when no live task wakers remain registered. The final dispatcher
 snapshot records whether that drain completed, timed out, or was skipped
-because live wakers remained. The runtime still does not expose a portable
+because live wakers remained. When a root \texttt{run\_until} future completes
+with spawned \texttt{io\_uring} work still pending, the dispatcher remains
+installed for that executor on the current thread so later executor calls can
+continue the same operations. The runtime still does not expose a portable
 completion source, tunable completion policy, or a deeper shutdown policy for
 mixed readiness and completion workloads.

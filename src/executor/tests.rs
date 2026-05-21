@@ -595,6 +595,54 @@ fn io_uring_shutdown_reports_live_wakers_without_blocking() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn io_uring_spawned_task_can_complete_after_run_until_returns() -> io::Result<()> {
+    if crate::os::available_io_uring(8)?.is_none() {
+        return Ok(());
+    }
+
+    let (read_stream, mut write_stream) = UnixStream::pair()?;
+    let (executor, spawner) = executor_and_spawner();
+    let handle = spawner
+        .spawn_with_handle(async move {
+            read_at_uring(read_stream.as_raw_fd(), u64::MAX, vec![0; 5]).await
+        })
+        .unwrap();
+
+    executor.run_until(async {
+        yield_now().await;
+    });
+    let suspended = executor
+        .snapshot()
+        .io_uring
+        .expect("io_uring dispatcher snapshot is recorded at root completion");
+    assert_eq!(
+        suspended
+            .shutdown_drain
+            .expect("shutdown drain outcome is recorded")
+            .status,
+        crate::os::IoUringShutdownDrainStatus::SkippedLiveWakers
+    );
+    assert!(suspended.registered_wakers > 0);
+
+    write_stream.write_all(b"hello")?;
+    let join_result = executor
+        .run_until(timeout(Duration::from_millis(250), handle))
+        .expect("spawned io_uring task should complete after root returns");
+    let bytes = join_result.unwrap()?;
+
+    assert_eq!(bytes, b"hello");
+    let completed = executor
+        .snapshot()
+        .io_uring
+        .expect("io_uring dispatcher snapshot is recorded after completion");
+    assert_eq!(completed.registered_wakers, 0);
+    assert!(completed.total_dispatched_operations > suspended.total_dispatched_operations);
+    drop(spawner);
+    Ok(())
+}
+
 #[test]
 fn timeout_returns_future_output_before_deadline() {
     let output = block_on(async { timeout(Duration::from_secs(1), async { 7 }).await });

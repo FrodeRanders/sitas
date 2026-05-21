@@ -13,6 +13,8 @@ use crate::os::{
     IoUringShutdownDrainSnapshot, IoUringShutdownDrainStatus, available_io_uring,
 };
 
+use super::scheduling_group::ExecutorId;
+
 type SharedDispatcher = crate::os::SharedIoUringDispatcher;
 
 const EXECUTOR_IO_URING_ENTRIES: u32 = 256;
@@ -20,21 +22,26 @@ pub(super) const EXECUTOR_IO_URING_COMPLETION_BUDGET: usize = 64;
 const EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS: usize = 8;
 
 thread_local! {
-    static CURRENT_IO_URING: RefCell<Option<SharedDispatcher>> = const { RefCell::new(None) };
+    static CURRENT_IO_URING: RefCell<Option<CurrentIoUring>> = const { RefCell::new(None) };
+}
+
+struct CurrentIoUring {
+    owner: ExecutorId,
+    dispatcher: SharedDispatcher,
 }
 
 pub(super) struct ExecutorIoUringScope;
 
 impl ExecutorIoUringScope {
-    pub(super) fn enter() -> Self {
-        install_current_io_uring();
+    pub(super) fn enter(owner: ExecutorId) -> Self {
+        install_current_io_uring(owner);
         Self
     }
 }
 
 impl Drop for ExecutorIoUringScope {
     fn drop(&mut self) {
-        let _ = shutdown_current();
+        shutdown_current_if_idle();
     }
 }
 
@@ -330,26 +337,65 @@ fn completion_result_to_usize(result: i32, operation: &str) -> io::Result<usize>
     })
 }
 
-pub(super) fn install_current_io_uring() {
+pub(super) fn install_current_io_uring(owner: ExecutorId) {
     CURRENT_IO_URING.with(|current| {
-        if current.borrow().is_some() {
-            return;
+        if let Some(installed) = current.borrow().as_ref() {
+            if installed.owner == owner {
+                return;
+            }
+
+            let snapshot = installed.dispatcher.borrow().snapshot();
+            assert!(
+                snapshot.is_idle(),
+                "executor io_uring dispatcher for another executor still has live state: {snapshot:?}"
+            );
         }
 
         let dispatcher = available_io_uring(EXECUTOR_IO_URING_ENTRIES)
             .ok()
             .flatten()
             .map(|ring| IoUringDispatcher::new(ring).into_shared());
-        *current.borrow_mut() = dispatcher;
+        *current.borrow_mut() = dispatcher.map(|dispatcher| CurrentIoUring { owner, dispatcher });
     });
 }
 
-pub(super) fn shutdown_current() -> Option<IoUringDispatcherSnapshot> {
+pub(super) fn shutdown_current(owner: ExecutorId) -> Option<IoUringDispatcherSnapshot> {
     CURRENT_IO_URING.with(|current| {
-        let dispatcher = current.borrow_mut().take()?;
-        let mut dispatcher = dispatcher.borrow_mut();
+        {
+            let current_ref = current.borrow();
+            let installed = current_ref.as_ref()?;
+            if installed.owner != owner {
+                return None;
+            }
+
+            if installed.dispatcher.borrow().snapshot().registered_wakers > 0 {
+                let mut snapshot = installed.dispatcher.borrow().snapshot();
+                snapshot.shutdown_drain = Some(IoUringShutdownDrainSnapshot {
+                    status: IoUringShutdownDrainStatus::SkippedLiveWakers,
+                    max_waits: EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS,
+                    dispatched: 0,
+                });
+                return Some(snapshot);
+            }
+        }
+
+        let installed = current.borrow_mut().take().expect("dispatcher exists");
+        let mut dispatcher = installed.dispatcher.borrow_mut();
         Some(shutdown_dispatcher(&mut dispatcher))
     })
+}
+
+fn shutdown_current_if_idle() {
+    CURRENT_IO_URING.with(|current| {
+        let should_shutdown = current.borrow().as_ref().is_some_and(|installed| {
+            installed.dispatcher.borrow().snapshot().registered_wakers == 0
+        });
+        if should_shutdown {
+            let installed = current.borrow_mut().take().expect("dispatcher exists");
+            let mut dispatcher = installed.dispatcher.borrow_mut();
+            let _ = shutdown_dispatcher(&mut dispatcher);
+        }
+    });
 }
 
 fn shutdown_dispatcher(dispatcher: &mut IoUringDispatcher) -> IoUringDispatcherSnapshot {
@@ -406,8 +452,9 @@ fn drain_shutdown_dispatcher(
 
 pub(super) fn dispatch_available() -> usize {
     CURRENT_IO_URING.with(|current| {
-        current.borrow().as_ref().map_or(0, |dispatcher| {
-            dispatcher
+        current.borrow().as_ref().map_or(0, |installed| {
+            installed
+                .dispatcher
                 .borrow_mut()
                 .dispatch_available_limit(EXECUTOR_IO_URING_COMPLETION_BUDGET)
         })
@@ -420,8 +467,8 @@ pub(super) fn completion_budget() -> usize {
 
 pub(super) fn should_wait() -> bool {
     CURRENT_IO_URING.with(|current| {
-        current.borrow().as_ref().is_some_and(|dispatcher| {
-            let snapshot = dispatcher.borrow().snapshot();
+        current.borrow().as_ref().is_some_and(|installed| {
+            let snapshot = installed.dispatcher.borrow().snapshot();
             snapshot.registered_wakers > 0 || snapshot.ring.pending_submissions > 0
         })
     })
@@ -432,13 +479,17 @@ pub(super) fn completion_fd() -> Option<RawFd> {
         current
             .borrow()
             .as_ref()
-            .map(|dispatcher| dispatcher.borrow().raw_fd())
+            .map(|installed| installed.dispatcher.borrow().raw_fd())
     })
 }
 
 pub(super) fn submit_pending() -> io::Result<u32> {
     CURRENT_IO_URING.with(|current| {
-        let Some(dispatcher) = current.borrow().as_ref().cloned() else {
+        let Some(dispatcher) = current
+            .borrow()
+            .as_ref()
+            .map(|installed| Rc::clone(&installed.dispatcher))
+        else {
             return Ok(0);
         };
         dispatcher.borrow_mut().submit_pending()
@@ -450,12 +501,17 @@ pub(super) fn snapshot() -> Option<IoUringDispatcherSnapshot> {
         current
             .borrow()
             .as_ref()
-            .map(|dispatcher| dispatcher.borrow().snapshot())
+            .map(|installed| installed.dispatcher.borrow().snapshot())
     })
 }
 
 fn current_dispatcher() -> Option<SharedDispatcher> {
-    CURRENT_IO_URING.with(|current| current.borrow().as_ref().cloned())
+    CURRENT_IO_URING.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .map(|installed| Rc::clone(&installed.dispatcher))
+    })
 }
 
 #[cfg(test)]

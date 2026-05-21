@@ -103,7 +103,7 @@ impl Executor {
     /// Runs tasks until all spawners and runnable tasks are gone.
     pub fn run(&self) {
         #[cfg(target_os = "linux")]
-        let _io_uring_scope = uring::ExecutorIoUringScope::enter();
+        let _io_uring_scope = uring::ExecutorIoUringScope::enter(self.scheduler.id());
         self.refresh_io_uring_snapshot();
 
         loop {
@@ -129,7 +129,7 @@ impl Executor {
         F: Future,
     {
         #[cfg(target_os = "linux")]
-        let _io_uring_scope = uring::ExecutorIoUringScope::enter();
+        let _io_uring_scope = uring::ExecutorIoUringScope::enter(self.scheduler.id());
         self.refresh_io_uring_snapshot();
 
         let root = Arc::new(RootWaker::new(Arc::clone(&self.scheduler)));
@@ -212,13 +212,14 @@ impl Executor {
     fn shutdown_io_uring(&self) {
         #[cfg(target_os = "linux")]
         self.scheduler
-            .record_io_uring_snapshot(uring::shutdown_current());
+            .record_io_uring_snapshot(uring::shutdown_current(self.scheduler.id()));
     }
 }
 
 impl Drop for Executor {
     fn drop(&mut self) {
         self.scheduler.close();
+        self.shutdown_io_uring();
     }
 }
 

@@ -429,6 +429,11 @@ makes a bounded attempt to drain abandoned operations before discarding the
 thread-local dispatcher when no live task wakers remain registered. This avoids
 hiding completion work behind an unrelated timer or readiness wait, but it is
 still a staged integration rather than one combined production wait primitive.
+If `run_until` returns while spawned tasks still have registered `io_uring`
+wakers, the dispatcher remains installed for that executor on the current
+thread so a later `run` or `run_until` can continue driving those operations.
+A different executor may not take over that thread-local dispatcher while it
+still has live state.
 
 This integration deliberately keeps some limits visible:
 
