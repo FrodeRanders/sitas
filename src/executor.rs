@@ -3,8 +3,9 @@
 //! This module is intentionally small. It exists to expose the core mechanics
 //! behind async task execution: tasks own pinned futures, wakers re-enqueue
 //! ready tasks, and an executor repeatedly polls tasks from a ready queue. On
-//! Unix, the `non-std-runtime` branch parks the executor on an OS reactor wake
-//! source when no tasks are ready.
+//! On Unix, the executor sleeps on an OS reactor (`epoll`, `kqueue`, or `poll`
+//! fallback) when no tasks are ready. On Linux, the executor also dispatches
+//! experimental `io_uring` completions through the same idle-wait path.
 
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
@@ -139,7 +140,7 @@ impl Executor {
         let mut context = Context::from_waker(&waker);
         let mut future = Box::pin(future);
 
-        loop {
+        let output: F::Output = loop {
             if root.take_ready() {
                 let current_scheduler = enter_scheduler(Arc::clone(&self.scheduler));
 
@@ -148,10 +149,7 @@ impl Executor {
                 drop(current_scheduler);
 
                 match poll_result {
-                    Ok(Poll::Ready(output)) => {
-                        self.shutdown_io_uring();
-                        return output;
-                    }
+                    Ok(Poll::Ready(value)) => break value,
                     Ok(Poll::Pending) => {}
                     Err(payload) => panic::resume_unwind(payload),
                 }
@@ -164,7 +162,11 @@ impl Executor {
             }
 
             self.wait_for_idle_driver_event("running root future");
-        }
+        };
+
+        drop(future);
+        self.shutdown_io_uring();
+        output
     }
 
     fn drive_ready_work(&self) {

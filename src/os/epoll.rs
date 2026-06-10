@@ -330,3 +330,205 @@ fn control_epoll_fd(
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoll_interest_events_read_only() {
+        let interest = EpollInterest {
+            fd: 1,
+            read: true,
+            write: false,
+        };
+        assert_eq!(interest.events(), EPOLLIN);
+    }
+
+    #[test]
+    fn epoll_interest_events_write_only() {
+        let interest = EpollInterest {
+            fd: 1,
+            read: false,
+            write: true,
+        };
+        assert_eq!(interest.events(), EPOLLOUT);
+    }
+
+    #[test]
+    fn epoll_interest_events_read_write() {
+        let interest = EpollInterest {
+            fd: 1,
+            read: true,
+            write: true,
+        };
+        assert_eq!(interest.events(), EPOLLIN | EPOLLOUT);
+    }
+
+    #[test]
+    fn epoll_interests_new_merges_duplicate_fds() {
+        let interests = EpollInterests::new(&[1, 2, 1], &[2, 3]);
+        assert_eq!(interests.len(), 3);
+        assert!(interests.contains_fd(1));
+        assert!(interests.contains_fd(2));
+        assert!(interests.contains_fd(3));
+        assert!(!interests.contains_fd(4));
+
+        let fd1 = interests
+            .iter()
+            .find(|i| i.fd == 1)
+            .expect("fd 1 should be present");
+        assert!(fd1.read, "fd1 appeared in read set (twice)");
+        assert!(!fd1.write, "fd1 was not in write set");
+
+        let fd2 = interests
+            .iter()
+            .find(|i| i.fd == 2)
+            .expect("fd 2 should be present");
+        assert!(fd2.read, "fd2 appeared in read set");
+        assert!(fd2.write, "fd2 appeared in write set");
+    }
+
+    #[test]
+    fn epoll_interests_empty() {
+        let interests = EpollInterests::new(&[], &[]);
+        assert_eq!(interests.len(), 0);
+        assert!(!interests.contains_fd(0));
+    }
+
+    #[test]
+    fn epoll_registry_allocate_token_increments() {
+        let mut reg = EpollRegistry::new();
+        assert_eq!(reg.allocate_token(), 1);
+        assert_eq!(reg.allocate_token(), 2);
+        assert_eq!(reg.allocate_token(), 3);
+    }
+
+    #[test]
+    fn epoll_registry_insert_and_get() {
+        let mut reg = EpollRegistry::new();
+        let token = reg.allocate_token();
+        let interest = EpollInterest {
+            fd: 42,
+            read: true,
+            write: false,
+        };
+        reg.insert(token, interest);
+        assert_eq!(reg.get(token), Some(interest));
+        assert_eq!(reg.token_for_fd(42), Some(token));
+    }
+
+    #[test]
+    fn epoll_registry_update() {
+        let mut reg = EpollRegistry::new();
+        let token = reg.allocate_token();
+        let initial = EpollInterest {
+            fd: 10,
+            read: true,
+            write: false,
+        };
+        reg.insert(token, initial);
+        let updated = EpollInterest {
+            fd: 10,
+            read: true,
+            write: true,
+        };
+        reg.update(token, updated);
+        assert_eq!(reg.get(token), Some(updated));
+        assert_eq!(reg.token_for_fd(10), Some(token));
+    }
+
+    #[test]
+    fn epoll_registry_remove() {
+        let mut reg = EpollRegistry::new();
+        let token = reg.allocate_token();
+        let interest = EpollInterest {
+            fd: 99,
+            read: true,
+            write: false,
+        };
+        reg.insert(token, interest);
+        let removed = reg.remove_fd(99);
+        assert_eq!(removed, Some(interest));
+        assert_eq!(reg.get(token), None);
+        assert_eq!(reg.token_for_fd(99), None);
+    }
+
+    #[test]
+    fn epoll_registry_remove_nonexistent() {
+        let mut reg = EpollRegistry::new();
+        assert_eq!(reg.remove_fd(999), None);
+    }
+
+    #[test]
+    fn epoll_registry_get_nonexistent_token() {
+        let reg = EpollRegistry::new();
+        assert_eq!(reg.get(0), None);
+        assert_eq!(reg.get(999), None);
+    }
+
+    #[test]
+    fn epoll_registry_token_for_fd_nonexistent() {
+        let reg = EpollRegistry::new();
+        assert_eq!(reg.token_for_fd(42), None);
+    }
+
+    #[test]
+    fn epoll_registry_interest_fds() {
+        let mut reg = EpollRegistry::new();
+        let t1 = reg.allocate_token();
+        let t2 = reg.allocate_token();
+        reg.insert(
+            t1,
+            EpollInterest {
+                fd: 10,
+                read: true,
+                write: false,
+            },
+        );
+        reg.insert(
+            t2,
+            EpollInterest {
+                fd: 20,
+                read: false,
+                write: true,
+            },
+        );
+        let mut fds = reg.interest_fds();
+        fds.sort();
+        assert_eq!(fds, vec![10, 20]);
+    }
+
+    #[test]
+    fn epoll_registry_insert_wake() {
+        let mut reg = EpollRegistry::new();
+        reg.insert_wake(5);
+        let wake = reg.get(0).expect("wake fd should be at token 0");
+        assert_eq!(wake.fd, 5);
+        assert!(wake.read);
+        assert!(!wake.write);
+    }
+
+    #[test]
+    fn add_epoll_interest_new_fd() {
+        let mut interests = Vec::new();
+        add_epoll_interest(&mut interests, 1, true, false);
+        assert_eq!(interests.len(), 1);
+        assert_eq!(interests[0].fd, 1);
+        assert!(interests[0].read);
+        assert!(!interests[0].write);
+    }
+
+    #[test]
+    fn add_epoll_interest_merge() {
+        let mut interests = vec![EpollInterest {
+            fd: 1,
+            read: true,
+            write: false,
+        }];
+        add_epoll_interest(&mut interests, 1, false, true);
+        assert_eq!(interests.len(), 1);
+        assert!(interests[0].read);
+        assert!(interests[0].write);
+    }
+}

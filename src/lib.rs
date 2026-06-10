@@ -12,17 +12,22 @@
 //! Cross-shard values are owned values, so no references into shard-local state
 //! escape the shard.
 //!
-//! The baseline std-only milestone deliberately does not include:
+//! The crate now contains three layers:
 //!
-//! - non-blocking I/O
-//! - a network server
-//! - persistence
-//! - CPU pinning
-//! - scheduling classes
-//! - procedural macro service generation
+//! 1. **Baseline std-only sharded services** (`runtime`, `kv`, `counter`,
+//!    `placement`): bounded mailboxes, typed command/reply APIs, blocking and
+//!    submit/wait-later handles, owned snapshots, clean startup/shutdown.
 //!
-//! The `non-std-runtime` branch starts introducing small Unix runtime backend
-//! pieces directly through OS syscalls.
+//! 2. **Custom single-threaded async executor** (`executor`, `os`): pinned
+//!    futures, ready-queue scheduling, timers, timeouts, cooperative stop
+//!    tokens, task scopes, join handles, scheduling groups, Unix readiness I/O
+//!    (`epoll`/`kqueue`/`poll`), TCP accept/connect/copy helpers, and
+//!    experimental Linux `io_uring` file-I/O futures.
+//!
+//! 3. **Shard-per-thread async runtime** (`sharded_executor`, `shard_local`):
+//!    one executor thread per shard, cross-shard submission via
+//!    `ShardedSubmitter`, shard-local state via `ShardLocal<T>`, CPU placement,
+//!    sharded scheduling groups, and snapshot-based observability.
 
 #![warn(missing_docs)]
 #![warn(unsafe_op_in_unsafe_fn)]

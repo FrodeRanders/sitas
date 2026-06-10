@@ -11,7 +11,7 @@ use super::task::Task;
 type JoinResult<T> = Result<T, JoinError>;
 
 /// Future returned by [`super::Spawner::spawn_with_handle`].
-#[must_use = "join handles do nothing unless polled or awaited"]
+#[must_use = "join handles abort the underlying task when dropped; await or explicitly abort them instead"]
 pub struct JoinHandle<T> {
     pub(super) shared: Arc<Mutex<JoinState<T>>>,
     pub(super) task: Arc<Task>,
@@ -93,6 +93,12 @@ impl<T> JoinHandle<T> {
 
         complete_join(&self.shared, Err(JoinError::Canceled));
         true
+    }
+}
+
+impl<T> Drop for JoinHandle<T> {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 

@@ -417,3 +417,202 @@ fn duration_to_timespec(duration: Duration) -> Timespec {
         tv_nsec: i64::from(duration.subsec_nanos()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kqueue_interests_new_merges_duplicate_fds() {
+        let interests = KqueueInterests::new(&[1, 2, 1], &[2, 3]);
+        assert_eq!(interests.len(), 3);
+        assert!(interests.contains_fd(1));
+        assert!(interests.contains_fd(2));
+        assert!(interests.contains_fd(3));
+        assert!(!interests.contains_fd(4));
+
+        let fd1 = interests
+            .iter()
+            .find(|i| i.fd == 1)
+            .expect("fd 1 should be present");
+        assert!(fd1.read, "fd1 appeared in read set (twice)");
+        assert!(!fd1.write, "fd1 was not in write set");
+
+        let fd2 = interests
+            .iter()
+            .find(|i| i.fd == 2)
+            .expect("fd 2 should be present");
+        assert!(fd2.read, "fd2 appeared in read set");
+        assert!(fd2.write, "fd2 appeared in write set");
+    }
+
+    #[test]
+    fn kqueue_interests_empty() {
+        let interests = KqueueInterests::new(&[], &[]);
+        assert_eq!(interests.len(), 0);
+        assert!(!interests.contains_fd(0));
+    }
+
+    #[test]
+    fn kqueue_registry_allocate_token_increments() {
+        let mut reg = KqueueRegistry::new();
+        assert_eq!(reg.allocate_token(), 1);
+        assert_eq!(reg.allocate_token(), 2);
+        assert_eq!(reg.allocate_token(), 3);
+    }
+
+    #[test]
+    fn kqueue_registry_insert_and_get() {
+        let mut reg = KqueueRegistry::new();
+        let token = reg.allocate_token();
+        let interest = KqueueInterest {
+            fd: 42,
+            read: true,
+            write: false,
+        };
+        reg.insert(token, interest);
+        assert_eq!(reg.get(token), Some(interest));
+        assert_eq!(reg.token_for_fd(42), Some(token));
+    }
+
+    #[test]
+    fn kqueue_registry_update() {
+        let mut reg = KqueueRegistry::new();
+        let token = reg.allocate_token();
+        let initial = KqueueInterest {
+            fd: 10,
+            read: true,
+            write: false,
+        };
+        reg.insert(token, initial);
+        let updated = KqueueInterest {
+            fd: 10,
+            read: true,
+            write: true,
+        };
+        reg.update(token, updated);
+        assert_eq!(reg.get(token), Some(updated));
+        assert_eq!(reg.token_for_fd(10), Some(token));
+    }
+
+    #[test]
+    fn kqueue_registry_remove() {
+        let mut reg = KqueueRegistry::new();
+        let token = reg.allocate_token();
+        let interest = KqueueInterest {
+            fd: 99,
+            read: true,
+            write: false,
+        };
+        reg.insert(token, interest);
+        let removed = reg.remove_fd(99);
+        assert_eq!(removed, Some(interest));
+        assert_eq!(reg.get(token), None);
+        assert_eq!(reg.token_for_fd(99), None);
+    }
+
+    #[test]
+    fn kqueue_registry_remove_nonexistent() {
+        let mut reg = KqueueRegistry::new();
+        assert_eq!(reg.remove_fd(999), None);
+    }
+
+    #[test]
+    fn kqueue_registry_get_nonexistent_token() {
+        let reg = KqueueRegistry::new();
+        assert_eq!(reg.get(0), None);
+        assert_eq!(reg.get(999), None);
+    }
+
+    #[test]
+    fn kqueue_registry_token_for_fd_nonexistent() {
+        let reg = KqueueRegistry::new();
+        assert_eq!(reg.token_for_fd(42), None);
+    }
+
+    #[test]
+    fn kqueue_registry_interest_fds() {
+        let mut reg = KqueueRegistry::new();
+        let t1 = reg.allocate_token();
+        let t2 = reg.allocate_token();
+        reg.insert(
+            t1,
+            KqueueInterest {
+                fd: 10,
+                read: true,
+                write: false,
+            },
+        );
+        reg.insert(
+            t2,
+            KqueueInterest {
+                fd: 20,
+                read: false,
+                write: true,
+            },
+        );
+        let mut fds = reg.interest_fds();
+        fds.sort();
+        assert_eq!(fds, vec![10, 20]);
+    }
+
+    #[test]
+    fn kqueue_registry_insert_wake() {
+        let mut reg = KqueueRegistry::new();
+        reg.insert_wake(5);
+        let wake = reg.get(0).expect("wake fd should be at token 0");
+        assert_eq!(wake.fd, 5);
+        assert!(wake.read);
+        assert!(!wake.write);
+    }
+
+    #[test]
+    fn add_kqueue_interest_new_fd() {
+        let mut interests = Vec::new();
+        add_kqueue_interest(&mut interests, 1, true, false);
+        assert_eq!(interests.len(), 1);
+        assert_eq!(interests[0].fd, 1);
+        assert!(interests[0].read);
+        assert!(!interests[0].write);
+    }
+
+    #[test]
+    fn add_kqueue_interest_merge() {
+        let mut interests = vec![KqueueInterest {
+            fd: 1,
+            read: true,
+            write: false,
+        }];
+        add_kqueue_interest(&mut interests, 1, false, true);
+        assert_eq!(interests.len(), 1);
+        assert!(interests[0].read);
+        assert!(interests[0].write);
+    }
+
+    #[test]
+    fn duration_to_timespec_converts_correctly() {
+        let dur = Duration::from_millis(1500);
+        let ts = duration_to_timespec(dur);
+        assert_eq!(ts.tv_sec, 1);
+        assert_eq!(ts.tv_nsec, 500_000_000);
+    }
+
+    #[test]
+    fn duration_to_timespec_zero() {
+        let dur = Duration::ZERO;
+        let ts = duration_to_timespec(dur);
+        assert_eq!(ts.tv_sec, 0);
+        assert_eq!(ts.tv_nsec, 0);
+    }
+
+    #[test]
+    fn empty_kevent_is_all_zeros() {
+        let ev = empty_kevent();
+        assert_eq!(ev.ident, 0);
+        assert_eq!(ev.filter, 0);
+        assert_eq!(ev.flags, 0);
+        assert_eq!(ev.fflags, 0);
+        assert_eq!(ev.data, 0);
+        assert!(ev.udata.is_null());
+    }
+}

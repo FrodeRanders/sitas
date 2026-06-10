@@ -6,7 +6,7 @@ use crate::executor::{JoinError, JoinHandle, SpawnError, TimeoutError, timeout};
 use crate::shard::ShardId;
 
 /// Join handle tagged with the shard on which the task is running.
-#[must_use = "sharded join handles do nothing unless joined"]
+#[must_use = "sharded join handles abort the underlying task when dropped; join them instead"]
 pub struct ShardedJoinHandle<T> {
     shard_id: ShardId,
     handle: JoinHandle<T>,

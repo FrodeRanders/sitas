@@ -110,6 +110,29 @@ where
         Ok((shard_id, cell.with_mut(|value| operation(shard_id, value))))
     }
 
+    /// Like [`with_current`](Self::with_current) but the closure does not
+    /// receive the [`ShardId`].
+    pub fn with_current_result<R, F>(&self, operation: F) -> Result<R, ShardLocalAccessError>
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        let shard_id = current_executor_shard().ok_or(ShardLocalAccessError::NotOnShard)?;
+        let cell = self.cell_for_current(shard_id)?;
+
+        Ok(cell.with_mut(operation))
+    }
+
+    /// Returns a clone of the value owned by the current shard.
+    ///
+    /// This is shorthand for
+    /// `with_current_result(|v| v.clone())`.
+    pub fn get_current(&self) -> Result<T, ShardLocalAccessError>
+    where
+        T: Clone,
+    {
+        self.with_current_result(|v| v.clone())
+    }
+
     /// Runs `operation` against the value owned by `shard_id`.
     pub fn with_on<R, F>(
         &self,
@@ -263,7 +286,7 @@ where
 
         Ok(StoppableShardLocalWorkers {
             stop_source,
-            workers: ShardLocalWorkers { handles },
+            workers: Some(ShardLocalWorkers { handles }),
         })
     }
 
@@ -490,21 +513,21 @@ impl std::error::Error for ShardLocalWorkerTimeoutError {
 }
 
 /// Stoppable join handle set for one shard-local worker per shard.
-#[must_use = "stoppable shard-local workers do nothing useful unless stopped or joined"]
+#[must_use = "stoppable shard-local workers abort their children when dropped; call stop_and_join instead"]
 pub struct StoppableShardLocalWorkers<T> {
     stop_source: StopSource,
-    workers: ShardLocalWorkers<T>,
+    workers: Option<ShardLocalWorkers<T>>,
 }
 
 impl<T> StoppableShardLocalWorkers<T> {
     /// Returns the number of worker handles.
     pub fn len(&self) -> usize {
-        self.workers.len()
+        self.workers.as_ref().map_or(0, |w| w.len())
     }
 
     /// Returns true when there are no worker handles.
     pub fn is_empty(&self) -> bool {
-        self.workers.is_empty()
+        self.workers.as_ref().is_none_or(|w| w.is_empty())
     }
 
     /// Returns true if cooperative stop has already been requested.
@@ -519,17 +542,23 @@ impl<T> StoppableShardLocalWorkers<T> {
 
     /// Returns the shard ids represented by this worker set.
     pub fn shard_ids(&self) -> impl Iterator<Item = ShardId> + '_ {
-        self.workers.shard_ids()
+        self.workers
+            .as_ref()
+            .map(|w| w.shard_ids().collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
     }
 
     /// Consumes this value and returns the non-stoppable worker join set.
-    pub fn into_workers(self) -> ShardLocalWorkers<T> {
-        self.workers
+    pub fn into_workers(mut self) -> ShardLocalWorkers<T> {
+        self.workers.take().expect(
+            "StoppableShardLocalWorkers::into_workers called after workers were already consumed",
+        )
     }
 
     /// Waits for every worker and returns shard-tagged outputs in shard order.
     pub async fn join(self) -> Result<Vec<(ShardId, T)>, ShardedJoinError> {
-        self.workers.join().await
+        self.into_workers().join().await
     }
 
     /// Requests cooperative stop, then waits for every worker.
@@ -544,7 +573,7 @@ impl<T> StoppableShardLocalWorkers<T> {
         duration: Duration,
     ) -> Result<Vec<(ShardId, T)>, ShardLocalWorkerTimeoutError> {
         self.stop();
-        self.workers.join_timeout(duration).await
+        self.into_workers().join_timeout(duration).await
     }
 
     /// Waits for every worker and reduces the shard-tagged outputs into one
@@ -557,7 +586,7 @@ impl<T> StoppableShardLocalWorkers<T> {
     where
         Reduce: FnMut(Acc, ShardId, T) -> Acc,
     {
-        self.workers.map_reduce(initial, reduce).await
+        self.into_workers().map_reduce(initial, reduce).await
     }
 
     /// Requests cooperative stop, then reduces all worker outputs.
@@ -585,9 +614,18 @@ impl<T> StoppableShardLocalWorkers<T> {
         Reduce: FnMut(Acc, ShardId, T) -> Acc,
     {
         self.stop();
-        self.workers
+        self.into_workers()
             .map_reduce_timeout(duration, initial, reduce)
             .await
+    }
+}
+
+impl<T> Drop for StoppableShardLocalWorkers<T> {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(workers) = self.workers.take() {
+            workers.abort_all();
+        }
     }
 }
 
@@ -595,7 +633,10 @@ impl<T> fmt::Debug for StoppableShardLocalWorkers<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoppableShardLocalWorkers")
             .field("stopped", &self.is_stopped())
-            .field("workers", &self.workers)
+            .field(
+                "workers",
+                &self.workers.as_ref().map(|w| w.len()).unwrap_or(0),
+            )
             .finish()
     }
 }

@@ -461,58 +461,86 @@ impl ShardedExecutor {
     /// Spawns one task onto each executor shard.
     pub fn spawn_on_all<MakeFuture, Fut>(
         &self,
-        make_future: MakeFuture,
+        mut make_future: MakeFuture,
     ) -> Result<(), ShardedSpawnError>
     where
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_with_handle_on_all(make_future).map(|_| ())
+        for idx in 0..self.shard_count() {
+            let shard_id = ShardId(idx);
+            self.spawner_for(shard_id)?
+                .spawn(make_future(shard_id))
+                .map_err(ShardedSpawnError::Spawn)?;
+        }
+        Ok(())
     }
 
     /// Spawns one task into a scheduling group on each executor shard.
     pub fn spawn_in_group_on_all<MakeFuture, Fut>(
         &self,
         group: &ShardedSchedulingGroup,
-        make_future: MakeFuture,
+        mut make_future: MakeFuture,
     ) -> Result<(), ShardedSpawnError>
     where
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_with_handle_in_group_on_all(group, make_future)
-            .map(|_| ())
+        for idx in 0..self.shard_count() {
+            let shard_id = ShardId(idx);
+            self.spawner_for(shard_id)?
+                .spawn_in_group(
+                    group.group_for(self.runtime_id, shard_id)?,
+                    make_future(shard_id),
+                )
+                .map_err(ShardedSpawnError::Spawn)?;
+        }
+        Ok(())
     }
 
     /// Spawns one named task into a scheduling group on each executor shard.
     pub fn spawn_named_in_group_on_all<MakeName, MakeFuture, Fut>(
         &self,
         group: &ShardedSchedulingGroup,
-        make_name: MakeName,
-        make_future: MakeFuture,
+        mut make_name: MakeName,
+        mut make_future: MakeFuture,
     ) -> Result<(), ShardedSpawnError>
     where
         MakeName: FnMut(ShardId) -> String,
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_with_handle_named_in_group_on_all(group, make_name, make_future)
-            .map(|_| ())
+        for idx in 0..self.shard_count() {
+            let shard_id = ShardId(idx);
+            self.spawner_for(shard_id)?
+                .spawn_named_in_group(
+                    group.group_for(self.runtime_id, shard_id)?,
+                    make_name(shard_id),
+                    make_future(shard_id),
+                )
+                .map_err(ShardedSpawnError::Spawn)?;
+        }
+        Ok(())
     }
 
     /// Spawns one named task onto each executor shard.
     pub fn spawn_named_on_all<MakeName, MakeFuture, Fut>(
         &self,
-        make_name: MakeName,
-        make_future: MakeFuture,
+        mut make_name: MakeName,
+        mut make_future: MakeFuture,
     ) -> Result<(), ShardedSpawnError>
     where
         MakeName: FnMut(ShardId) -> String,
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_with_handle_named_on_all(make_name, make_future)
-            .map(|_| ())
+        for idx in 0..self.shard_count() {
+            let shard_id = ShardId(idx);
+            self.spawner_for(shard_id)?
+                .spawn_named(make_name(shard_id), make_future(shard_id))
+                .map_err(ShardedSpawnError::Spawn)?;
+        }
+        Ok(())
     }
 
     /// Spawns one task into a scheduling group on each executor shard and
@@ -695,6 +723,29 @@ impl ShardedExecutor {
         Reduce: FnMut(Acc, ShardId, Fut::Output) -> Acc,
     {
         for (shard_id, output) in self.map_all(make_future).await? {
+            initial = reduce(initial, shard_id, output);
+        }
+
+        Ok(initial)
+    }
+
+    /// Runs one named async computation per shard and reduces the shard-tagged
+    /// outputs into one value.
+    pub async fn map_reduce_named_all<MakeName, MakeFuture, Fut, Acc, Reduce>(
+        &self,
+        make_name: MakeName,
+        make_future: MakeFuture,
+        mut initial: Acc,
+        mut reduce: Reduce,
+    ) -> Result<Acc, ShardedOperationError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+        Reduce: FnMut(Acc, ShardId, Fut::Output) -> Acc,
+    {
+        for (shard_id, output) in self.map_named_all(make_name, make_future).await? {
             initial = reduce(initial, shard_id, output);
         }
 
@@ -1024,58 +1075,86 @@ impl ShardedSubmitter {
     /// Submits one task to each shard.
     pub fn submit_to_all<MakeFuture, Fut>(
         &self,
-        make_future: MakeFuture,
+        mut make_future: MakeFuture,
     ) -> Result<(), ShardedSpawnError>
     where
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.submit_with_handle_to_all(make_future).map(|_| ())
+        for idx in 0..self.shard_count() {
+            let shard_id = ShardId(idx);
+            self.spawner_for(shard_id)?
+                .spawn(make_future(shard_id))
+                .map_err(ShardedSpawnError::Spawn)?;
+        }
+        Ok(())
     }
 
     /// Submits one named task to each shard.
     pub fn submit_named_to_all<MakeName, MakeFuture, Fut>(
         &self,
-        make_name: MakeName,
-        make_future: MakeFuture,
+        mut make_name: MakeName,
+        mut make_future: MakeFuture,
     ) -> Result<(), ShardedSpawnError>
     where
         MakeName: FnMut(ShardId) -> String,
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.submit_with_handle_named_to_all(make_name, make_future)
-            .map(|_| ())
+        for idx in 0..self.shard_count() {
+            let shard_id = ShardId(idx);
+            self.spawner_for(shard_id)?
+                .spawn_named(make_name(shard_id), make_future(shard_id))
+                .map_err(ShardedSpawnError::Spawn)?;
+        }
+        Ok(())
     }
 
     /// Submits one task into a scheduling group on each shard.
     pub fn submit_in_group_to_all<MakeFuture, Fut>(
         &self,
         group: &ShardedSchedulingGroup,
-        make_future: MakeFuture,
+        mut make_future: MakeFuture,
     ) -> Result<(), ShardedSpawnError>
     where
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.submit_with_handle_in_group_to_all(group, make_future)
-            .map(|_| ())
+        for idx in 0..self.shard_count() {
+            let shard_id = ShardId(idx);
+            self.spawner_for(shard_id)?
+                .spawn_in_group(
+                    group.group_for(self.runtime_id, shard_id)?,
+                    make_future(shard_id),
+                )
+                .map_err(ShardedSpawnError::Spawn)?;
+        }
+        Ok(())
     }
 
     /// Submits one named task into a scheduling group on each shard.
     pub fn submit_named_in_group_to_all<MakeName, MakeFuture, Fut>(
         &self,
         group: &ShardedSchedulingGroup,
-        make_name: MakeName,
-        make_future: MakeFuture,
+        mut make_name: MakeName,
+        mut make_future: MakeFuture,
     ) -> Result<(), ShardedSpawnError>
     where
         MakeName: FnMut(ShardId) -> String,
         MakeFuture: FnMut(ShardId) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.submit_with_handle_named_in_group_to_all(group, make_name, make_future)
-            .map(|_| ())
+        for idx in 0..self.shard_count() {
+            let shard_id = ShardId(idx);
+            self.spawner_for(shard_id)?
+                .spawn_named_in_group(
+                    group.group_for(self.runtime_id, shard_id)?,
+                    make_name(shard_id),
+                    make_future(shard_id),
+                )
+                .map_err(ShardedSpawnError::Spawn)?;
+        }
+        Ok(())
     }
 
     /// Submits one task to each shard and returns shard-tagged join handles.
@@ -1223,6 +1302,29 @@ impl ShardedSubmitter {
         Reduce: FnMut(Acc, ShardId, Fut::Output) -> Acc,
     {
         for (shard_id, output) in self.map_all(make_future).await? {
+            initial = reduce(initial, shard_id, output);
+        }
+
+        Ok(initial)
+    }
+
+    /// Runs one named async computation per shard and reduces the shard-tagged
+    /// outputs into one value.
+    pub async fn map_reduce_named_all<MakeName, MakeFuture, Fut, Acc, Reduce>(
+        &self,
+        make_name: MakeName,
+        make_future: MakeFuture,
+        mut initial: Acc,
+        mut reduce: Reduce,
+    ) -> Result<Acc, ShardedOperationError>
+    where
+        MakeName: FnMut(ShardId) -> String,
+        MakeFuture: FnMut(ShardId) -> Fut,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+        Reduce: FnMut(Acc, ShardId, Fut::Output) -> Acc,
+    {
+        for (shard_id, output) in self.map_named_all(make_name, make_future).await? {
             initial = reduce(initial, shard_id, output);
         }
 

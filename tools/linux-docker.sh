@@ -8,6 +8,13 @@ DOCKER_IO_URING="${SITAS_DOCKER_IO_URING:-0}"
 DOCKER_PRIVILEGED="${SITAS_DOCKER_PRIVILEGED:-0}"
 REQUIRE_IO_URING="${SITAS_REQUIRE_IO_URING:-$DOCKER_IO_URING}"
 
+if [ "${DOCKER_IO_URING}" = "0" ] && [ "${DOCKER_PRIVILEGED}" = "0" ]; then
+    printf '%s\n' '---' >&2
+    printf '%s\n' 'Note: io_uring tests will be skipped because the Docker container blocks' >&2
+    printf '%s\n' 'io_uring_setup(2) by default. Set SITAS_DOCKER_IO_URING=1 to unblock it.' >&2
+    printf '%s\n' '---' >&2
+fi
+
 if [ "$#" -eq 0 ]; then
     set -- sh -lc '
         set -eu
