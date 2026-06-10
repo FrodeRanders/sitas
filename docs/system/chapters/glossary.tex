@@ -33,10 +33,12 @@ field guide for those words.
 
     \item[Join handle] An awaitable handle for a spawned task result. It is
         also the cancellation handle: aborting it requests that the task be
-        dropped if it has not completed.
+        dropped if it has not completed. Dropping a join handle without
+        awaiting it automatically aborts the underlying task.
 
     \item[Task scope] A structured owner for child tasks. It gives a group of
         children one cooperative stop source and one bounded shutdown path.
+        Dropping a scope requests stop and aborts remaining children.
 \end{description}
 
 \section{Scheduling terms}
@@ -86,6 +88,27 @@ field guide for those words.
         enough state to dispose of buffers safely later.
 \end{description}
 
+\section{Observability terms}
+
+\begin{description}
+    \item[Running statistics] An online accumulator using Welford's algorithm
+        that computes count, mean, variance, standard deviation, coefficient
+        of variation, min, max, and total from streaming \texttt{f64} samples
+        without storing the values. Two accumulators can be merged. Duration
+        convenience methods accept \texttt{Duration} and \texttt{Instant} pairs.
+
+    \item[Snapshot] An owned point-in-time copy of runtime state. A snapshot is
+        not live and does not keep the runtime alive.
+
+    \item[Coefficient of variation (CV)] Standard deviation divided by mean,
+        expressed as a percentage. Unit-free, useful for comparing dispersion
+        across metrics with different scales.
+
+    \item[Runtime identity] A private identity used to reject handles from a
+        different runtime, such as a sharded scheduling group created by
+        another \texttt{ShardedExecutor}.
+\end{description}
+
 \section{Ownership terms}
 
 \begin{description}
@@ -94,13 +117,13 @@ field guide for those words.
 
     \item[Shard-local value] One owned value per shard, accessed only on the
         owning shard and only through synchronous closures.
+        \texttt{with\_current\_result} skips the \texttt{ShardId} parameter.
+        \texttt{get\_current} returns a clone.
 
-    \item[Snapshot] An owned point-in-time copy of runtime state. A snapshot is
-        not live and does not keep the runtime alive.
-
-    \item[Runtime identity] A private identity used to reject handles from a
-        different runtime, such as a sharded scheduling group created by
-        another \texttt{ShardedExecutor}.
+    \item[Stoppable shard-local workers] A set of shard-local workers sharing
+        a cooperative stop token. Dropping the handle requests stop and aborts
+        remaining workers---the explicit \texttt{stop\_and\_join} path is
+        preferred for clean shutdown.
 \end{description}
 
 \section{Mechanism maps}

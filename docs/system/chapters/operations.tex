@@ -54,6 +54,54 @@ as hard CPU affinity and \texttt{io\_uring}. The helper keeps that platform
 check repeatable without pretending the project is platform-neutral in areas
 where it is not.
 
+\section{Continuous integration}
+
+The project includes a GitHub Actions workflow (\filepath{.github/workflows/ci.yml})
+that runs on every push and pull request:
+
+\begin{itemize}
+    \item \texttt{rustfmt} and \texttt{clippy} checks on Ubuntu.
+    \item Full test suite (\texttt{cargo test --all-targets}) on both Ubuntu
+          and macOS.
+    \item Documentation build (\texttt{cargo doc --no-deps}) with
+          \texttt{\#![warn(missing\_docs)]} enforcement.
+    \item All example programs are compiled and run on Ubuntu.
+\end{itemize}
+
+This provides cross-platform validation for the unsafe FFI and
+platform-gated features (epoll/kqueue/poll, CPU affinity, io\_uring).
+
+
+\section{Documentation conventions}
+
+Every source file carries a \texttt{//!} module-level comment describing its
+purpose and the types it contains. The crate root declares
+\texttt{\#![warn(missing\_docs)]}, which makes undocumented public items
+compilation errors.
+
+\begin{itemize}
+    \item \textbf{Public API} (\texttt{///}): required on all \texttt{pub}
+          items. Enforced by the lint.
+    \item \textbf{Module docs} (\texttt{//!}): present on every \texttt{.rs}
+          file, both top-level public modules and internal sub-files.
+    \item \textbf{Unsafe blocks} (\texttt{// SAFETY:}): every unsafe block
+          has a preceding comment explaining why the operation is sound.
+    \item \textbf{FFI blocks}: all use \texttt{unsafe extern "C" \{ ... \}}
+          per Rust Edition 2024.
+    \item \textbf{Test names}: follow a descriptive
+          \texttt{subject\_action\_expected\_outcome} convention.
+\end{itemize}
+
+The standard commands for checking these are part of the normal validation
+workflow:
+
+\begin{lstlisting}[language=bash]
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo doc --no-deps
+\end{lstlisting}
+
 \section{Validation strategy}
 
 Use narrow tests first, then broaden. This keeps iteration fast while still

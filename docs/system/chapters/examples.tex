@@ -85,16 +85,38 @@ sorted index of offsets into that data file. Each shard scans one partition,
 sorts its partition-local index entries, writes a materialized run file, and
 then participates in merge rounds until one sorted index remains.
 
+The example demonstrates several of the runtime's most important APIs in
+combination:
+
+\begin{itemize}
+    \item \texttt{ShardLocal<ShardProgress>} tracks per-shard phase,
+          record count, and byte counters. Each shard task calls
+          \texttt{with\_current\_result} to update only its own slot.
+          No shared mutex protects the progress counters.
+    \item \texttt{runtime.map\_all} dispatches partition work to all
+          shards with a single call, replacing manual handle collection.
+    \item Chunked record reads (256 records per read) replace one-syscall-
+          per-record scanning.
+    \item \texttt{RunningStatistics} collects per-shard scan durations and
+          prints mean, standard deviation, CV, min, and max across shards.
+    \item Explicit merge rounds submit pairs of sorted run files onto shards,
+          stream-merge them into new run files, and carry odd runs forward.
+    \item Wall-clock timing is reported at the end:
+          \texttt{partition=34.1ms merge=82.2ms total=175.7ms}.
+\end{itemize}
+
 The \texttt{io\_uring} variant performs partition reads, run writes, and merge
-run reads/writes through the executor-backed Linux completion path. Final
+run reads/writes through the executor-backed Linux completion path. It uses the
+same \texttt{ShardLocal} and \texttt{map\_all} shape as the std variant. Final
 verification still uses ordinary file I/O because it checks the externally
 visible result rather than the runtime path that produced it.
 
 The index examples are intentionally more involved than the small teaching
 examples. They exercise the Seastar-like direction: split work by shard, keep
-partition-local state local while sorting, materialize intermediate runs, and
-merge owned outputs. They are useful for studying where the project is heading,
-but they are not the first examples to read.
+partition-local state local while sorting, materialize intermediate runs,
+merge owned outputs, and collect per-shard timing statistics with
+\texttt{RunningStatistics}. They are useful for studying where the project is
+heading, but they are not the first examples to read.
 
 The reason the index build is a good larger example is that it is naturally
 partitionable. Each shard can sort a portion of the data without sharing a

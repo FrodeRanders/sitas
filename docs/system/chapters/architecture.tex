@@ -115,8 +115,8 @@ OS primitives: pipe/poll/epoll/io_uring/affinity
 \end{lstlisting}
 
 The standard-library baseline exercises the upper part of the model. The
-non-std runtime branch fills in the executor and OS layers while preserving the
-same shared-nothing service direction.
+custom executor and OS runtime layers fill in the lower layers while preserving
+the same shared-nothing service direction.
 
 \section{Primary modules}
 
@@ -133,7 +133,9 @@ same shared-nothing service direction.
     \item[\texttt{sharded\_executor}] One executor per shard thread, plus
         submission and observation APIs.
     \item[\texttt{shard\_local}] One owned value per executor shard with
-        checked local access.
+        checked local access. Provides \texttt{with\_current},
+        \texttt{with\_current\_result}, \texttt{get\_current},
+        \texttt{map\_all}, and worker/scope APIs.
 \end{description}
 
 \section{How to trace a feature through the layers}

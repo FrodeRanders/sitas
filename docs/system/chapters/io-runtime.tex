@@ -173,3 +173,45 @@ that executor on the current thread so later executor calls can continue the
 same operations. The runtime still does not expose a portable completion
 source, tunable completion policy, or a deeper shutdown policy for mixed
 readiness and completion workloads.
+
+\section{Running statistics}
+
+\href{https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance\#Welford's_online_algorithm}{Welford's
+algorithm} computes mean, variance, and standard deviation in a single pass
+without storing individual samples. The \texttt{running\_stats} module provides
+\texttt{RunningStatistics} as a small online accumulator useful for runtime
+diagnostics and benchmark comparisons.
+
+\begin{lstlisting}[language={},caption={RunningStatistics use}]
+let mut stats = RunningStatistics::new();
+stats.add_sample_duration(elapsed);       // record as seconds (f64)
+stats.add_sample_interval(start, end);    // convenience for Instant pairs
+stats.merge(&other);                      // Chan et al. parallel merge
+
+// Accessors return Option<f64> (None until enough samples):
+stats.count()         // u64
+stats.min() / max()   // Option<f64>
+stats.mean()          // Option<f64>
+stats.variance()      // Option<f64>,  sample variance (n-1), n >= 2
+stats.std_dev()       // Option<f64>
+stats.cv()            // Option<f64>,  coefficient of variation in %
+stats.total()         // u64 integral total
+\end{lstlisting}
+
+Duration convenience methods (\texttt{mean\_duration()},
+\texttt{min\_duration()}, \texttt{max\_duration()},
+\texttt{std\_dev\_duration()}) return \texttt{Option<Duration>}
+instead of raw seconds.
+
+The \texttt{merge} method uses Chan et al.'s parallel algorithm so partial
+accumulators from different threads or shards can be combined without
+reprocessing the original samples. This is useful when each shard collects
+statistics independently and the caller wants aggregate numbers.
+
+The display format prints count, mean, standard deviation, CV, min, max, and
+total in a single human-readable line, which is how the index build examples
+report per-shard timing statistics.
+
+CV is unit-free. It expresses dispersion relative to the mean, making it useful
+for comparing the stability of metrics with different scales (e.g.\ partition
+scan times versus merge round times).

@@ -214,6 +214,59 @@ The output is not tracing. There is no event stream. It is repeated sampling of
 owned snapshots. This is less powerful than a full console, but it is simple,
 portable, and keeps runtime internals inspectable.
 
+\section{Walkthrough: sharded index build}
+
+The index build is the most application-like example. Start with a small run:
+
+\begin{lstlisting}[language=bash,caption={Index build example}]
+cargo run --example sharded_index_build -- --records 512 --shards 4 --seed 0xbeef --cleanup
+\end{lstlisting}
+
+Then read:
+
+\begin{lstlisting}[language={},caption={Index build reading path}]
+examples/sharded_index_build.rs
+src/shard_local.rs
+src/sharded_executor.rs
+src/running_stats.rs
+\end{lstlisting}
+
+The example demonstrates several runtime mechanisms working together:
+
+\begin{enumerate}
+    \item \texttt{ShardLocal<ShardProgress>} holds per-shard progress
+          counters. Each shard task calls \texttt{with\_current\_result}
+          to update only its own slot without a shared mutex.
+    \item \texttt{runtime.map\_all} dispatches partition scanning to all
+          shards in one call, replacing the older pattern of collecting
+          join handles one at a time.
+    \item Chunked reads (256 records per \texttt{read\_exact}) replace
+          one-syscall-per-record scanning.
+    \item After all partitions complete, \texttt{RunningStatistics}
+          collects per-shard scan durations and prints mean, standard
+          deviation, CV, min, and max.
+    \item The merge phase submits pairs of sorted run files back onto
+          shards. Each merge task reads two sorted run files, merges them,
+          and writes a new run file. The round continues until one sorted
+          index remains.
+    \item Verification reads every index entry and confirms global sort
+          order and correct record offsets, but does so outside the
+          sharded runtime---it checks the externally visible result.
+\end{enumerate}
+
+The interesting runtime question is \emph{where} the work runs. Partition
+tasks run on assigned shards. Merge tasks are submitted to specific shards
+(the left input run's shard). Progress reads happen through
+\texttt{ShardLocal::map\_all}, which submits synchronous closures to every
+shard and collects owned results. At no point does a shard borrow another
+shard's progress counter.
+
+The \texttt{io\_uring} variant (\filepath{examples/sharded\_index\_build\_uring.rs})
+replaces partition reads, run writes, and merge run I/O with
+\texttt{read\_exact\_at\_uring} and \texttt{write\_all\_at\_uring} futures.
+It keeps the same \texttt{ShardLocal}, \texttt{map\_all}, and
+\texttt{RunningStatistics} shape.
+
 \section{Debugging checklist}
 
 When something behaves unexpectedly, ask these questions in order:
