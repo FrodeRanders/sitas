@@ -1,3 +1,10 @@
+//! I/O readiness interest tracking.
+//!
+//! [`ReadinessInterests`] maintains separate read and write interest sets,
+//! each backed by a deduplicated fd-to-waker mapping. When the OS reactor
+//! reports readable or writable fds, only the interested tasks are woken.
+//! Interests are removed on drop to avoid dangling fd registrations.
+
 use std::os::unix::io::RawFd;
 use std::task::Waker;
 

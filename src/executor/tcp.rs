@@ -1,3 +1,10 @@
+//! TCP server helpers built on readiness-based async I/O.
+//!
+//! Provides non-blocking accept, connect, read, write, and copy futures,
+//! plus higher-level server helpers: fixed-count, idle-timeout, stoppable,
+//! and scoped accept loops. Scoped variants propagate shutdown to handlers
+//! through task scopes.
+
 #![cfg(unix)]
 
 use std::future::Future;

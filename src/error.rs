@@ -1,3 +1,8 @@
+//! Error types returned by shard and runtime operations.
+//!
+//! [`ShardError`] is the central error type for the std-only shard runtime
+//! and the concrete services built on top of it.
+
 use std::error::Error;
 use std::fmt;
 

@@ -1,3 +1,10 @@
+//! Integration tests for the custom executor.
+//!
+//! Covers: basic task execution, `block_on` / `run_until` semantics, join
+//! handles, timers, timeouts, race, cooperative stop tokens, task scopes,
+//! readiness I/O futures, TCP accept/connect/copy/server helpers,
+//! scheduling groups, and Linux `io_uring` executor integration.
+
 use super::{
     Notify, RaceOutput, SpawnError, TaskScope, TaskScopeError, TimeoutError, block_on,
     executor_and_spawner, race, sleep, stop_pair, timeout, yield_now,

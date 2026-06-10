@@ -1,3 +1,10 @@
+//! Shard-tagged join handles and join helpers.
+//!
+//! [`ShardedJoinHandle`] wraps an executor [`JoinHandle`] with the shard
+//! ID on which the task runs. [`join_all_shards`] and
+//! [`join_all_shards_timeout`] provide shard-collection and bounded abort
+//! semantics.
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;

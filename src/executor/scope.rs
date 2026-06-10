@@ -1,3 +1,11 @@
+//! Grouped child tasks with cooperative shutdown.
+//!
+//! [`TaskScope`] owns a set of spawned tasks and a shared stop token.
+//! Dropping a scope signals stop and aborts remaining children. Explicit
+//! [`shutdown`](TaskScope::shutdown) and
+//! [`shutdown_timeout`](TaskScope::shutdown_timeout) support cooperative
+//! cancellation with bounded abort.
+
 use std::error::Error;
 use std::fmt;
 use std::future::Future;

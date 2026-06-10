@@ -1,3 +1,9 @@
+//! Readiness-based Unix I/O futures for the custom executor.
+//!
+//! Wraps non-blocking file descriptors into [`Readable`] and [`Writable`]
+//! futures, plus async read/write/accept/connect/copy helpers with optional
+//! timeout variants.
+
 #![cfg(unix)]
 
 use std::future::Future;

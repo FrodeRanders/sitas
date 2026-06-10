@@ -1,3 +1,9 @@
+//! Typed reply handles for key-value store operations.
+//!
+//! Each reply type wraps a [`Reply<T>`] for a specific KV command. They
+//! provide `wait`, `wait_timeout`, and `wait_async` methods so callers can
+//! consume results both synchronously and through the custom executor.
+
 use std::time::Duration;
 
 use crate::runtime::Reply;

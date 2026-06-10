@@ -1,3 +1,9 @@
+//! Awaitable join handles for spawned tasks.
+//!
+//! [`JoinHandle<T>`] carries the output of a spawned task. Dropping a
+//! handle aborts the underlying task. [`JoinError`] distinguishes between
+//! cancellation and panics.
+
 use std::error::Error;
 use std::fmt;
 use std::future::Future;

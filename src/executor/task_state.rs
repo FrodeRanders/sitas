@@ -1,3 +1,12 @@
+//! Task lifecycle state machine.
+//!
+//! [`TaskState`] tracks the current phase of a spawned task: waiting,
+//! queued, polling, or completed (including cancelled and panicked).
+//! Cancellation is cooperative: a polling task finishes its current poll
+//! before the cancellation takes effect. The state machine also records
+//! cumulative poll count, accumulated poll time, and key timestamps for
+//! observability snapshots.
+
 use std::time::{Duration, Instant};
 
 use super::{

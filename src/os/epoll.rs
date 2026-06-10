@@ -1,3 +1,9 @@
+//! Linux `epoll(7)` readiness backend.
+//!
+//! Maintains a persistent kernel registration set and reconciles it
+//! against the executor's current fd interests before each wait, so
+//! unchanged interests do not churn through add/delete syscalls.
+
 use std::collections::HashMap;
 use std::io;
 use std::os::raw::c_int;

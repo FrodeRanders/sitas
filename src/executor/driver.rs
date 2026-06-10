@@ -1,3 +1,11 @@
+//! OS event dispatch for the executor idle-wait path.
+//!
+//! [`DriverEvent`] unifies readiness wakeups (from `epoll`/`kqueue`/`poll`)
+//! and Linux `io_uring` completion wakeups into a single event type.
+//! `dispatch_available` applies the event: readiness events wake interested
+//! tasks and `io_uring` completions are dispatched against the thread-local
+//! ring.
+
 #[cfg(unix)]
 #[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;

@@ -1,3 +1,10 @@
+//! Central executor scheduler.
+//!
+//! [`Scheduler`] owns the task set, timer wheel, I/O interest tracker, and
+//! cumulative counters behind a single mutex. It provides the coordination
+//! point between ready-task polling, timer expiry, I/O readiness wakeups,
+//! and Linux `io_uring` completion dispatch.
+
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{Duration, Instant};

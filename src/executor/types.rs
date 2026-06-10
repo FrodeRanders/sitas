@@ -1,3 +1,6 @@
+//! Executor data types: snapshots, task identifiers, scheduling groups,
+//! I/O interest representations, and task lifecycle status.
+
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};

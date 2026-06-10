@@ -1,3 +1,11 @@
+//! Linux `io_uring` primitives, dispatcher, and futures.
+//!
+//! [`IoUring`] owns a raw ring with memory-mapped SQ/CQ and a local
+//! tracked-operation table. [`IoUringDispatcher`] adds async-facing state:
+//! wakers, buffered completions, abandoned operations, deferred owned
+//! buffers, and cumulative counters. Abandoned-operation safety keeps owned
+//! read/write buffers alive until the kernel completion is observed.
+
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;

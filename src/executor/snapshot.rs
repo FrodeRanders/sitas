@@ -1,3 +1,10 @@
+//! Executor snapshot builder.
+//!
+//! Gathers raw scheduler state (task list, counters, I/O interest counts,
+//! `io_uring` status) and assembles an owned [`ExecutorSnapshot`]. Task
+//! snapshots are filtered to live tasks, sorted by task ID, and annotated
+//! with their scheduling group name where resolvable.
+
 #[cfg(target_os = "linux")]
 use super::IoUringExecutorStatus;
 use super::counters::SchedulerCounters;

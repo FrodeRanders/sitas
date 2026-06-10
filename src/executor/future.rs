@@ -1,3 +1,10 @@
+//! General-purpose async combinators.
+//!
+//! Provides [`sleep`], [`timeout`], [`race`], and [`yield_now`] for the
+//! custom executor. These are intentionally small and dependency-free:
+//! `sleep` registers with the timer wheel, `timeout` races a future against
+//! a sleep, `race` composes two futures and drops the loser.
+
 use std::error::Error;
 use std::fmt;
 use std::future::Future;

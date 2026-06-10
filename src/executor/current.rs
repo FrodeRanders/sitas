@@ -1,3 +1,11 @@
+//! Thread-local executor and task tracking.
+//!
+//! Two thread-locals store the currently active [`Scheduler`] and [`Task`].
+//! Guard types restore the previous state on drop, enabling nested polling
+//! (e.g. `block_on` within a task) without losing the outer context. The
+//! scheduler must be entered before any task is polled and is used by
+//! [`set_current_task_waiting_for`] to record wait interest for snapshots.
+
 use std::cell::RefCell;
 use std::sync::Arc;
 

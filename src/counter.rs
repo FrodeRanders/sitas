@@ -1,3 +1,9 @@
+//! Sharded counter service.
+//!
+//! [`ShardedCounter`] is a deliberately small second service proving that
+//! the runtime primitives are reusable without forcing premature generic
+//! service abstractions. Each shard owns a private `i64` accumulator.
+
 use std::fmt;
 use std::sync::mpsc;
 use std::time::Duration;

@@ -1,3 +1,10 @@
+//! Timer wheel for the custom executor.
+//!
+//! [`TimerSet`] stores registered timers as a flat vector of deadline/waker
+//! pairs. On each tick the executor calls [`expired`](TimerSet::expired) to
+//! collect due wakers. Timers are deduplicated by their allocated ID, and
+//! dropped timers are cleaned up through the ID removal path.
+
 use std::task::Waker;
 use std::time::{Duration, Instant};
 

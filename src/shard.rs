@@ -1,3 +1,9 @@
+//! Shard identifiers and snapshot types.
+//!
+//! [`ShardId`] is a newtype index identifying a shard within a running
+//! service. [`ShardSnapshot`] is an owned point-in-time summary of one
+//! shard, used by the observability layer.
+
 /// Identifier for a shard within a running sharded service.
 ///
 /// `ShardId(0)` identifies the first shard.

@@ -1,3 +1,9 @@
+//! Cooperative synchronization primitives for the executor.
+//!
+//! [`Notify`] provides a one-shot async wake event. [`StopSource`] and
+//! [`StopToken`] implement cloneable cooperative stop signals. Both are
+//! waker-aware and integrate with the executor's idle-wait loop.
+
 use std::fmt;
 use std::future::Future;
 use std::mem;

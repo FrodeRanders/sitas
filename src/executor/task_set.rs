@@ -1,3 +1,10 @@
+//! Task storage and scheduling-group queues.
+//!
+//! [`SchedulerTaskSet`] holds all live tasks, per-group ready queues for
+//! weighted virtual runtime scheduling, spawner and task reference counts,
+//! and monotonic task ID allocation. Draining occurs when no spawners
+//! remain and all tasks have completed.
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 use std::time::Duration;

@@ -1,3 +1,10 @@
+//! CPU placement for shard executor threads.
+//!
+//! [`CpuPlacement`] controls hard CPU affinity via `sched_setaffinity` on
+//! Linux. Non-Linux platforms report unsupported placement honestly. Callers
+//! may opt into fail-fast required placement through
+//! [`ShardedExecutorConfig`].
+
 use std::fmt;
 use std::thread;
 
@@ -209,6 +216,13 @@ mod platform {
 
     pub(super) fn available_cpu_ids() -> Option<Vec<CpuId>> {
         let mut set = CpuSet::empty();
+
+        // SAFETY: `sched_getaffinity` reads the calling thread's CPU
+        // affinity mask. We pass pid=0 for the current thread,
+        // `sizeof(CpuSet)` as the mask size (matching the kernel's
+        // expectation for the raw mask buffer), and a pointer to an
+        // owned, properly-aligned `CpuSet`. The kernel only writes
+        // within the provided size.
         let result = unsafe {
             sched_getaffinity(
                 0,
@@ -238,6 +252,11 @@ mod platform {
             };
         }
 
+        // SAFETY: `sched_setaffinity` pins the calling thread to the
+        // CPUs in `set`. We pass pid=0 for the current thread,
+        // `sizeof(CpuSet)` matching the kernel's expectation, and a
+        // pointer to an immutable, initialized `CpuSet` whose lifetime
+        // covers the call.
         let result = unsafe {
             sched_setaffinity(
                 0,

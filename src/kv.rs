@@ -1,3 +1,10 @@
+//! Sharded key-value store.
+//!
+//! [`ShardedKv`] is the reference service proving the shared-nothing model.
+//! Each shard owns a private [`HashMap`] and communicates only through typed
+//! commands and owned reply values. The module exposes blocking, non-blocking
+//! enqueue, submit/wait-later, aggregate, and snapshot operations.
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::mpsc;

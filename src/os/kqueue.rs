@@ -1,3 +1,10 @@
+//! macOS / iOS `kqueue(2)` readiness backend.
+//!
+//! Maintains a persistent kernel registration set and reconciles it
+//! against the executor's current fd interests before each wait. Updates
+//! are applied as add/delete pairs on individual filters to avoid
+//! re-registering unchanged interests.
+
 use std::collections::HashMap;
 use std::io;
 use std::os::raw::{c_int, c_short, c_uint, c_void};

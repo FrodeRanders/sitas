@@ -1,3 +1,10 @@
+//! Task lifecycle and polling.
+//!
+//! [`Task`] owns a pinned future and its lifecycle state. Polling is done
+//! inside `catch_unwind` to contain panics. Cancellation, queuing, wait
+//! interest, and snapshot reporting are delegated to the inner
+//! [`TaskState`](super::task_state::TaskState).
+
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};

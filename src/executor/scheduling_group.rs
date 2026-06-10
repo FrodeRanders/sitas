@@ -1,3 +1,9 @@
+//! Scheduling groups for weighted cooperative task scheduling.
+//!
+//! Each group has a name, a share count, and its own ready queue. The
+//! executor selects the group with the lowest weighted virtual runtime and
+//! charges it with actual poll time scaled by its shares.
+
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};

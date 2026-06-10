@@ -1,3 +1,9 @@
+//! Task spawning and executor monitoring.
+//!
+//! [`Spawner`] submits futures to the executor with optional naming,
+//! scheduling group placement, and join handles. [`ExecutorObserver`]
+//! provides a weak monitoring handle that does not keep the executor alive.
+
 use std::error::Error;
 use std::fmt;
 use std::future::Future;

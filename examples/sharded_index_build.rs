@@ -3,16 +3,20 @@
 //! This is intentionally more application-like than the tiny examples. It
 //! demonstrates how sitas keeps work shard-affine, returns owned metadata, and
 //! uses explicit merge submissions instead of sharing mutable index state.
+//!
+//! Unlike earlier revisions, this version uses [`ShardLocal`] for per-shard
+//! progress counters instead of a shared `Arc<Mutex<Vec<...>>>`, and uses
+//! [`ShardedExecutor::map_all`] instead of manual handle collection.
 use sitas::{
-    CpuPlacement, ShardId, ShardedExecutor, ShardedExecutorConfig, available_cpu_ids,
-    current_executor_cpu_placement, current_executor_shard, executor::block_on,
+    CpuPlacement, RunningStatistics, ShardId, ShardLocal, ShardedExecutor, ShardedExecutorConfig,
+    available_cpu_ids, current_executor_cpu_placement, current_executor_shard, executor::block_on,
 };
 use std::cmp::Ordering;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 // The demo builds a sorted secondary index for a fixed-record data file.
 //
@@ -28,9 +32,11 @@ const DEFAULT_SEED: u64 = 0x517a_5eed;
 const PAYLOAD_SIZE: usize = 24;
 const RECORD_SIZE: usize = 8 + PAYLOAD_SIZE;
 const INDEX_ENTRY_SIZE: usize = 16;
+const READ_CHUNK_RECORDS: usize = 256;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = DemoConfig::from_args(env::args())?;
+    let overall_start = Instant::now();
 
     // Setup: create deterministic input files in the temp directory. The index
     // file starts empty; it is populated after all shard-local runs have been
@@ -47,11 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ShardedExecutorConfig::new(config.shard_count).with_cpu_placement(CpuPlacement::Sequential),
     )?;
     let shard_count = runtime.shard_count();
-    // This mutex protects demo progress reporting, not service state. The
-    // actual index-building work remains partitioned by shard and communicates
-    // through owned `ShardRun` values.
-    let progress = Arc::new(Mutex::new(vec![ShardProgress::default(); shard_count]));
-    let mut handles = Vec::with_capacity(shard_count);
+
+    // Per-shard progress is tracked through ShardLocal, not a shared mutex.
+    // Each task calls with_current_result to update only its own shard's slot.
+    let progress = ShardLocal::new(runtime.submitter(), |_| ShardProgress::default());
 
     println!("data file: {}", paths.data.display());
     println!("index file: {}", paths.index.display());
@@ -64,34 +69,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.record_count * RECORD_SIZE
     );
 
-    // Partition phase: submit one named task per shard. Each task runs on its
-    // assigned shard thread and only returns metadata for its materialized run;
-    // the sorted entries themselves stay on disk.
-    for shard_idx in 0..shard_count {
-        let partition = Partition::for_shard(shard_idx, shard_count, config.record_count);
+    // Partition phase: one task per shard via map_all. Each task runs on its
+    // assigned shard thread and returns metadata for its materialized run.
+    let partition_start = Instant::now();
+    let run_pairs = block_on(runtime.map_all(|shard_id| {
         let data_path = paths.data.clone();
-        let run_path = paths.partition_run_path(shard_idx);
-        let progress = Arc::clone(&progress);
-        // The file I/O here is ordinary blocking std I/O. That is acceptable
-        // for this demo because each shard owns a coarse partition task; a
-        // later io_uring-backed variant could replace this inner implementation
-        // without changing the shard ownership shape.
-        let handle = runtime.spawn_with_handle_named_on(
-            ShardId(shard_idx),
-            format!("index-partition-{shard_idx}"),
-            async move { build_sorted_run(data_path, run_path, partition, progress) },
-        )?;
-        handles.push(handle);
-    }
+        let run_path = paths.partition_run_path(shard_id.0);
+        let partition = Partition::for_shard(shard_id.0, shard_count, config.record_count);
+        let progress = progress.clone();
+        async move { build_sorted_run(data_path, run_path, partition, progress).await }
+    }))?;
+    let partition_elapsed = partition_start.elapsed();
 
-    print_progress("started", &runtime, &progress);
+    let mut runs: Vec<ShardRun> = run_pairs
+        .into_iter()
+        .map(|(_shard_id, run)| run)
+        .collect::<io::Result<_>>()?;
+    runs.sort_by_key(|r| r.shard_id.0);
 
-    let mut runs = Vec::with_capacity(shard_count);
-    for handle in handles {
-        let run = block_on(handle)??;
-        runs.push(run);
-        print_progress("joined partition", &runtime, &progress);
-    }
+    print_progress("partition complete", &runtime, &progress);
 
     for run in &runs {
         println!(
@@ -108,8 +104,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Merge phase: keep submitting merge tasks to shards until the run list has
     // collapsed to a single globally sorted run file.
-    runs.sort_by_key(|run| run.shard_id.0);
+
+    // Collect scan timing statistics across shards before merge consumes runs.
+    let mut scan_stats = RunningStatistics::new();
+    for run in &runs {
+        scan_stats.add_sample_duration(run.scan_elapsed);
+    }
+    println!("scan stats across {shard_count} shards: {scan_stats}");
+
+    let merge_start = Instant::now();
     let final_run = merge_runs_on_shards(&runtime, &progress, &paths.run_dir, runs)?;
+    let merge_elapsed = merge_start.elapsed();
 
     // Finalization: copy the final run into the advertised index path and
     // verify both global sort order and that every offset points back to a
@@ -123,7 +128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         final_run.entry_count * INDEX_ENTRY_SIZE,
         final_run.path.display()
     );
+    println!(
+        "timing: partition={partition_elapsed:.1?} merge={merge_elapsed:.1?} total={:.1?}",
+        overall_start.elapsed()
+    );
+    println!("verification: index file is valid and globally sorted");
 
+    drop(progress);
     runtime.stop()?;
     if config.cleanup {
         cleanup_files(&paths)?;
@@ -134,37 +145,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // Runs inside a shard executor task. This is the shard-local partition builder:
-// it scans one contiguous slice of the data file, sorts only that slice in
-// memory, and writes a local sorted run file for later merge rounds.
-fn build_sorted_run(
+// it scans one contiguous slice of the data file in chunks, sorts only that
+// slice in memory, and writes a local sorted run file for later merge rounds.
+async fn build_sorted_run(
     data_path: PathBuf,
     run_path: PathBuf,
     partition: Partition,
-    progress: Arc<Mutex<Vec<ShardProgress>>>,
+    progress: ShardLocal<ShardProgress>,
 ) -> io::Result<ShardRun> {
     let shard_id = current_executor_shard().expect("index task runs on a shard");
     let cpu_placement =
         current_executor_cpu_placement().expect("index task runs on a sharded executor");
+    let scan_start = Instant::now();
 
-    set_progress(&progress, shard_id, Phase::Scanning, 0, 0, 0);
+    set_progress(&progress, Phase::Scanning, 0, 0, 0);
 
     // Each partition is contiguous, so the shard seeks once and then performs a
-    // linear scan through its assigned records.
+    // linear scan through its assigned records in chunked reads.
     let mut data = File::open(data_path)?;
-    data.seek(SeekFrom::Start(record_offset(partition.start_record)))?;
-
     let mut entries = Vec::with_capacity(partition.record_count);
-    for record_idx in partition.start_record..partition.end_record {
-        let record = read_record(&mut data)?;
-        entries.push(IndexEntry {
-            key: record.key,
-            offset: record_offset(record_idx),
-        });
+    let mut next_record = partition.start_record;
 
-        if entries.len() % 512 == 0 || record_idx + 1 == partition.end_record {
+    while next_record < partition.end_record {
+        let chunk_records = READ_CHUNK_RECORDS.min(partition.end_record - next_record);
+        data.seek(SeekFrom::Start(record_offset(next_record)))?;
+
+        let mut buffer = vec![0u8; chunk_records * RECORD_SIZE];
+        data.read_exact(&mut buffer)?;
+
+        for (chunk_idx, record_bytes) in buffer.chunks_exact(RECORD_SIZE).enumerate() {
+            let record_idx = next_record + chunk_idx;
+            let record = record_from_bytes(record_bytes)?;
+            entries.push(IndexEntry {
+                key: record.key,
+                offset: record_offset(record_idx),
+            });
+        }
+        next_record += chunk_records;
+
+        if entries.len() % 512 == 0 || next_record == partition.end_record {
             set_progress(
                 &progress,
-                shard_id,
                 Phase::Scanning,
                 entries.len(),
                 entries.len() * RECORD_SIZE,
@@ -176,19 +197,11 @@ fn build_sorted_run(
     let bytes_read = entries.len() * RECORD_SIZE;
     let bytes_written = entries.len() * INDEX_ENTRY_SIZE;
 
-    set_progress(
-        &progress,
-        shard_id,
-        Phase::Sorting,
-        entries.len(),
-        bytes_read,
-        0,
-    );
+    set_progress(&progress, Phase::Sorting, entries.len(), bytes_read, 0);
     entries.sort_unstable();
     write_index_file(&run_path, &entries)?;
     set_progress(
         &progress,
-        shard_id,
         Phase::Sorted,
         entries.len(),
         bytes_read,
@@ -203,6 +216,7 @@ fn build_sorted_run(
         bytes_read,
         bytes_written,
         path: run_path,
+        scan_elapsed: scan_start.elapsed(),
     })
 }
 
@@ -307,7 +321,7 @@ fn verify_index_file(
 
 fn merge_runs_on_shards(
     runtime: &ShardedExecutor,
-    progress: &Arc<Mutex<Vec<ShardProgress>>>,
+    progress: &ShardLocal<ShardProgress>,
     run_dir: &Path,
     mut runs: Vec<ShardRun>,
 ) -> Result<ShardRun, Box<dyn std::error::Error>> {
@@ -336,14 +350,14 @@ fn merge_runs_on_shards(
             // on the shard that owned the left input run. That policy is simple
             // rather than load-balanced; its purpose is to keep placement
             // decisions visible while the runtime mechanics are still evolving.
-            let progress = Arc::clone(progress);
+            let progress = progress.clone();
             let handle = runtime.spawn_with_handle_named_on(
                 target_shard,
                 format!(
                     "index-merge-round-{round}-{}-{}",
                     left.shard_id.0, right.shard_id.0
                 ),
-                async move { merge_pair(left, right, output_path, progress) },
+                async move { merge_pair(left, right, output_path, progress).await },
             )?;
             handles.push(handle);
         }
@@ -365,11 +379,11 @@ fn merge_runs_on_shards(
 
 // Runs inside a shard executor task. It streams two already sorted run files
 // into a new sorted run file without loading both inputs into memory.
-fn merge_pair(
+async fn merge_pair(
     left: ShardRun,
     right: ShardRun,
     output_path: PathBuf,
-    progress: Arc<Mutex<Vec<ShardProgress>>>,
+    progress: ShardLocal<ShardProgress>,
 ) -> io::Result<ShardRun> {
     let shard_id = current_executor_shard().expect("merge task runs on a shard");
     let cpu_placement =
@@ -378,20 +392,12 @@ fn merge_pair(
     let bytes_read = total_entries * INDEX_ENTRY_SIZE;
     let bytes_written = total_entries * INDEX_ENTRY_SIZE;
 
-    set_progress(
-        &progress,
-        shard_id,
-        Phase::Merging,
-        total_entries,
-        bytes_read,
-        0,
-    );
+    set_progress(&progress, Phase::Merging, total_entries, bytes_read, 0);
 
     let entry_count = merge_run_files(&left.path, &right.path, &output_path)?;
 
     set_progress(
         &progress,
-        shard_id,
         Phase::Merged,
         entry_count,
         bytes_read,
@@ -406,6 +412,7 @@ fn merge_pair(
         bytes_read,
         bytes_written,
         path: output_path,
+        scan_elapsed: left.scan_elapsed + right.scan_elapsed,
     })
 }
 
@@ -448,19 +455,21 @@ fn merge_run_files(left_path: &Path, right_path: &Path, output_path: &Path) -> i
     Ok(count)
 }
 
-// Progress is a demo-level observability layer. It combines explicit per-shard
-// counters from this example with the runtime's own task snapshots.
-fn print_progress(
-    label: &str,
-    runtime: &ShardedExecutor,
-    progress: &Arc<Mutex<Vec<ShardProgress>>>,
-) {
+// Per-shard progress via ShardLocal. Each task calls with_current_result to
+// update only its own shard's slot. The read-back path uses map_all to
+// collect from every shard.
+fn print_progress(label: &str, runtime: &ShardedExecutor, progress: &ShardLocal<ShardProgress>) {
     let snapshot = runtime.snapshot();
-    let progress = progress.lock().expect("progress mutex poisoned");
+    let progress_values: Vec<(ShardId, ShardProgress)> =
+        block_on(progress.map_all(|_, p| *p)).unwrap_or_default();
 
     println!("{label}:");
     for shard in &snapshot.shards {
-        let progress = progress[shard.shard_id.0];
+        let progress = progress_values
+            .iter()
+            .find(|(id, _)| *id == shard.shard_id)
+            .map(|(_, p)| *p)
+            .unwrap_or_default();
         let task_count = shard
             .executor
             .as_ref()
@@ -479,26 +488,31 @@ fn print_progress(
 }
 
 fn set_progress(
-    progress: &Arc<Mutex<Vec<ShardProgress>>>,
-    shard_id: ShardId,
+    progress: &ShardLocal<ShardProgress>,
     phase: Phase,
     records: usize,
     bytes_read: usize,
     bytes_written: usize,
 ) {
-    let mut progress = progress.lock().expect("progress mutex poisoned");
-    progress[shard_id.0] = ShardProgress {
+    let updated = ShardProgress {
         phase,
         records,
         bytes_read,
         bytes_written,
     };
+    // The closure runs synchronously on the owning shard, so the borrowed
+    // local value cannot escape or cross an `.await`.
+    let _ = progress.with_current_result(|p| *p = updated);
 }
 
 fn read_record(file: &mut File) -> io::Result<Record> {
     let mut buffer = [0u8; RECORD_SIZE];
     file.read_exact(&mut buffer)?;
+    record_from_bytes(&buffer)
+}
 
+fn record_from_bytes(buffer: &[u8]) -> io::Result<Record> {
+    debug_assert_eq!(buffer.len(), RECORD_SIZE);
     let mut key = [0u8; 8];
     key.copy_from_slice(&buffer[..8]);
 
@@ -590,13 +604,9 @@ fn record_offset(record_idx: usize) -> u64 {
 
 #[derive(Debug, Clone, Copy)]
 struct DemoConfig {
-    // Number of fixed-size records to generate in the input data file.
     record_count: usize,
-    // Number of shard executor threads to start for this run.
     shard_count: usize,
-    // Deterministic seed used by the tiny local pseudo-random generator.
     seed: u64,
-    // Remove temp data, index, and run files after successful verification.
     cleanup: bool,
 }
 
@@ -724,7 +734,6 @@ impl DemoPaths {
 
 #[derive(Debug, Clone, Copy)]
 struct Partition {
-    // Half-open record range [start_record, end_record) assigned to one shard.
     start_record: usize,
     end_record: usize,
     record_count: usize,
@@ -744,23 +753,18 @@ impl Partition {
 
 #[derive(Debug)]
 struct ShardRun {
-    // The shard that produced this materialized sorted run.
     shard_id: ShardId,
     cpu_placement: sitas::CpuPlacementStatus,
-    // Original data records represented by this run. During merge rounds this
-    // is the sum of the input runs' scanned records.
     records_scanned: usize,
     entry_count: usize,
-    // Bytes read and written by the task that produced this run, not cumulative
-    // lifetime I/O across all earlier rounds.
     bytes_read: usize,
     bytes_written: usize,
     path: PathBuf,
+    scan_elapsed: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IndexEntry {
-    // Sorting by (key, offset) gives deterministic order even when keys repeat.
     key: u64,
     offset: u64,
 }
@@ -785,7 +789,7 @@ struct Record {
     payload: [u8; PAYLOAD_SIZE],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct ShardProgress {
     phase: Phase,
     records: usize,
@@ -793,19 +797,9 @@ struct ShardProgress {
     bytes_written: usize,
 }
 
-impl Default for ShardProgress {
-    fn default() -> Self {
-        Self {
-            phase: Phase::Waiting,
-            records: 0,
-            bytes_read: 0,
-            bytes_written: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 enum Phase {
+    #[default]
     Waiting,
     Scanning,
     Sorting,

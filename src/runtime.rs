@@ -1,3 +1,14 @@
+//! Standard-library shard runtime primitives.
+//!
+//! This module provides the reusable kernel for the shared-nothing service
+//! model: bounded shard mailboxes, one-shot reply handles, shard set
+//! startup, non-blocking enqueue, and shutdown support. It does not know
+//! about concrete service state or key-value commands.
+//!
+//! The reply primitive is waker-aware so blocking code can wait
+//! synchronously while executor tasks can await replies through
+//! [`ReplyFuture`] without external runtime dependencies.
+
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;

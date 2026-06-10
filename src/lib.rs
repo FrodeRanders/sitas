@@ -54,6 +54,9 @@ pub mod shard_local;
 /// Shard-per-thread async executor runtime.
 pub mod sharded_executor;
 
+/// Running statistics for streaming samples.
+pub mod running_stats;
+
 pub use counter::{
     CounterReply, CounterShardSnapshot, CounterShardSnapshotsReply, CounterTotalReply,
     ShardedCounter, ShardedCounterConfig,
@@ -67,6 +70,7 @@ pub use kv::{
     KvAllKeysReply, KvDeleteManyReply, KvGetManyReply, KvReply, KvShardSnapshotsReply,
     KvTotalLenReply, ShardedKv, ShardedKvConfig,
 };
+pub use running_stats::RunningStatistics;
 pub use runtime::{DEFAULT_MAILBOX_CAPACITY, ReplyFuture, RuntimeSnapshot};
 pub use shard::{ShardId, ShardSnapshot};
 pub use shard_local::{

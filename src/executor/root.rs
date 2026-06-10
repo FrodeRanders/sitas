@@ -1,3 +1,10 @@
+//! Root waker for `block_on` and `run_until`.
+//!
+//! [`RootWaker`] provides the waker for the root future in `block_on`.
+//! It starts ready and uses a `take_ready`/`wake` pattern: the executor
+//! spins while the root is ready or spawned tasks are pending, then waits
+//! on the OS reactor when nothing is runnable.
+
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::task::Wake;

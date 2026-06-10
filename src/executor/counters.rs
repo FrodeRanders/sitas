@@ -1,3 +1,10 @@
+//! Cumulative executor counters.
+//!
+//! [`SchedulerCounters`] accumulates task lifecycle metrics (spawned,
+//! completed, polls, budget exhaustion), driver events (readiness,
+//! completion dispatch), and Linux `io_uring` completion accounting. All
+//! counters are monotonic and reported in executor snapshots.
+
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct SchedulerCounters {
     pub(super) total_spawned_tasks: u64,

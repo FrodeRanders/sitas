@@ -31,6 +31,7 @@ if [ "$#" -eq 0 ]; then
         cargo run --example async_kv
         cargo run --example sharded_executor
         cargo run --example sharded_index_build
+        cargo run --example sharded_index_build_uring
         cargo run --example sharded_observability
         cargo run --example sharded_submit
         cargo run --example sharded_broadcast

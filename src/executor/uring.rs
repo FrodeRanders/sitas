@@ -1,3 +1,10 @@
+//! Executor integration for Linux `io_uring`.
+//!
+//! Installs a thread-local [`IoUringDispatcher`] on each executor,
+//! providing `read_at_uring`, `read_exact_at_uring`, and
+//! `write_all_at_uring` futures. Completion dispatch shares the executor's
+//! idle-wait path but is not yet unified with timers or readiness I/O.
+
 #![cfg(target_os = "linux")]
 
 use std::cell::RefCell;
