@@ -1,19 +1,56 @@
 # Sitas
 
-`sitas` is a small Rust experiment in shard-local service ownership, typed
-message passing, executor internals, and Unix runtime backends.
+`Sitas` is a pure-Rust (edition 2024), zero-dependency exploration of Seastar-like shard-per-core architecture 
+built on Rust ownership semantics. `Sitas explores what shared-nothing looks like when designed around type
+boundaries, explicit message passing, and isolated unsafe.
 
-The project is inspired by Seastar's shard-per-core, shared-nothing model, but
-this first milestone is intentionally much smaller. It does not attempt to clone
-Seastar.
+## Overview
+
+`Sitas` currently has...
+
+A stable baseline:
+- Shard-per-thread runtime with bounded mailboxes, typed Command/Reply<T> APIs, and clean startup/shutdown
+- ShardedKv and ShardedCounter as concrete reference services
+- Blocking, try_* (non-blocking send), and submit_* (reply handle) variants for all operations
+- Owned ShardSnapshot / RuntimeSnapshot observability
+
+A custom executor:
+- Single-threaded async executor (block_on, run, run_until) without requiring Send + 'static
+- Spawner, JoinHandle<T>, task lifecycle tracking, timer wheel, sleep, timeout, race
+- Cooperative primitives: StopSource/StopToken, Notify, yield_now, TaskScope
+- Scheduling groups with weighted virtual runtime
+
+Unix I/O:
+- Readiness futures (readable, writable, read_exact_async, write_all_async, copy_async)
+- Non-blocking TCP connect/accept/copy helpers
+- TCP server helpers: fixed-count, idle-timeout, stoppable, scoped variants
+- Backends: epoll (Linux), kqueue (macOS/iOS), poll (fallback)
+
+A sharded executor:
+- ShardedExecutor with one executor + OS thread per shard
+- ShardedSubmitter for cross-shard async submission
+- CPU affinity on Linux (sched_setaffinity), container cpuset-aware
+- ShardLocal<T> — per-shard owned values with no mutex, closure-based access, stoppable workers
+  
+Eperimental io_uring support (on Linux):
+- Full ring, dispatcher lifecycle, tracked operations, abandoned buffer safety, completion counting
+- Integrated for file I/O futures (read_at_uring, write_all_at_uring)
+- Not yet unified with readiness/timers into a production I/O engine
+
+## Inspiration
+
+`Sitas` is inspired by Seastar's shard-per-core, shared-nothing model, but
+`Sitas` is intentionally much smaller and not an attempt to clone Seastar.
 
 ## First Milestone
 
-The current version implements a sharded key-value store using only the Rust
-standard library:
+The current version implements a sharded key-value store as an application
+on top of the runtime, using only the Rust standard library.
+
+Going into more detail, `Sitas` is or has:
 
 - a small reusable std-only runtime layer
-- a minimal executor experiment with custom wakers, join handles, awaitable
+- an executor experiment with custom wakers, join handles, awaitable
   shard replies, cancellable spawned tasks, timers, timeouts, OS-backed
   sleeping, racing futures, and read/write-readiness futures on this branch
 - direct root-future driving without requiring the root future to be `Send` or
