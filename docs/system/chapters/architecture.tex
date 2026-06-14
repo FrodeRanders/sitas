@@ -126,16 +126,40 @@ the same shared-nothing service direction.
     \item[\texttt{kv}] The reference sharded key-value service.
     \item[\texttt{counter}] A smaller second service proving that the runtime
         primitives are not key-value-specific.
+    \item[\texttt{sharded}] A generic \texttt{ShardService} trait and
+        \texttt{Sharded<S>} runtime providing common lifecycle (start, shutdown,
+        snapshot) for user-defined shard-local services. Shutdown is automatic
+        via \texttt{stop\_command}.
     \item[\texttt{placement}] Key-to-shard routing.
+    \item[\texttt{stream\_reply}] Streaming reply channels. A
+        \texttt{StreamProducer<T>} delivers a sequence of owned values. Two
+        async patterns: \texttt{StreamBatch<'a, T>} borrows the reply for
+        \texttt{next\_batch()} loops, \texttt{StreamFuture<T>} owns the reply
+        with \texttt{collect()} and \texttt{fold()} convenience methods.
+        Senders use an atomic refcount so intermediate clone drops do not
+        prematurely close the stream.
+    \item[\texttt{async\_service}] Async wrappers bridging std-layer services
+        (\texttt{ShardedKv}, \texttt{ShardedCounter}) into the executor via
+        \texttt{submit\_* + reply.wait\_async().await}.
     \item[\texttt{os}] Unix FFI, wake pipes, readiness backends, affinity, and
-        Linux \texttt{io\_uring} experiments.
-    \item[\texttt{executor}] The single-threaded async kernel.
+        Linux \texttt{io\_uring} experiments. Readiness backends now cover
+        \texttt{epoll} (Linux), \texttt{kqueue} (macOS/iOS/FreeBSD/NetBSD/
+        OpenBSD), and \texttt{poll} (other Unix).
+    \item[\texttt{executor}] The single-threaded async kernel. Sub-modules
+        include \texttt{tcp}, \texttt{udp}, \texttt{backpressure}, and
+        Linux \texttt{io\_uring} dispatch. \texttt{Spawner::with\_backpressure}
+        integrates a counting semaphore into the spawn path.
     \item[\texttt{sharded\_executor}] One executor per shard thread, plus
         submission and observation APIs.
     \item[\texttt{shard\_local}] One owned value per executor shard with
         checked local access. Provides \texttt{with\_current},
         \texttt{with\_current\_result}, \texttt{get\_current},
         \texttt{map\_all}, and worker/scope APIs.
+    \item[\texttt{sharded\_tcp}] Network-facing sharded TCP server with
+        \texttt{SO\_REUSEPORT} on Linux and single-accept distribution on
+        other platforms.
+    \item[\texttt{metrics}] Thread-safe atomic-counter metrics collector with
+        owned \texttt{MetricsSnapshot} for observability.
 \end{description}
 
 \section{How to trace a feature through the layers}

@@ -81,11 +81,15 @@ The service exposes blocking methods, non-blocking enqueue variants, submit/wait
 
 ### `sharded`
 
-`sharded` provides a generic sharded service trait and runtime. The `ShardService` trait captures the reusable pattern: per-shard state, typed command enum, initial state factory, and process function. `Sharded<S>` provides lifecycle management (start, stop, snapshot) and raw command submission. Concrete services like `ShardedCounter` and `ShardedKv` remain available with their richer type-specific APIs; the generic layer does not replace them but provides a common infrastructure.
+`sharded` provides a generic sharded service trait and runtime. The `ShardService` trait captures the reusable pattern: per-shard state, typed command enum, initial state factory, `process` function, and a `stop_command` constructor that builds the command which causes the shard loop to exit. `Sharded<S>` provides lifecycle management (start, shutdown, snapshot) and raw command submission. Shutdown is automatic: the generic infrastructure calls `stop_command` once per shard and joins the threads. Concrete services like `ShardedCounter` and `ShardedKv` remain available with their richer type-specific APIs; the generic layer does not replace them but provides a common infrastructure.
 
 ### `stream_reply`
 
-`stream_reply` provides streaming reply channels. A `StreamProducer<T>` bridges between a shard producing multiple values and a consumer receiving them incrementally. Unlike one-shot `Reply<T>`, stream replies deliver a sequence of owned values followed by a terminal completion signal. The consumer can iterate, collect, fold, or batch-receive values.
+`stream_reply` provides streaming reply channels. A `StreamProducer<T>` bridges between a shard producing multiple values and a consumer receiving them incrementally. Unlike one-shot `Reply<T>`, stream replies deliver a sequence of owned values followed by a terminal completion signal signalled by dropping the last `StreamSender` clone.
+
+Two async consumption patterns are available. `StreamBatch<'a, T>` is a one-shot future borrowing a `StreamReply` mutably — call `reply.next_batch()` repeatedly in a `while let` loop. `StreamFuture<T>` owns the reply (via `reply.into_stream()`) and provides the same `next_batch()` loop plus convenience methods `collect()` and `fold()`.
+
+Senders use an atomic refcount so intermediate clone drops do not prematurely signal end-of-stream. The stream only closes when the last sender is dropped.
 
 ### `async_service`
 
@@ -93,7 +97,7 @@ The service exposes blocking methods, non-blocking enqueue variants, submit/wait
 
 ### `backpressure`
 
-`backpressure` provides a spawn backpressure mechanism for the async executor, living under `executor`. A `BackpressureGuard` acts as a counting semaphore: `acquire()` returns a future that resolves when capacity is available, and the permit is released when the spawned task completes. `BackpressureTask<F>` wraps a future with its permit for automatic lifecycle tracking.
+`backpressure` provides a spawn backpressure mechanism for the async executor, living under `executor`. A `BackpressureGuard` acts as a counting semaphore with an async `acquire()` future and a non-blocking `try_acquire()`. `Spawner::with_backpressure(capacity)` integrates backpressure directly into the spawn path: every `spawn` call acquires a permit, and the permit is held in the task's future for its lifetime. `AcquirePermit` uses a generation counter to clean up wakers when the future is dropped before capacity becomes available, preventing a slow memory leak in the waiters list.
 
 ### `sharded_tcp`
 
