@@ -11,6 +11,7 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -74,13 +75,15 @@ impl<T> StreamSender<T> {
 
 impl<T> Drop for StreamSender<T> {
     fn drop(&mut self) {
+        if self.shared.sender_count.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
         let waker = {
             let mut state = self
                 .shared
                 .state
                 .lock()
                 .expect("stream state mutex poisoned");
-            state.sender_alive = false;
             state.waker.take()
         };
         self.shared.ready.notify_all();
@@ -92,6 +95,7 @@ impl<T> Drop for StreamSender<T> {
 
 impl<T> Clone for StreamSender<T> {
     fn clone(&self) -> Self {
+        self.shared.sender_count.fetch_add(1, Ordering::Relaxed);
         Self {
             shared: Arc::clone(&self.shared),
         }
@@ -110,11 +114,11 @@ pub struct StreamReply<T> {
 struct StreamShared<T> {
     state: Mutex<StreamState<T>>,
     ready: Condvar,
+    sender_count: AtomicUsize,
 }
 
 struct StreamState<T> {
     values: Vec<T>,
-    sender_alive: bool,
     done: bool,
     waker: Option<Waker>,
 }
@@ -124,11 +128,11 @@ pub fn stream_channel<T>() -> (StreamSender<T>, StreamReply<T>) {
     let shared = Arc::new(StreamShared {
         state: Mutex::new(StreamState {
             values: Vec::new(),
-            sender_alive: true,
             done: false,
             waker: None,
         }),
         ready: Condvar::new(),
+        sender_count: AtomicUsize::new(1),
     });
 
     (
@@ -159,7 +163,7 @@ impl<T> StreamReply<T> {
                 return Ok(batch);
             }
 
-            if !state.sender_alive {
+            if self.shared.sender_count.load(Ordering::Acquire) == 0 {
                 state.done = true;
                 return Ok(Vec::new());
             }
@@ -198,7 +202,7 @@ impl<T> StreamReply<T> {
             return Ok(Some(batch));
         }
 
-        if !state.sender_alive {
+        if self.shared.sender_count.load(Ordering::Acquire) == 0 {
             return Ok(None);
         }
 
@@ -242,7 +246,7 @@ impl<T> StreamReply<T> {
             .state
             .lock()
             .expect("stream state mutex poisoned");
-        !state.sender_alive && self.index >= state.values.len()
+        self.shared.sender_count.load(Ordering::Acquire) == 0 && self.index >= state.values.len()
     }
 
     /// Returns a future that yields the next batch of values.
@@ -297,7 +301,6 @@ impl<T> Drop for StreamReply<T> {
             .lock()
             .expect("stream state mutex poisoned");
         state.done = true;
-        state.sender_alive = false;
         self.shared.ready.notify_all();
     }
 }
@@ -339,7 +342,9 @@ impl<T> Future for StreamBatch<'_, T> {
                     .lock()
                     .expect("stream state mutex poisoned");
 
-                if !state.sender_alive && this.reply.index >= state.values.len() {
+                if this.reply.shared.sender_count.load(Ordering::Acquire) == 0
+                    && this.reply.index >= state.values.len()
+                {
                     return Poll::Ready(Ok(None));
                 }
 
