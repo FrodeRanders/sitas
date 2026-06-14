@@ -8,7 +8,7 @@ The project is guided by a small set of invariants:
     \item Each piece of application service state is owned by one shard.
     \item Only the owning shard may mutate its service state.
     \item Application services should not be modeled as shared
-          \texttt{Arc<Mutex<Service>>} state.
+          \texttt{Arc<Mutex<Service\textgreater{}\textgreater{}} state.
     \item Cross-shard interaction happens through typed messages, typed reply
           handles, or typed submitter calls.
     \item Values crossing shard boundaries are owned.
@@ -29,8 +29,8 @@ commands. In the async runtime exploration that owner is an executor shard
 polling futures assigned to it. The form changes, but the rule is the same.
 
 This is why the project avoids turning service state into
-\texttt{Arc<Mutex<Service>>}. A mutex would make mutation mechanically safe,
-but it would hide the runtime question that the project is trying to study:
+\texttt{Arc<Mutex<Service\textgreater{}\textgreater{}}. A mutex would make mutation 
+mechanically safe, but it would hide the runtime question that the project is trying to study:
 which shard owns this state, where does work run, and when does the ownership
 boundary get crossed?
 

@@ -4,8 +4,6 @@
 
 This chapter gives concrete source-reading paths. Each walkthrough starts from
 a visible API or example and follows the mechanism down through the runtime.
-The goal is to make the code base approachable without flattening the design
-into prose only.
 
 \begin{notabene}[How to use these walkthroughs]
 Keep the source tree open while reading. The paths are intentionally explicit.
@@ -140,7 +138,7 @@ the target shard. Its owned output completes a join handle. The original task
 wakes and resumes on its original shard.
 
 While reading the submitter APIs, look for the \texttt{Send + 'static}
-boundaries. They are not incidental. They mark where work can cross threads.
+boundaries that mark where work can cross threads.
 
 \section{Walkthrough: shard-local state}
 
@@ -251,7 +249,7 @@ The example demonstrates several runtime mechanisms working together:
           index remains.
     \item Verification reads every index entry and confirms global sort
           order and correct record offsets, but does so outside the
-          sharded runtime---it checks the externally visible result.
+          sharded runtime.
 \end{enumerate}
 
 The interesting runtime question is \emph{where} the work runs. Partition

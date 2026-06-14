@@ -3,11 +3,11 @@
 \section{Purpose}
 
 \texttt{sitas} is an experimental Rust runtime and service model inspired by
-Seastar's shard-per-core architecture. It is not a direct clone. The project is
-about understanding the runtime internals: how work is owned by shards, how
-cross-shard messages move, how a small executor drives futures, and how OS
-completion and readiness mechanisms can be exposed without depending on a
-third-party async runtime.
+Seastar's shard-per-core architecture. The project is about understanding the 
+runtime internals: how work is owned by shards, how cross-shard messages 
+move, how a small executor drives futures, and how OS completion and 
+readiness mechanisms can be exposed without depending on a third-party 
+async runtime.
 
 The code base started with a standard-library-only sharded key-value store. The
 current branch extends that baseline with a custom executor, Unix readiness
@@ -17,18 +17,13 @@ support.
 
 \section{How to read this project}
 
-The easiest way to understand \texttt{sitas} is to read it from the outside
-in, then return from the inside out.
+The important idea is that application code should see typed, owned boundaries. 
+A caller asks a service or a shard to do work. The runtime decides which shard 
+owns that work. The owning shard mutates its local state and returns an owned 
+reply. This is the same mental shape as a service call, but the implementation 
+deliberately avoids hiding service state behind a global mutex.
 
-From the outside, the important idea is that application code should see
-typed, owned boundaries. A caller asks a service or a shard to do work. The
-runtime decides which shard owns that work. The owning shard mutates its local
-state and returns an owned reply. This is the same mental shape as a service
-call, but the implementation deliberately avoids hiding service state behind a
-global mutex.
-
-From the inside, the interesting question is how the runtime keeps that model
-honest:
+The interesting question is how the runtime keeps that model honest:
 
 \begin{enumerate}
     \item futures are owned by executor tasks;
@@ -102,8 +97,8 @@ that exposes cleaner runtime internals or a better teaching surface.
 \section{What this project is not}
 
 \texttt{sitas} is not trying to become a production replacement for mature
-Rust runtimes. It is also not trying to copy Seastar line by line. The point is
-to keep the mechanisms small enough that they can be inspected:
+Rust runtimes. It is also not trying to copy Seastar. The point is to keep 
+the mechanisms small enough that they can be inspected:
 
 \begin{itemize}
     \item no Tokio, async-std, Glommio, Monoio, or actor framework is used as
