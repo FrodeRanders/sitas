@@ -1,8 +1,9 @@
 //! Task spawning and executor monitoring.
 //!
 //! [`Spawner`] submits futures to the executor with optional naming,
-//! scheduling group placement, and join handles. [`ExecutorObserver`]
-//! provides a weak monitoring handle that does not keep the executor alive.
+//! scheduling group placement, join handles, and optional backpressure
+//! limiting. [`ExecutorObserver`] provides a weak monitoring handle that
+//! does not keep the executor alive.
 
 use std::error::Error;
 use std::fmt;
@@ -14,6 +15,8 @@ use super::scheduler::Scheduler;
 use super::scheduling_group::{SchedulingGroup, SchedulingGroupError};
 use super::task::Task;
 use super::{ExecutorSnapshot, JoinError, JoinHandle, PanicHandler, SchedulingGroupId};
+
+use crate::executor::backpressure::{BackpressureGuard, Permit};
 
 /// Weak observer handle for an executor.
 ///
@@ -45,6 +48,8 @@ pub enum SpawnError {
     Closed,
     /// The scheduling group belongs to a different executor.
     SchedulingGroupExecutorMismatch,
+    /// Backpressure limit reached; no spawn capacity available.
+    Backpressure,
 }
 
 impl fmt::Display for SpawnError {
@@ -54,6 +59,7 @@ impl fmt::Display for SpawnError {
             SpawnError::SchedulingGroupExecutorMismatch => {
                 write!(f, "scheduling group belongs to a different executor")
             }
+            SpawnError::Backpressure => write!(f, "spawn backpressure limit reached"),
         }
     }
 }
@@ -61,9 +67,17 @@ impl fmt::Display for SpawnError {
 impl Error for SpawnError {}
 
 /// Handle used to submit futures to an [`super::Executor`].
-#[derive(Debug)]
 pub struct Spawner {
     scheduler: Arc<Scheduler>,
+    backpressure: Option<BackpressureGuard>,
+}
+
+impl fmt::Debug for Spawner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Spawner")
+            .field("backpressure", &self.backpressure)
+            .finish()
+    }
 }
 
 impl Clone for Spawner {
@@ -72,6 +86,7 @@ impl Clone for Spawner {
 
         Self {
             scheduler: Arc::clone(&self.scheduler),
+            backpressure: self.backpressure.clone(),
         }
     }
 }
@@ -84,7 +99,27 @@ impl Drop for Spawner {
 
 impl Spawner {
     pub(super) fn new(scheduler: Arc<Scheduler>) -> Self {
-        Self { scheduler }
+        Self {
+            scheduler,
+            backpressure: None,
+        }
+    }
+
+    /// Attaches a backpressure guard to this spawner, limiting concurrent
+    /// in-flight tasks. Cloned spawners share the same guard.
+    pub fn with_backpressure(mut self, capacity: usize) -> Self {
+        self.backpressure = Some(BackpressureGuard::new(capacity));
+        self
+    }
+
+    /// Returns the current backpressure in-flight count, if configured.
+    pub fn backpressure_in_flight(&self) -> Option<usize> {
+        self.backpressure.as_ref().map(|g| g.in_flight())
+    }
+
+    /// Returns the configured backpressure capacity, if any.
+    pub fn backpressure_capacity(&self) -> Option<usize> {
+        self.backpressure.as_ref().map(|g| g.capacity())
     }
 
     /// Creates an executor-local scheduling group with a relative weight.
@@ -157,7 +192,8 @@ impl Spawner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_with_panic_handler(name, scheduling_group_id, future, None)
+        let _permit = self.acquire_backpressure()?;
+        self.spawn_inner(name, scheduling_group_id, future, _permit, None)
             .map(|_| ())
     }
 
@@ -242,13 +278,16 @@ impl Spawner {
         let shared_for_task = Arc::clone(&shared);
         let shared_for_panic = Arc::clone(&shared);
 
-        let task = self.spawn_with_panic_handler(
+        let permit = self.acquire_backpressure()?;
+
+        let task = self.spawn_inner(
             name,
             scheduling_group_id,
             async move {
                 let output = future.await;
                 complete_join(&shared_for_task, Ok(output));
             },
+            permit,
             Some(Box::new(move |payload| {
                 complete_join(&shared_for_panic, Err(JoinError::Panic(payload)));
             })),
@@ -257,22 +296,39 @@ impl Spawner {
         Ok(JoinHandle::new(shared, task))
     }
 
-    fn spawn_with_panic_handler<F>(
+    fn acquire_backpressure(&self) -> Result<Option<Permit>, SpawnError> {
+        match &self.backpressure {
+            Some(guard) => guard
+                .try_acquire()
+                .map(Some)
+                .ok_or(SpawnError::Backpressure),
+            None => Ok(None),
+        }
+    }
+
+    fn spawn_inner<F>(
         &self,
         name: Option<String>,
         scheduling_group_id: SchedulingGroupId,
         future: F,
+        permit: Option<Permit>,
         panic_handler: Option<PanicHandler>,
     ) -> Result<Arc<Task>, SpawnError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let id = self.scheduler.allocate_task_id();
+        let wrapped = async move {
+            // Hold the permit for the task's lifetime by moving it into the
+            // async block. It is dropped when the task completes or is cancelled.
+            let _permit = permit;
+            future.await;
+        };
         let task = Arc::new(Task::new_in_group(
             id,
             name,
             scheduling_group_id,
-            Box::pin(future),
+            Box::pin(wrapped),
             Arc::clone(&self.scheduler),
             panic_handler,
         ));

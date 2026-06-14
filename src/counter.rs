@@ -480,7 +480,7 @@ impl Drop for ShardedCounter {
     }
 }
 
-fn run_counter_shard(receiver: mpsc::Receiver<CounterCommand>) {
+fn run_counter_shard(_shard_id: crate::ShardId, receiver: mpsc::Receiver<CounterCommand>) {
     let mut service = CounterService::default();
 
     loop {

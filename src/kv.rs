@@ -1,7 +1,7 @@
 //! Sharded key-value store.
 //!
 //! [`ShardedKv`] is the reference service proving the shared-nothing model.
-//! Each shard owns a private [`HashMap`] and communicates only through typed
+//! Each shard owns a private [`std::collections::HashMap`] and communicates only through typed
 //! commands and owned reply values. The module exposes blocking, non-blocking
 //! enqueue, submit/wait-later, aggregate, and snapshot operations.
 
@@ -974,7 +974,7 @@ impl<P> Drop for ShardedKv<P> {
     }
 }
 
-fn run_kv_shard(receiver: mpsc::Receiver<KvCommand>) {
+fn run_kv_shard(_shard_id: crate::ShardId, receiver: mpsc::Receiver<KvCommand>) {
     let mut service = KvService::new();
 
     loop {

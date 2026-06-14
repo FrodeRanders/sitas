@@ -1,8 +1,8 @@
 //! Key-to-shard placement strategies.
 //!
-//! The [`Placement`] trait lets callers provide custom routing from keys
-//! to shards. [`HashPlacement`] is the default strategy, using the
-//! standard library's hasher. The free function [`shard_for_hash`] provides
+//! The [`crate::placement::Placement`] trait lets callers provide custom routing from keys
+//! to shards. [`crate::placement::HashPlacement`] is the default strategy, using the
+//! standard library's hasher. The free function [`crate::placement::shard_for_hash`] provides
 //! the same hash-based mapping without the trait.
 
 use std::collections::hash_map::DefaultHasher;

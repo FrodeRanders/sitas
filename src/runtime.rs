@@ -186,7 +186,12 @@ impl<T> fmt::Debug for Reply<T> {
     }
 }
 
-pub(crate) struct ReplySender<T> {
+/// The sending side of a one-shot reply channel.
+///
+/// Created together with a [`Reply`] by the channel constructor. The sender
+/// is moved into the shard thread's command and used to send the response
+/// back to the waiting caller.
+pub struct ReplySender<T> {
     shared: Arc<ReplyShared<T>>,
 }
 
@@ -379,14 +384,14 @@ impl<H> ShardSet<H> {
     where
         C: Send + 'static,
         BuildHandle: FnMut(usize, ShardMailbox<C>) -> H,
-        RunShard: Fn(mpsc::Receiver<C>) + Copy + Send + 'static,
+        RunShard: Fn(ShardId, mpsc::Receiver<C>) + Copy + Send + 'static,
     {
         let mut handles = Vec::with_capacity(shard_count);
         let mut joins = Vec::with_capacity(shard_count);
 
         for shard_idx in 0..shard_count {
             let (mailbox, receiver) = bounded_mailbox(mailbox_capacity);
-            let join = thread::spawn(move || run_shard(receiver));
+            let join = thread::spawn(move || run_shard(ShardId(shard_idx), receiver));
 
             handles.push(build_handle(shard_idx, mailbox));
             joins.push(join);

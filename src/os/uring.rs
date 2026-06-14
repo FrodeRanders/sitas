@@ -34,6 +34,18 @@ const IORING_OP_TIMEOUT: u8 = 11;
 const IORING_OP_ASYNC_CANCEL: u8 = 14;
 const IORING_OP_READ: u8 = 22;
 const IORING_OP_WRITE: u8 = 23;
+#[allow(dead_code)]
+const IORING_OP_ACCEPT: u8 = 13;
+#[allow(dead_code)]
+const IORING_OP_CONNECT: u8 = 17;
+#[allow(dead_code)]
+const IORING_OP_SEND: u8 = 8;
+#[allow(dead_code)]
+const IORING_OP_RECV: u8 = 9;
+#[allow(dead_code)]
+const IORING_OP_SENDMSG: u8 = 10;
+#[allow(dead_code)]
+const IORING_OP_RECVMSG: u8 = 12;
 const SQE_SIZE: usize = 64;
 const SQE_FD_OFFSET: usize = 4;
 const SQE_OFF_OFFSET: usize = 8;
@@ -1653,6 +1665,14 @@ pub enum IoUringOperationKind {
     Read,
     /// Write operation.
     Write,
+    /// Accept operation.
+    Accept,
+    /// Connect operation.
+    Connect,
+    /// Send operation.
+    Send,
+    /// Receive operation.
+    Recv,
     /// Relative timeout operation.
     Timeout,
     /// Cancellation request for another tracked operation.
@@ -1668,6 +1688,10 @@ impl fmt::Debug for IoUringOperationKind {
             Self::Nop => f.write_str("Nop"),
             Self::Read => f.write_str("Read"),
             Self::Write => f.write_str("Write"),
+            Self::Accept => f.write_str("Accept"),
+            Self::Connect => f.write_str("Connect"),
+            Self::Send => f.write_str("Send"),
+            Self::Recv => f.write_str("Recv"),
             Self::Timeout => f.write_str("Timeout"),
             Self::Cancel { target } => write!(f, "Cancel {{ target: {target} }}"),
         }
@@ -1684,6 +1708,14 @@ pub struct IoUringOperationKindCounts {
     pub reads: usize,
     /// Number of tracked write operations.
     pub writes: usize,
+    /// Number of tracked accept operations.
+    pub accepts: usize,
+    /// Number of tracked connect operations.
+    pub connects: usize,
+    /// Number of tracked send operations.
+    pub sends: usize,
+    /// Number of tracked recv operations.
+    pub recvs: usize,
     /// Number of tracked timeout operations.
     pub timeouts: usize,
     /// Number of tracked cancellation operations.
@@ -1693,7 +1725,15 @@ pub struct IoUringOperationKindCounts {
 impl IoUringOperationKindCounts {
     /// Returns the sum of all operation-kind counts.
     pub fn total(&self) -> usize {
-        self.nops + self.reads + self.writes + self.timeouts + self.cancellations
+        self.nops
+            + self.reads
+            + self.writes
+            + self.accepts
+            + self.connects
+            + self.sends
+            + self.recvs
+            + self.timeouts
+            + self.cancellations
     }
 
     /// Returns whether all operation-kind counts are zero.
@@ -1706,6 +1746,10 @@ impl IoUringOperationKindCounts {
             IoUringOperationKind::Nop => self.nops += 1,
             IoUringOperationKind::Read => self.reads += 1,
             IoUringOperationKind::Write => self.writes += 1,
+            IoUringOperationKind::Accept => self.accepts += 1,
+            IoUringOperationKind::Connect => self.connects += 1,
+            IoUringOperationKind::Send => self.sends += 1,
+            IoUringOperationKind::Recv => self.recvs += 1,
             IoUringOperationKind::Timeout => self.timeouts += 1,
             IoUringOperationKind::Cancel { .. } => self.cancellations += 1,
         }

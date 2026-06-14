@@ -79,6 +79,34 @@ The service exposes blocking methods, non-blocking enqueue variants, submit/wait
 
 `ShardedCounter` is the deliberately small second service. It proves that the runtime primitives are not key-value-specific without forcing premature generic service abstractions.
 
+### `sharded`
+
+`sharded` provides a generic sharded service trait and runtime. The `ShardService` trait captures the reusable pattern: per-shard state, typed command enum, initial state factory, and process function. `Sharded<S>` provides lifecycle management (start, stop, snapshot) and raw command submission. Concrete services like `ShardedCounter` and `ShardedKv` remain available with their richer type-specific APIs; the generic layer does not replace them but provides a common infrastructure.
+
+### `stream_reply`
+
+`stream_reply` provides streaming reply channels. A `StreamProducer<T>` bridges between a shard producing multiple values and a consumer receiving them incrementally. Unlike one-shot `Reply<T>`, stream replies deliver a sequence of owned values followed by a terminal completion signal. The consumer can iterate, collect, fold, or batch-receive values.
+
+### `async_service`
+
+`async_service` bridges std-layer sharded services and the async executor. `AsyncShardedKv` wraps a `ShardedKv` reference and provides async methods that call `submit_*` followed by `reply.wait_async().await`. `AsyncShardedCounter` does the same for `ShardedCounter`. `OwnedAsyncShardedKv` manages lifecycle for owned kv stores used from async contexts.
+
+### `backpressure`
+
+`backpressure` provides a spawn backpressure mechanism for the async executor, living under `executor`. A `BackpressureGuard` acts as a counting semaphore: `acquire()` returns a future that resolves when capacity is available, and the permit is released when the spawned task completes. `BackpressureTask<F>` wraps a future with its permit for automatic lifecycle tracking.
+
+### `sharded_tcp`
+
+`sharded_tcp` integrates TCP helpers with the shard-per-thread model. `ShardedTcpServer` binds a listening socket and spawns one accept-loop task per shard. On Linux with `SO_REUSEPORT`, the kernel distributes connections across shards. On other platforms, a single accept shard distributes connections via the `ShardedSubmitter`. Connection handlers receive the TCP stream and a submitter clone for spawning work on their shard.
+
+### `udp`
+
+`udp` provides a non-blocking UDP socket using direct Unix FFI (following the same pattern as `os`). It supports `bind`, `recv_from`, and `send_to` for datagram communication. Located under `executor` alongside `tcp`, it is designed for readiness-based integration with the custom executor.
+
+### `metrics`
+
+`metrics` provides a thread-safe metrics collector using atomic counters. `RuntimeMetrics` accumulates counters for task lifecycle, I/O operations, network connections, shard commands/replies, executor polls/wakeups, and `io_uring` submissions. `MetricsSnapshot` is an owned point-in-time snapshot suitable for observability without live borrows.
+
 ### `placement`
 
 `placement` defines routing from keys to shards. The default strategy is hash-based. The goal is to make placement explicit and replaceable, not to provide production-grade consistent hashing yet.
@@ -547,14 +575,22 @@ The current architecture does not yet aim to provide:
 - distributed clustering;
 - procedural macro service generation;
 - production-grade unified `io_uring`/timer/readiness integration for the
-  sharded executor;
-- broader BSD `kqueue` support beyond macOS/iOS;
+  sharded executor (experimental integration exists but is staged, not unified);
 - generic load balancing;
 - production-grade Seastar-like scheduling/resource classes;
 - a stable public runtime API;
 - replacing the custom runtime path with Tokio, Glommio, Monoio, or another external runtime.
 
 CPU placement exists as an experimental Linux-supported runtime request. Portable production CPU placement and richer scheduling policy remain future work.
+
+Removed from non-goals (now implemented):
+- broader BSD `kqueue` support beyond macOS/iOS (NetBSD/FreeBSD/OpenBSD `kqueue` now supported);
+- generic `Sharded<T>` abstraction (evaluated and provided as opt-in generic infrastructure);
+- streaming/chunked responses (stream reply channels available);
+- async spawn backpressure (backpressure guard available);
+- network-facing sharded TCP service (sharded TCP server available);
+- UDP support (UDP socket module available);
+- runtime metrics collection (metrics module with atomic counters available).
 
 ## 12. Roadmap
 
@@ -574,17 +610,26 @@ CPU placement exists as an experimental Linux-supported runtime request. Portabl
 4. Clarify the boundary between blocking std services and executor-backed services.
 5. Add better platform-gated validation for Linux-only features.
 
+### Recently completed
+
+- Generic `Sharded<T>` trait and `Sharded<S>` runtime infrastructure (opt-in, not replacing concrete services).
+- Streaming reply channels (`StreamReply<T>`, `StreamSender<T>`, `StreamProducer<T>`).
+- Async-std bridge (`AsyncShardedKv`, `OwnedAsyncShardedKv`, `AsyncShardedCounter`).
+- Spawn backpressure mechanism (`BackpressureGuard`, `Permit`, `BackpressureTask`).
+- Network-facing sharded TCP server (`ShardedTcpServer` with `SO_REUSEPORT` on Linux).
+- UDP socket module with direct Unix FFI (`UdpSocket`).
+- Runtime metrics collection (`RuntimeMetrics`, `MetricsSnapshot`).
+- Extended `io_uring` opcode coverage (accept, connect, send, recv stubs).
+- BSD `kqueue` support for NetBSD/FreeBSD/OpenBSD.
+
 ### Longer term
 
-1. Evaluate whether a generic `Sharded<T>` abstraction is useful or whether typed service generation is better.
-2. Explore procedural macros for generating command enums, client stubs, routing, and reply plumbing from service traits.
-3. Unify executor `io_uring` waits with timers and readiness into a single
+1. Explore procedural macros for generating command enums, client stubs, routing, and reply plumbing from service traits.
+2. Unify executor `io_uring` waits with timers and readiness into a single
    deadline-aware wait path instead of the current priority-based integration.
-4. Generalize the `kqueue` backend beyond macOS/iOS where the platform ABI is
-   known.
-5. Extend scheduling/resource classes beyond the current minimal weighted
+3. Extend scheduling/resource classes beyond the current minimal weighted
    cooperative groups only after the executor and service semantics are stable.
-6. Explore network-facing sharded services with explicit key routing.
+4. Explore network-facing sharded services with explicit key routing.
 
 ## 13. Design stance
 

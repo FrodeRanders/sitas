@@ -16,6 +16,7 @@ use std::task::{Context, Poll, Waker};
 #[cfg(unix)]
 use crate::os::OsReactor;
 
+mod backpressure;
 mod counters;
 mod current;
 mod driver;
@@ -38,10 +39,13 @@ mod tcp;
 mod timer;
 mod types;
 #[cfg(unix)]
+mod udp;
+#[cfg(unix)]
 mod unix_io;
 #[cfg(target_os = "linux")]
 mod uring;
 
+pub use backpressure::{BackpressureGuard, BackpressureTask, Permit};
 use current::enter_scheduler;
 pub use future::{
     Race, RaceOutput, Sleep, Timeout, TimeoutError, YieldNow, race, sleep, timeout, yield_now,
@@ -69,6 +73,8 @@ pub use types::{
     DEFAULT_SCHEDULING_GROUP_ID, DEFAULT_SCHEDULING_GROUP_SHARES, ExecutorSnapshot,
     SchedulingGroupId, SchedulingGroupSnapshot, TaskId, TaskSnapshot, TaskStatus, TaskWait,
 };
+#[cfg(unix)]
+pub use udp::{UdpSocket, udp_pair};
 #[cfg(unix)]
 pub use unix_io::{
     Readable, Writable, accept_async, accept_timeout_async, connect_async, connect_timeout_async,

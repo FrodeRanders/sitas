@@ -15,23 +15,29 @@
 //! The crate now contains three layers:
 //!
 //! 1. **Baseline std-only sharded services** (`runtime`, `kv`, `counter`,
-//!    `placement`): bounded mailboxes, typed command/reply APIs, blocking and
-//!    submit/wait-later handles, owned snapshots, clean startup/shutdown.
+//!    `placement`, `sharded`): bounded mailboxes, typed command/reply APIs,
+//!    blocking and submit/wait-later handles, owned snapshots, clean
+//!    startup/shutdown, streaming replies, and a generic sharded service trait.
 //!
 //! 2. **Custom single-threaded async executor** (`executor`, `os`): pinned
 //!    futures, ready-queue scheduling, timers, timeouts, cooperative stop
 //!    tokens, task scopes, join handles, scheduling groups, Unix readiness I/O
-//!    (`epoll`/`kqueue`/`poll`), TCP accept/connect/copy helpers, and
-//!    experimental Linux `io_uring` file-I/O futures.
+//!    (`epoll`/`kqueue`/`poll`), TCP accept/connect/copy helpers, UDP socket
+//!    support, and experimental Linux `io_uring` file-I/O futures with
+//!    extended opcode support.
 //!
 //! 3. **Shard-per-thread async runtime** (`sharded_executor`, `shard_local`):
 //!    one executor thread per shard, cross-shard submission via
 //!    `ShardedSubmitter`, shard-local state via `ShardLocal<T>`, CPU placement,
-//!    sharded scheduling groups, and snapshot-based observability.
+//!    backpressure-aware spawning, sharded TCP server, sharded scheduling
+//!    groups, async-std bridge, and snapshot-based observability with metrics
+//!    collection.
 
 #![warn(missing_docs)]
 #![warn(unsafe_op_in_unsafe_fn)]
 
+/// Async-std service bridge adapters.
+pub mod async_service;
 /// Sharded counter service implementation.
 pub mod counter;
 /// Error types returned by shard operations.
@@ -40,6 +46,8 @@ pub mod error;
 pub mod executor;
 /// Sharded key-value store implementation.
 pub mod kv;
+/// Runtime metrics collection.
+pub mod metrics;
 /// Unix runtime backend experiments.
 #[cfg(unix)]
 pub mod os;
@@ -51,25 +59,34 @@ pub mod runtime;
 pub mod shard;
 /// Shard-local async state helpers.
 pub mod shard_local;
+/// Generic sharded service trait and runtime.
+pub mod sharded;
 /// Shard-per-thread async executor runtime.
 pub mod sharded_executor;
+/// Network-facing sharded TCP server.
+pub mod sharded_tcp;
+/// Streaming reply channels for sharded services.
+pub mod stream_reply;
 
 /// Running statistics for streaming samples.
 pub mod running_stats;
 
+pub use async_service::{AsyncShardedCounter, AsyncShardedKv, OwnedAsyncShardedKv};
 pub use counter::{
     CounterReply, CounterShardSnapshot, CounterShardSnapshotsReply, CounterTotalReply,
     ShardedCounter, ShardedCounterConfig,
 };
 pub use error::ShardError;
 pub use executor::{
-    ExecutorObserver, ExecutorSnapshot, SchedulingGroup, SchedulingGroupError, SchedulingGroupId,
-    SchedulingGroupSnapshot, TaskId, TaskSnapshot, TaskStatus, TaskWait,
+    BackpressureGuard, BackpressureTask, ExecutorObserver, ExecutorSnapshot, Permit,
+    SchedulingGroup, SchedulingGroupError, SchedulingGroupId, SchedulingGroupSnapshot, TaskId,
+    TaskSnapshot, TaskStatus, TaskWait,
 };
 pub use kv::{
     KvAllKeysReply, KvDeleteManyReply, KvGetManyReply, KvReply, KvShardSnapshotsReply,
     KvTotalLenReply, ShardedKv, ShardedKvConfig,
 };
+pub use metrics::{MetricsSnapshot, RuntimeMetrics};
 pub use running_stats::RunningStatistics;
 pub use runtime::{DEFAULT_MAILBOX_CAPACITY, ReplyFuture, RuntimeSnapshot};
 pub use shard::{ShardId, ShardSnapshot};
@@ -77,6 +94,7 @@ pub use shard_local::{
     ShardLocal, ShardLocalAccessError, ShardLocalWorkerTimeoutError, ShardLocalWorkers,
     StoppableShardLocalWorkers,
 };
+pub use sharded::{ShardService, Sharded, ShardedConfig};
 pub use sharded_executor::{
     CpuId, CpuPlacement, CpuPlacementStatus, ShardedExecutor, ShardedExecutorConfig,
     ShardedExecutorObserver, ShardedExecutorShardSnapshot, ShardedExecutorSnapshot,
@@ -84,4 +102,8 @@ pub use sharded_executor::{
     ShardedSchedulingGroup, ShardedSchedulingGroupError, ShardedSpawnError, ShardedSubmitter,
     available_cpu_ids, available_parallelism, current_executor_cpu_placement,
     current_executor_shard, join_all_shards, join_all_shards_timeout,
+};
+pub use sharded_tcp::{ShardedTcpConfig, ShardedTcpConnection, ShardedTcpServer};
+pub use stream_reply::{
+    StreamError, StreamFuture, StreamProducer, StreamReply, StreamSender, stream_channel,
 };

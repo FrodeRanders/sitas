@@ -3,7 +3,7 @@
 //! This module is the first step outside the pure standard-library runtime.
 //! It uses direct Unix FFI for a small reactor wake primitive and descriptor
 //! readiness waiting. A non-blocking pipe provides the wake source. Linux uses
-//! `epoll(7)`, macOS/iOS uses `kqueue(2)`, and other Unix targets currently
+//! `epoll(7)`, macOS/iOS/FreeBSD/NetBSD/OpenBSD use `kqueue(2)`, and other
 //! use `poll(2)`.
 
 use std::fmt;
@@ -11,7 +11,13 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, TcpStream};
 #[cfg(all(
     not(target_os = "linux"),
-    not(any(target_os = "macos", target_os = "ios"))
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
 ))]
 use std::os::raw::c_short;
 use std::os::raw::{c_int, c_void};
@@ -21,7 +27,13 @@ use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 mod epoll;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 mod kqueue;
 #[cfg(target_os = "linux")]
 mod uring;
@@ -79,19 +91,37 @@ pub fn report_io_uring_unavailable() {
 
 #[cfg(all(
     not(target_os = "linux"),
-    not(any(target_os = "macos", target_os = "ios"))
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
 ))]
 type Nfds = u32;
 type SockLen = u32;
 
 #[cfg(all(
     not(target_os = "linux"),
-    not(any(target_os = "macos", target_os = "ios"))
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
 ))]
 const POLLIN: c_short = 0x0001;
 #[cfg(all(
     not(target_os = "linux"),
-    not(any(target_os = "macos", target_os = "ios"))
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
 ))]
 const POLLOUT: c_short = 0x0004;
 const F_GETFL: c_int = 3;
@@ -119,7 +149,13 @@ const EWOULDBLOCK: c_int = 35;
 
 #[cfg(all(
     not(target_os = "linux"),
-    not(any(target_os = "macos", target_os = "ios"))
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
 ))]
 #[repr(C)]
 struct PollFd {
@@ -180,7 +216,13 @@ struct SockAddrIn {
 
 #[cfg(all(
     not(target_os = "linux"),
-    not(any(target_os = "macos", target_os = "ios"))
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
 ))]
 impl PollFd {
     fn readable(fd: RawFd) -> Self {
@@ -207,7 +249,13 @@ unsafe extern "C" {
     fn pipe(fds: *mut c_int) -> c_int;
     #[cfg(all(
         not(target_os = "linux"),
-        not(any(target_os = "macos", target_os = "ios"))
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))
     ))]
     fn poll(fds: *mut PollFd, nfds: Nfds, timeout: c_int) -> c_int;
     fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
@@ -220,7 +268,13 @@ unsafe extern "C" {
     fn __errno_location() -> *mut c_int;
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 unsafe extern "C" {
     fn __error() -> *mut c_int;
 }
@@ -234,7 +288,13 @@ pub struct OsReactor {
     write_fd: Arc<OwnedFd>,
     #[cfg(target_os = "linux")]
     epoll: epoll::EpollBackend,
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
     kqueue: kqueue::KqueueBackend,
 }
 
@@ -244,7 +304,13 @@ impl OsReactor {
         let (read_fd, write_fd) = create_pipe()?;
         #[cfg(target_os = "linux")]
         let epoll = epoll::EpollBackend::new(read_fd.raw())?;
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
         let kqueue = kqueue::KqueueBackend::new(read_fd.raw())?;
 
         Ok(Self {
@@ -252,7 +318,13 @@ impl OsReactor {
             write_fd: Arc::new(write_fd),
             #[cfg(target_os = "linux")]
             epoll,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
             kqueue,
         })
     }
@@ -311,7 +383,13 @@ impl OsReactor {
             .wait_io(read_fds, write_fds, timeout, || self.drain_wakes())
     }
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
     fn wait_io_backend(
         &self,
         read_fds: &[RawFd],
@@ -324,7 +402,13 @@ impl OsReactor {
 
     #[cfg(all(
         not(target_os = "linux"),
-        not(any(target_os = "macos", target_os = "ios"))
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))
     ))]
     fn wait_io_backend(
         &self,
@@ -685,7 +769,13 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     target_os = "linux",
     all(
         not(target_os = "linux"),
-        not(any(target_os = "macos", target_os = "ios"))
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))
     )
 ))]
 fn timeout_to_wait_ms(timeout: Option<Duration>) -> c_int {
@@ -728,7 +818,13 @@ fn errno() -> c_int {
     unsafe { *__errno_location() }
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 fn errno() -> c_int {
     // SAFETY: libc exposes a thread-local errno pointer on Apple platforms.
     unsafe { *__error() }
@@ -961,7 +1057,13 @@ mod tests {
         target_os = "linux",
         all(
             not(target_os = "linux"),
-            not(any(target_os = "macos", target_os = "ios"))
+            not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))
         )
     ))]
     #[test]
