@@ -226,11 +226,13 @@ impl UdpSocket {
             }
         }
 
-        // SAFETY: `fd` is a valid, open socket descriptor from `socket()` above.
-        // Ownership is transferred to the `OwnedFd`, which will call `close()`
-        // on drop. No other code holds a reference to this fd.
-        let fd_owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: `fd` is a valid, open, bound socket descriptor.
+        // Ownership is transferred to `OwnedFd` below. The raw `fd`
+        // value is only used for `getsockname` before any drop can close it.
         let local_addr = get_sock_name(fd, addr)?;
+        // SAFETY: `fd` is a valid, open socket descriptor. Ownership is
+        // transferred to the `OwnedFd`, which will call `close()` on drop.
+        let fd_owned = unsafe { OwnedFd::from_raw_fd(fd) };
 
         Ok(Self {
             fd: fd_owned,
@@ -324,8 +326,11 @@ impl UdpSocket {
 
 /// Creates a UDP socket pair for testing and local communication.
 pub fn udp_pair() -> io::Result<(UdpSocket, UdpSocket)> {
-    let a = UdpSocket::bind("127.0.0.1:0".parse().unwrap())?;
-    let b = UdpSocket::bind("127.0.0.1:0".parse().unwrap())?;
+    let addr: SocketAddr = "127.0.0.1:0"
+        .parse()
+        .expect("hardcoded localhost address is valid");
+    let a = UdpSocket::bind(addr)?;
+    let b = UdpSocket::bind(addr)?;
     Ok((a, b))
 }
 
