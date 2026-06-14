@@ -38,7 +38,8 @@ pub struct BackpressureGuard {
 struct BackpressureInner {
     capacity: usize,
     in_flight: AtomicUsize,
-    waiters: Mutex<Vec<Waker>>,
+    waiters: Mutex<Vec<(usize, Waker)>>,
+    next_wait_id: AtomicUsize,
 }
 
 impl fmt::Debug for BackpressureInner {
@@ -65,6 +66,7 @@ impl BackpressureGuard {
                 capacity,
                 in_flight: AtomicUsize::new(0),
                 waiters: Mutex::new(Vec::new()),
+                next_wait_id: AtomicUsize::new(0),
             }),
         }
     }
@@ -112,6 +114,7 @@ impl BackpressureGuard {
         AcquirePermit {
             inner: Arc::clone(&self.inner),
             registered: false,
+            wait_id: self.inner.next_wait_id.fetch_add(1, Ordering::Relaxed),
         }
     }
 }
@@ -160,7 +163,11 @@ impl Drop for Permit {
                 .waiters
                 .lock()
                 .expect("backpressure waiters poisoned");
-            std::mem::take(&mut *waiters)
+            let taken: Vec<(usize, Waker)> = std::mem::take(&mut *waiters);
+            taken
+                .into_iter()
+                .map(|(_, waker)| waker)
+                .collect::<Vec<_>>()
         };
         for waker in wakers {
             waker.wake();
@@ -173,6 +180,7 @@ impl Drop for Permit {
 pub struct AcquirePermit {
     inner: Arc<BackpressureInner>,
     registered: bool,
+    wait_id: usize,
 }
 
 impl fmt::Debug for AcquirePermit {
@@ -211,7 +219,7 @@ impl Future for AcquirePermit {
             self.registered = true;
             let inner = Arc::clone(&self.inner);
             let mut waiters = inner.waiters.lock().expect("backpressure waiters poisoned");
-            waiters.push(context.waker().clone());
+            waiters.push((self.wait_id, context.waker().clone()));
         }
 
         Poll::Pending
@@ -221,57 +229,13 @@ impl Future for AcquirePermit {
 impl Drop for AcquirePermit {
     fn drop(&mut self) {
         if self.registered {
-            // Waker may remain in list; waking a dropped future is a no-op.
+            let mut waiters = self
+                .inner
+                .waiters
+                .lock()
+                .expect("backpressure waiters poisoned");
+            waiters.retain(|(id, _)| *id != self.wait_id);
         }
-    }
-}
-
-/// A spawned task wrapper that manages backpressure lifecycle.
-///
-/// When a task is spawned through a backpressure-aware spawner, the
-/// [`BackpressureTask`] holds the permit for the task's lifetime. When the
-/// task completes or is dropped, the permit is released.
-#[derive(Debug)]
-pub struct BackpressureTask<F> {
-    future: F,
-    _permit: Permit,
-}
-
-impl<F> BackpressureTask<F> {
-    /// Creates a new backpressure task, consuming the permit.
-    pub fn new(future: F, permit: Permit) -> Self {
-        Self {
-            future,
-            _permit: permit,
-        }
-    }
-
-    /// Returns a reference to the inner future.
-    pub fn inner(&self) -> &F {
-        &self.future
-    }
-
-    /// Returns a mutable reference to the inner future.
-    pub fn inner_mut(&mut self) -> &mut F {
-        &mut self.future
-    }
-
-    /// Consumes this wrapper and returns the inner future.
-    /// The permit is released immediately.
-    pub fn into_inner(self) -> F {
-        // Permit is dropped here, releasing capacity.
-        self.future
-    }
-}
-
-impl<F: Future> Future for BackpressureTask<F> {
-    type Output = F::Output;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        // Safety: we only project to the future field, the permit is pinned but never moved.
-        let this = unsafe { self.get_unchecked_mut() };
-        // Safety: the future is pinned through Box::pin when spawned by the executor.
-        unsafe { Pin::new_unchecked(&mut this.future) }.poll(context)
     }
 }
 
@@ -324,17 +288,19 @@ mod tests {
     }
 
     #[test]
-    fn backpressure_task_holds_permit() {
-        let guard = BackpressureGuard::new(1);
-        let permit = guard.try_acquire().unwrap();
-        assert!(guard.try_acquire().is_none());
+    fn spawner_with_backpressure_limits_concurrent_tasks() {
+        use super::super::executor_and_spawner;
 
-        let task = BackpressureTask::new(async { 42 }, permit);
-        assert!(guard.try_acquire().is_none());
+        let (_executor, spawner) = executor_and_spawner();
+        let spawner = spawner.with_backpressure(1);
 
-        drop(task);
-        let _permit = guard.try_acquire().unwrap();
-        assert_eq!(guard.in_flight(), 1);
+        // First spawn succeeds, consuming the only permit.
+        spawner.spawn(async {}).unwrap();
+        // Second spawn fails because backpressure limit is reached.
+        assert_eq!(
+            spawner.spawn(async {}),
+            Err(super::super::SpawnError::Backpressure)
+        );
     }
 
     #[test]

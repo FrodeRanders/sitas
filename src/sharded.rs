@@ -73,6 +73,13 @@ pub trait ShardService: Sized {
     /// Return `true` to continue the shard event loop, or `false` to exit
     /// (e.g., when a stop command is received).
     fn process(state: &mut Self::State, command: Self::Command) -> bool;
+
+    /// Builds the command that tells a shard to stop.
+    ///
+    /// The generic infrastructure calls this once per shard during shutdown.
+    /// Implementations should construct a command whose processing returns
+    /// `false`, causing the shard loop to exit after sending the reply.
+    fn stop_command(reply: ReplySender<()>) -> Self::Command;
 }
 
 /// A handle for sending commands to a single shard.
@@ -255,16 +262,10 @@ where
     }
 
     /// Requests from all shards and returns reply handles.
+    ///
+    /// The caller controls blocking vs non-blocking behavior by passing either
+    /// `handle.request(...)` or `handle.try_request(...)` as the closure.
     pub fn request_all<T, F>(&self, request: F) -> Result<Vec<Reply<T>>, ShardError>
-    where
-        F: FnMut(&ShardHandle<S::Command>) -> Result<Reply<T>, ShardError>,
-    {
-        self.ensure_running()?;
-        self.shards.request_all(request)
-    }
-
-    /// Try-requests from all shards and returns reply handles.
-    pub fn try_request_all<T, F>(&self, request: F) -> Result<Vec<Reply<T>>, ShardError>
     where
         F: FnMut(&ShardHandle<S::Command>) -> Result<Reply<T>, ShardError>,
     {
@@ -288,30 +289,18 @@ where
     }
 
     /// Stops all shards and joins their threads while retaining the handle.
+    ///
+    /// Each shard receives a stop command built by
+    /// [`ShardService::stop_command`]. The shard loop processes it and exits
+    /// after sending the reply.
     pub fn shutdown(&mut self) -> Result<(), ShardError> {
         if self.stopped {
             return Ok(());
         }
 
         self.stopped = true;
-        // Services must implement their own stop command pattern.
-        // The generic Sharded provides the infrastructure; the specific
-        // service defines how to send stop commands.
-        Ok(())
-    }
-
-    /// Marks the service as stopped and joins shard threads after
-    /// sending stop commands through the provided closure.
-    pub fn shutdown_with<F>(&mut self, send_stop: F) -> Result<(), ShardError>
-    where
-        F: FnMut(&ShardHandle<S::Command>) -> Result<(), ShardError>,
-    {
-        if self.stopped {
-            return Ok(());
-        }
-
-        self.stopped = true;
-        self.shards.stop_and_join(send_stop)
+        self.shards
+            .stop_and_join(|handle| handle.request_stopped(|reply| S::stop_command(reply)))
     }
 
     fn ensure_running(&self) -> Result<(), ShardError> {
@@ -348,9 +337,9 @@ where
     fn drop(&mut self) {
         if !self.stopped {
             self.stopped = true;
-            // Without a stop command closure, we can only drain.
-            // Concrete services should call shutdown_with in their Drop impls.
-            let _ = self.shards.join_drained();
+            let _ = self
+                .shards
+                .stop_and_join(|handle| handle.request_stopped(|reply| S::stop_command(reply)));
         }
     }
 }
@@ -402,6 +391,10 @@ mod tests {
                 }
             }
         }
+
+        fn stop_command(reply: ReplySender<()>) -> Self::Command {
+            TestCommand::Stop { reply }
+        }
     }
 
     #[test]
@@ -425,9 +418,7 @@ mod tests {
             .unwrap();
         assert_eq!(get_reply.wait().unwrap(), 5);
 
-        service
-            .shutdown_with(|handle| handle.request_stopped(|reply| TestCommand::Stop { reply }))
-            .unwrap();
+        service.shutdown().unwrap();
     }
 
     #[test]
@@ -441,9 +432,7 @@ mod tests {
         let results: Vec<i64> = replies.into_iter().map(|r| r.wait().unwrap()).collect();
         assert_eq!(results, vec![10, 10, 10, 10]);
 
-        service
-            .shutdown_with(|handle| handle.request_stopped(|reply| TestCommand::Stop { reply }))
-            .unwrap();
+        service.shutdown().unwrap();
     }
 
     #[test]
@@ -455,8 +444,6 @@ mod tests {
             .unwrap();
         assert_eq!(reply.wait().unwrap(), 0);
 
-        service
-            .shutdown_with(|handle| handle.request_stopped(|reply| TestCommand::Stop { reply }))
-            .unwrap();
+        service.shutdown().unwrap();
     }
 }

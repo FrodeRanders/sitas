@@ -64,6 +64,7 @@ pub mod sharded;
 /// Shard-per-thread async executor runtime.
 pub mod sharded_executor;
 /// Network-facing sharded TCP server.
+#[cfg(unix)]
 pub mod sharded_tcp;
 /// Streaming reply channels for sharded services.
 pub mod stream_reply;
@@ -78,9 +79,9 @@ pub use counter::{
 };
 pub use error::ShardError;
 pub use executor::{
-    BackpressureGuard, BackpressureTask, ExecutorObserver, ExecutorSnapshot, Permit,
-    SchedulingGroup, SchedulingGroupError, SchedulingGroupId, SchedulingGroupSnapshot, TaskId,
-    TaskSnapshot, TaskStatus, TaskWait,
+    BackpressureGuard, ExecutorObserver, ExecutorSnapshot, Permit, SchedulingGroup,
+    SchedulingGroupError, SchedulingGroupId, SchedulingGroupSnapshot, TaskId, TaskSnapshot,
+    TaskStatus, TaskWait,
 };
 pub use kv::{
     KvAllKeysReply, KvDeleteManyReply, KvGetManyReply, KvReply, KvShardSnapshotsReply,
@@ -103,7 +104,9 @@ pub use sharded_executor::{
     available_cpu_ids, available_parallelism, current_executor_cpu_placement,
     current_executor_shard, join_all_shards, join_all_shards_timeout,
 };
+#[cfg(unix)]
 pub use sharded_tcp::{ShardedTcpConfig, ShardedTcpConnection, ShardedTcpServer};
 pub use stream_reply::{
-    StreamError, StreamFuture, StreamProducer, StreamReply, StreamSender, stream_channel,
+    StreamBatch, StreamError, StreamFuture, StreamProducer, StreamReply, StreamSender,
+    stream_channel,
 };

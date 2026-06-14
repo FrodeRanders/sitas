@@ -370,11 +370,17 @@ fn create_listener(addr: SocketAddr, backlog: u32, reuse_port: bool) -> io::Resu
     #[cfg(not(target_os = "linux"))]
     let sock_type = SOCK_STREAM;
 
+    // SAFETY: `socket` is called with constant AF_INET/AF_INET6 domain,
+    // SOCK_STREAM type (and SOCK_CLOEXEC on Linux), and protocol 0.
+    // Returns a valid descriptor or -1, checked immediately below.
     let fd = unsafe { socket(domain, sock_type, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: `fd` is an open socket descriptor from `socket()` above.
+    // F_GETFL reads flags, F_SETFL writes O_NONBLOCK. FD_CLOEXEC (cmd 2, arg 1)
+    // prevents leaking the fd across exec. All fds and flag values are valid.
     #[cfg(not(target_os = "linux"))]
     unsafe {
         let flags = fcntl(fd, F_GETFL, 0);
@@ -385,6 +391,8 @@ fn create_listener(addr: SocketAddr, backlog: u32, reuse_port: bool) -> io::Resu
         fcntl(fd, 2, 1);
     }
 
+    // SAFETY: `setsockopt` on an open socket fd with well-known SOL_SOCKET
+    // level, SO_REUSEADDR option, and a pointer to a valid c_int value.
     let optval: c_int = 1;
     unsafe {
         setsockopt(
@@ -397,6 +405,8 @@ fn create_listener(addr: SocketAddr, backlog: u32, reuse_port: bool) -> io::Resu
     }
 
     if reuse_port {
+        // SAFETY: `setsockopt` on an open socket fd with SOL_SOCKET level
+        // and SO_REUSEPORT option. The pointer and size are valid.
         unsafe {
             setsockopt(
                 fd,
@@ -409,18 +419,27 @@ fn create_listener(addr: SocketAddr, backlog: u32, reuse_port: bool) -> io::Resu
     }
 
     let (bind_ptr, bind_len) = build_sockaddr_for_bind(&addr);
+    // SAFETY: `bind` is called with the open socket fd and a pointer to a
+    // properly initialized sockaddr struct produced by build_sockaddr_for_bind.
+    // The length matches the struct size.
     let bind_result = unsafe { bind(fd, bind_ptr, bind_len) };
     if bind_result < 0 {
+        // SAFETY: `fd` is owned by this scope. Closed exactly once on error.
         unsafe { close(fd) };
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: `listen` marks the bound socket as passive with the given backlog.
+    // `fd` is a valid bound socket descriptor.
     let listen_result = unsafe { listen(fd, backlog as c_int) };
     if listen_result < 0 {
+        // SAFETY: `fd` is owned by this scope. Closed exactly once on error.
         unsafe { close(fd) };
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: `fd` is a valid, bound, listening socket descriptor. Ownership
+    // transfers to the `TcpListener`, which will close it on drop.
     Ok(unsafe { TcpListener::from_raw_fd(fd) })
 }
 

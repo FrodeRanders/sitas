@@ -45,7 +45,7 @@ mod unix_io;
 #[cfg(target_os = "linux")]
 mod uring;
 
-pub use backpressure::{BackpressureGuard, BackpressureTask, Permit};
+pub use backpressure::{BackpressureGuard, Permit};
 use current::enter_scheduler;
 pub use future::{
     Race, RaceOutput, Sleep, Timeout, TimeoutError, YieldNow, race, sleep, timeout, yield_now,

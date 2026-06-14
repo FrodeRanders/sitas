@@ -2692,4 +2692,68 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
     }
+
+    #[test]
+    fn cross_shard_stream_producer_and_consumer_with_stream_future() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+        let (sender, reply) = crate::stream_reply::stream_channel::<i32>();
+
+        // Shard 0: producer — sends values into the stream.
+        let sender2 = sender.clone();
+        runtime
+            .spawn_named_on(ShardId(0), "stream-producer", async move {
+                sender2.send(1).unwrap();
+                sender2.send(2).unwrap();
+                sender2.send(3).unwrap();
+                // Sender is dropped when this task completes, signalling EOF.
+            })
+            .unwrap();
+
+        // Shard 1: consumer — reads values via StreamFuture.
+        let handle = runtime
+            .spawn_with_handle_named_on(ShardId(1), "stream-consumer", async move {
+                drop(sender); // Main sender dropped so producer's drop finishes the stream.
+                reply.into_stream().collect().await.unwrap()
+            })
+            .unwrap();
+
+        let values = block_on(handle).unwrap();
+        assert_eq!(values, vec![1, 2, 3]);
+
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn cross_shard_stream_batch_loop_with_next_batch() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+        let (sender, mut reply) = crate::stream_reply::stream_channel::<String>();
+
+        let task_sender = sender.clone();
+        runtime
+            .spawn_named_on(ShardId(0), "stream-producer", async move {
+                task_sender.send("alpha".into()).unwrap();
+                task_sender.send("beta".into()).unwrap();
+            })
+            .unwrap();
+
+        let handle = runtime
+            .spawn_with_handle_named_on(ShardId(1), "stream-consumer", async move {
+                drop(sender);
+                let mut values = Vec::new();
+                while let Ok(Some(batch)) = reply.next_batch().await {
+                    values.extend(batch);
+                }
+                values
+            })
+            .unwrap();
+
+        let values = block_on(handle).unwrap();
+        assert_eq!(values, vec!["alpha".to_string(), "beta".to_string()]);
+
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
 }

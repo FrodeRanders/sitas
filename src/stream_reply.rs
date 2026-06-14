@@ -3,9 +3,10 @@
 //! A [`StreamReply<T>`] bridges between a shard producing multiple values and a
 //! consumer that receives them. Unlike a one-shot [`Reply<T>`](crate::runtime::Reply),
 //! a stream reply delivers a sequence of owned values followed by a terminal
-//! completion signal. Blocking consumers use `recv`, `recv_batch`, `collect`,
-//! or `fold`. Async consumers wrap the reply in a [`StreamFuture`] for
-//! waker-integrated polling.
+//! completion signal. Blocking consumers use [`StreamReply::recv`],
+//! [`StreamReply::recv_batch`], [`StreamReply::collect`], or
+//! [`StreamReply::fold`]. Async consumers call [`StreamReply::next_batch`]
+//! which returns a [`StreamBatch`] future for waker-integrated polling.
 
 use std::fmt;
 use std::future::Future;
@@ -36,7 +37,7 @@ impl std::error::Error for StreamError {}
 /// The sending side of a streaming reply channel.
 ///
 /// Shard threads push owned values and then drop the sender to signal
-/// completion. When an async consumer is waiting via [`StreamFuture`], the
+/// completion. When an async consumer is waiting via [`StreamBatch`], the
 /// sender wakes the registered waker.
 pub struct StreamSender<T> {
     shared: Arc<StreamShared<T>>,
@@ -244,13 +245,40 @@ impl<T> StreamReply<T> {
         !state.sender_alive && self.index >= state.values.len()
     }
 
-    /// Converts this blocking stream reply into an awaitable future.
+    /// Returns a future that yields the next batch of values.
     ///
-    /// The returned future integrates with executor wakers: when a value is
-    /// available, the waker registered by the future is invoked. The future
-    /// yields one batch at a time. When the stream is exhausted, the future
-    /// returns `Ok(None)`.
-    pub fn into_async(self) -> StreamFuture<T> {
+    /// This borrows the reply mutably, so it can be called repeatedly in a
+    /// loop. Each call polls the shared channel, registers the executor's
+    /// waker, and returns when values arrive or the stream is exhausted.
+    ///
+    /// ```
+    /// # use sitas::stream_reply::{stream_channel, StreamBatch};
+    /// # use sitas::executor::block_on;
+    /// # block_on(async {
+    /// let (sender, mut reply) = stream_channel::<i32>();
+    /// sender.send(1).unwrap();
+    /// sender.send(2).unwrap();
+    /// drop(sender);
+    ///
+    /// let mut values = Vec::new();
+    /// while let Ok(Some(batch)) = reply.next_batch().await {
+    ///     values.extend(batch);
+    /// }
+    /// assert_eq!(values, vec![1, 2]);
+    /// # });
+    /// ```
+    pub fn next_batch(&mut self) -> StreamBatch<'_, T> {
+        StreamBatch { reply: self }
+    }
+
+    /// Consumes this reply and returns a [`StreamFuture`] that owns it.
+    ///
+    /// `StreamFuture` provides the same `next_batch()` looping pattern plus
+    /// convenience async methods like [`StreamFuture::collect`] and
+    /// [`StreamFuture::fold`]. This is useful when you want to pass the
+    /// stream to another task or function without keeping a separate
+    /// `StreamReply` handle alive.
+    pub fn into_stream(self) -> StreamFuture<T> {
         StreamFuture { reply: self }
     }
 }
@@ -274,43 +302,50 @@ impl<T> Drop for StreamReply<T> {
     }
 }
 
-/// Future wrapper for [`StreamReply`] that integrates with executor wakers.
+/// Future returned by [`StreamReply::next_batch`].
 ///
-/// Each call to `poll` returns one batch of available values. When the stream
-/// is exhausted, the future returns `Poll::Ready(Ok(None))`.
+/// Borrows the reply mutably and yields one batch of available values.
+/// Returns `Ok(Some(batch))` when values are ready, `Ok(None)` when the
+/// stream is exhausted, or `Err(StreamError)` on failure. Integrates with
+/// executor wakers so the task sleeps until new values arrive.
+///
+/// This is a one-shot per call — to receive multiple batches, call
+/// `next_batch()` repeatedly.
 #[must_use = "futures do nothing unless polled or awaited"]
-pub struct StreamFuture<T> {
-    reply: StreamReply<T>,
+pub struct StreamBatch<'a, T> {
+    reply: &'a mut StreamReply<T>,
 }
 
-impl<T> fmt::Debug for StreamFuture<T> {
+impl<T> Unpin for StreamBatch<'_, T> {}
+
+impl<T> fmt::Debug for StreamBatch<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StreamFuture").finish_non_exhaustive()
+        f.debug_struct("StreamBatch").finish_non_exhaustive()
     }
 }
 
-impl<T> Future for StreamFuture<T> {
+impl<T> Future for StreamBatch<'_, T> {
     type Output = Result<Option<Vec<T>>, StreamError>;
 
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.reply.try_recv(usize::MAX) {
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.reply.try_recv(usize::MAX) {
             Ok(Some(batch)) => Poll::Ready(Ok(Some(batch))),
             Ok(None) => {
-                // No values available, register waker for notification.
-                let mut state = self
+                let mut state = this
                     .reply
                     .shared
                     .state
                     .lock()
                     .expect("stream state mutex poisoned");
 
-                if !state.sender_alive && self.reply.index >= state.values.len() {
+                if !state.sender_alive && this.reply.index >= state.values.len() {
                     return Poll::Ready(Ok(None));
                 }
 
-                if state.values.len() > self.reply.index {
+                if state.values.len() > this.reply.index {
                     drop(state);
-                    return self.poll(context);
+                    return Pin::new(&mut *this).poll(context);
                 }
 
                 state.waker = Some(context.waker().clone());
@@ -318,6 +353,68 @@ impl<T> Future for StreamFuture<T> {
             }
             Err(e) => Poll::Ready(Err(e)),
         }
+    }
+}
+
+/// Owning multi-yield stream future returned by [`StreamReply::into_stream`].
+///
+/// `StreamFuture<T>` owns the [`StreamReply<T>`] and provides the same
+/// `next_batch()` pattern as the borrowed variant. It also offers async
+/// convenience methods like [`StreamFuture::collect`] and
+/// [`StreamFuture::fold`] that drain the entire stream.
+///
+/// ```
+/// # use sitas::stream_reply::{stream_channel, StreamFuture};
+/// # use sitas::executor::block_on;
+/// # block_on(async {
+/// let (sender, reply) = stream_channel::<i32>();
+/// sender.send(1).unwrap();
+/// sender.send(2).unwrap();
+/// drop(sender);
+///
+/// let mut stream = reply.into_stream();
+/// let total = stream.fold(0, |acc, v| acc + v).await.unwrap();
+/// assert_eq!(total, 3);
+/// # });
+/// ```
+pub struct StreamFuture<T> {
+    reply: StreamReply<T>,
+}
+
+impl<T> StreamFuture<T> {
+    /// Returns a future yielding the next batch from this owned stream.
+    pub fn next_batch(&mut self) -> StreamBatch<'_, T> {
+        StreamBatch {
+            reply: &mut self.reply,
+        }
+    }
+
+    /// Collects all remaining values in the stream into a single vector.
+    pub async fn collect(mut self) -> Result<Vec<T>, StreamError> {
+        let mut all = Vec::new();
+        while let Some(batch) = self.next_batch().await? {
+            all.extend(batch);
+        }
+        Ok(all)
+    }
+
+    /// Folds all remaining values into an accumulator.
+    pub async fn fold<Acc, F>(mut self, mut acc: Acc, mut f: F) -> Result<Acc, StreamError>
+    where
+        F: FnMut(Acc, T) -> Acc,
+    {
+        while let Some(batch) = self.next_batch().await? {
+            for value in batch {
+                acc = f(acc, value);
+            }
+        }
+        Ok(acc)
+    }
+}
+
+impl<T> fmt::Debug for StreamFuture<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamFuture").finish_non_exhaustive()
     }
 }
 
@@ -459,29 +556,35 @@ mod tests {
     }
 
     #[test]
-    fn stream_future_integrates_with_executor_waker() {
-        let (sender, reply) = stream_channel::<i32>();
+    fn stream_batch_awaits_multiple_batches() {
+        let (sender, mut reply) = stream_channel::<i32>();
 
         sender.send(10).unwrap();
         sender.send(20).unwrap();
         drop(sender);
 
-        let result = block_on(async { reply.into_async().await.unwrap().unwrap() });
+        let result = block_on(async {
+            let mut values = Vec::new();
+            while let Ok(Some(batch)) = reply.next_batch().await {
+                values.extend(batch);
+            }
+            values
+        });
         assert_eq!(result, vec![10, 20]);
     }
 
     #[test]
-    fn stream_future_handles_empty_stream() {
-        let (_sender, reply) = stream_channel::<i32>();
+    fn stream_batch_handles_empty_stream() {
+        let (_sender, mut reply) = stream_channel::<i32>();
         drop(_sender);
 
-        let result = block_on(reply.into_async()).unwrap();
+        let result = block_on(async { reply.next_batch().await }).unwrap();
         assert_eq!(result, None);
     }
 
     #[test]
-    fn stream_future_waker_receives_values_from_other_thread() {
-        let (sender, reply) = stream_channel::<i32>();
+    fn stream_batch_waker_receives_values_from_other_thread() {
+        let (sender, mut reply) = stream_channel::<i32>();
 
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(10));
@@ -489,13 +592,66 @@ mod tests {
         });
 
         let result = block_on(async {
-            let future = reply.into_async();
-            match future.await {
+            match reply.next_batch().await {
                 Ok(Some(batch)) => batch,
                 Ok(None) => Vec::new(),
                 Err(_) => Vec::new(),
             }
         });
         assert_eq!(result, vec![99]);
+    }
+
+    #[test]
+    fn stream_future_collect_drains_all_values() {
+        let (sender, reply) = stream_channel::<i32>();
+
+        sender.send(1).unwrap();
+        sender.send(2).unwrap();
+        sender.send(3).unwrap();
+        drop(sender);
+
+        let result = block_on(reply.into_stream().collect()).unwrap();
+        assert_eq!(result, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn stream_future_fold_accumulates_values() {
+        let (sender, reply) = stream_channel::<i32>();
+
+        sender.send(10).unwrap();
+        sender.send(20).unwrap();
+        sender.send(30).unwrap();
+        drop(sender);
+
+        let total = block_on(reply.into_stream().fold(0, |acc, v| acc + v)).unwrap();
+        assert_eq!(total, 60);
+    }
+
+    #[test]
+    fn stream_future_next_batch_loops_like_reply() {
+        let (sender, reply) = stream_channel::<i32>();
+
+        sender.send(100).unwrap();
+        sender.send(200).unwrap();
+        drop(sender);
+
+        let result = block_on(async {
+            let mut stream = reply.into_stream();
+            let mut values = Vec::new();
+            while let Ok(Some(batch)) = stream.next_batch().await {
+                values.extend(batch);
+            }
+            values
+        });
+        assert_eq!(result, vec![100, 200]);
+    }
+
+    #[test]
+    fn stream_future_handles_empty_stream() {
+        let (_sender, reply) = stream_channel::<i32>();
+        drop(_sender);
+
+        let result = block_on(reply.into_stream().collect()).unwrap();
+        assert!(result.is_empty());
     }
 }
