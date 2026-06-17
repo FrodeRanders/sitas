@@ -13,6 +13,8 @@
 //! module to keep the project dependency-free.
 
 use std::collections::hash_map::DefaultHasher;
+use std::error::Error;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -43,8 +45,14 @@ const SOCK_CLOEXEC: c_int = 0o2000000;
 #[allow(dead_code)]
 const SOCK_CLOEXEC: c_int = 0;
 #[allow(dead_code)]
+#[cfg(target_os = "linux")]
+const SOL_SOCKET: c_int = 1;
+#[cfg(not(target_os = "linux"))]
 const SOL_SOCKET: c_int = 0xffff;
 #[allow(dead_code)]
+#[cfg(target_os = "linux")]
+const SO_REUSEADDR: c_int = 2;
+#[cfg(not(target_os = "linux"))]
 const SO_REUSEADDR: c_int = 0x0004;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
@@ -201,6 +209,60 @@ impl ShardedTcpConfig {
     }
 }
 
+/// Error returned when a sharded TCP server cannot be started.
+#[derive(Debug)]
+pub enum ShardedTcpStartError {
+    /// The configuration is invalid.
+    InvalidConfig(&'static str),
+    /// A listener could not be created for the accept path.
+    Listen {
+        /// The shard that would own this listener, or `None` for the
+        /// single-accept path.
+        shard_id: Option<ShardId>,
+        /// The underlying OS error.
+        source: io::Error,
+    },
+    /// The accept task could not be submitted to a shard executor.
+    Spawn(ShardedSpawnError),
+}
+
+impl fmt::Display for ShardedTcpStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(message) => write!(f, "invalid TCP server config: {message}"),
+            Self::Listen {
+                shard_id: Some(shard_id),
+                source,
+            } => write!(
+                f,
+                "failed to create TCP listener for shard {}: {source}",
+                shard_id.0
+            ),
+            Self::Listen {
+                shard_id: None,
+                source,
+            } => write!(f, "failed to create TCP listener: {source}"),
+            Self::Spawn(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for ShardedTcpStartError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Listen { source, .. } => Some(source),
+            Self::Spawn(error) => Some(error),
+            Self::InvalidConfig(_) => None,
+        }
+    }
+}
+
+impl From<ShardedSpawnError> for ShardedTcpStartError {
+    fn from(error: ShardedSpawnError) -> Self {
+        Self::Spawn(error)
+    }
+}
+
 /// A sharded TCP server.
 ///
 /// Binds a TCP listener and spawns one accept-loop task per shard. Accepted
@@ -248,7 +310,7 @@ impl ShardedTcpServer {
         &self,
         submitter: &ShardedSubmitter,
         make_handler: MakeHandler,
-    ) -> Result<ShardedTcpServerHandle, ShardedSpawnError>
+    ) -> Result<ShardedTcpServerHandle, ShardedTcpStartError>
     where
         MakeHandler: Fn(ShardedTcpConnection, ShardedSubmitter) -> HandlerFut
             + Send
@@ -257,9 +319,19 @@ impl ShardedTcpServer {
             + 'static,
         HandlerFut: std::future::Future<Output = ()> + Send + 'static,
     {
+        if self.config.max_connections_per_shard == 0 {
+            return Err(ShardedTcpStartError::InvalidConfig(
+                "max_connections_per_shard must be greater than zero",
+            ));
+        }
+
         #[cfg(target_os = "linux")]
         {
-            self.start_with_reuseport(submitter, make_handler)
+            if self.config.reuse_port {
+                self.start_with_reuseport(submitter, make_handler)
+            } else {
+                self.start_with_single_accept(submitter, make_handler)
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -272,7 +344,7 @@ impl ShardedTcpServer {
         &self,
         submitter: &ShardedSubmitter,
         make_handler: MakeHandler,
-    ) -> Result<ShardedTcpServerHandle, ShardedSpawnError>
+    ) -> Result<ShardedTcpServerHandle, ShardedTcpStartError>
     where
         MakeHandler: Fn(ShardedTcpConnection, ShardedSubmitter) -> HandlerFut
             + Send
@@ -281,15 +353,34 @@ impl ShardedTcpServer {
             + 'static,
         HandlerFut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let bind_addr = self.bind_addr;
         let backlog = self.config.backlog;
-        let reuse_port = self.config.reuse_port;
         let max_connections_per_shard = self.config.max_connections_per_shard;
         let connection_counts = connection_counts(submitter.shard_count());
         let (stop_source, stop_token) = stop_pair();
+        let mut listener_addr = self.bind_addr;
+        let mut listeners = Vec::with_capacity(submitter.shard_count());
 
         for shard_idx in 0..submitter.shard_count() {
             let shard_id = ShardId(shard_idx);
+            let listener = create_listener(listener_addr, backlog, true).map_err(|source| {
+                ShardedTcpStartError::Listen {
+                    shard_id: Some(shard_id),
+                    source,
+                }
+            })?;
+            if shard_idx == 0 && self.bind_addr.port() == 0 {
+                listener_addr =
+                    listener
+                        .local_addr()
+                        .map_err(|source| ShardedTcpStartError::Listen {
+                            shard_id: Some(shard_id),
+                            source,
+                        })?;
+            }
+            listeners.push((shard_idx, shard_id, listener));
+        }
+
+        for (shard_idx, shard_id, listener) in listeners {
             let make_handler = make_handler.clone();
             let shard_submitter = submitter.clone();
             let accept_stop = stop_token.clone();
@@ -299,14 +390,6 @@ impl ShardedTcpServer {
                 shard_id,
                 format!("tcp-accept-{}", shard_idx),
                 async move {
-                    let listener = match create_listener(bind_addr, backlog, reuse_port) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            eprintln!("[sitas-tcp] shard {} failed to bind: {}", shard_idx, e);
-                            return;
-                        }
-                    };
-
                     loop {
                         match race(accept_async(&listener), accept_stop.clone()).await {
                             RaceOutput::First(Ok((stream, remote_addr))) => {
@@ -346,19 +429,18 @@ impl ShardedTcpServer {
                 },
             ) {
                 stop_source.stop();
-                return Err(error);
+                return Err(error.into());
             }
         }
 
         Ok(ShardedTcpServerHandle { stop_source })
     }
 
-    #[cfg(not(target_os = "linux"))]
     fn start_with_single_accept<MakeHandler, HandlerFut>(
         &self,
         submitter: &ShardedSubmitter,
         make_handler: MakeHandler,
-    ) -> Result<ShardedTcpServerHandle, ShardedSpawnError>
+    ) -> Result<ShardedTcpServerHandle, ShardedTcpStartError>
     where
         MakeHandler: Fn(ShardedTcpConnection, ShardedSubmitter) -> HandlerFut
             + Send
@@ -373,20 +455,9 @@ impl ShardedTcpServer {
         let max_connections_per_shard = self.config.max_connections_per_shard;
         let connection_counts = connection_counts(shard_count);
         let (stop_source, stop_token) = stop_pair();
+        let listener = create_single_listener(bind_addr)?;
 
         if let Err(error) = submitter.submit_named_to(ShardId(0), "tcp-accept-0", async move {
-            let listener = match std::net::TcpListener::bind(bind_addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("[sitas-tcp] failed to bind: {}", e);
-                    return;
-                }
-            };
-            if let Err(error) = listener.set_nonblocking(true) {
-                eprintln!("[sitas-tcp] failed to set listener nonblocking: {}", error);
-                return;
-            }
-
             loop {
                 match race(accept_async(&listener), stop_token.clone()).await {
                     RaceOutput::First(Ok((stream, remote_addr))) => {
@@ -422,7 +493,7 @@ impl ShardedTcpServer {
             }
         }) {
             stop_source.stop();
-            return Err(error);
+            return Err(error.into());
         }
 
         Ok(ShardedTcpServerHandle { stop_source })
@@ -470,6 +541,20 @@ where
 
 fn connection_counts(shard_count: usize) -> Arc<Vec<AtomicUsize>> {
     Arc::new((0..shard_count).map(|_| AtomicUsize::new(0)).collect())
+}
+
+fn create_single_listener(addr: SocketAddr) -> Result<TcpListener, ShardedTcpStartError> {
+    let listener = TcpListener::bind(addr).map_err(|source| ShardedTcpStartError::Listen {
+        shard_id: None,
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| ShardedTcpStartError::Listen {
+            shard_id: None,
+            source,
+        })?;
+    Ok(listener)
 }
 
 #[allow(dead_code)]
@@ -719,6 +804,46 @@ mod bind_sockaddr_tests {
         assert!(handle.stop());
         assert!(handle.is_stopped());
 
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn server_start_rejects_zero_connection_limit() {
+        let runtime = ShardedExecutor::start(1).unwrap();
+        let submitter = runtime.submitter();
+        let server = ShardedTcpServer::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            ShardedTcpConfig::new().with_max_connections(0),
+        );
+
+        let result = server.start(&submitter, |_conn, _submitter| async move {});
+
+        assert!(matches!(
+            result,
+            Err(ShardedTcpStartError::InvalidConfig(
+                "max_connections_per_shard must be greater than zero"
+            ))
+        ));
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn server_start_reports_listener_bind_error() {
+        let occupied =
+            TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let runtime = ShardedExecutor::start(1).unwrap();
+        let submitter = runtime.submitter();
+        let server = ShardedTcpServer::new(addr, ShardedTcpConfig::new().with_reuse_port(false));
+
+        let result = server.start(&submitter, |_conn, _submitter| async move {});
+
+        assert!(matches!(
+            result,
+            Err(ShardedTcpStartError::Listen { shard_id: None, .. })
+        ));
         drop(submitter);
         runtime.stop().unwrap();
     }

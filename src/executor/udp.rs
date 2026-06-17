@@ -23,10 +23,20 @@ const SOCK_CLOEXEC: c_int = 0o2000000;
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 const SOCK_CLOEXEC: c_int = 0;
+#[cfg(target_os = "linux")]
+const SOL_SOCKET: c_int = 1;
+#[cfg(not(target_os = "linux"))]
 const SOL_SOCKET: c_int = 0xffff;
+#[cfg(target_os = "linux")]
+const SO_REUSEADDR: c_int = 2;
+#[cfg(not(target_os = "linux"))]
 const SO_REUSEADDR: c_int = 0x0004;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
+#[cfg(not(target_os = "linux"))]
+const F_SETFD: c_int = 2;
+#[cfg(not(target_os = "linux"))]
+const FD_CLOEXEC: c_int = 1;
 #[cfg(target_os = "linux")]
 const O_NONBLOCK: c_int = 0o4000;
 #[cfg(not(target_os = "linux"))]
@@ -149,32 +159,44 @@ impl UdpSocket {
             return Err(io::Error::last_os_error());
         }
 
-        // SAFETY: `fd` is an open socket descriptor. `fcntl` with F_GETFL and
-        // F_SETFL is safe to call on any open descriptor. O_NONBLOCK makes
-        // the socket non-blocking. On non-Linux, also set FD_CLOEXEC.
-        {
-            let flags = unsafe { fcntl(fd, F_GETFL, 0) };
-            if flags >= 0 {
-                unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) };
-            }
-            #[cfg(not(target_os = "linux"))]
-            unsafe {
-                fcntl(fd, 2 /* F_SETFD */, 1 /* FD_CLOEXEC */);
-            }
+        // SAFETY: `fd` is an open socket descriptor. F_GETFL reads descriptor
+        // flags, and F_SETFL writes the same flags plus O_NONBLOCK.
+        let flags = unsafe { fcntl(fd, F_GETFL, 0) };
+        if flags < 0 {
+            close_owned_fd(fd);
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is open and `flags | O_NONBLOCK` is derived from the
+        // descriptor's current flags.
+        if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+            close_owned_fd(fd);
+            return Err(io::Error::last_os_error());
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        // SAFETY: `fd` is open. F_SETFD with FD_CLOEXEC only updates the
+        // descriptor flag used to prevent leaking the socket across exec.
+        if unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) } < 0 {
+            close_owned_fd(fd);
+            return Err(io::Error::last_os_error());
         }
 
         // SAFETY: `setsockopt` is called on an open socket descriptor with the
         // well-known SOL_SOCKET level and SO_REUSEADDR option. The option value
         // is a pointer to a valid `c_int` with size `sizeof(c_int)`.
         let optval: c_int = 1;
-        unsafe {
+        let reuse_addr_result = unsafe {
             setsockopt(
                 fd,
                 SOL_SOCKET,
                 SO_REUSEADDR,
                 &optval,
                 std::mem::size_of::<c_int>() as SockLen,
-            );
+            )
+        };
+        if reuse_addr_result < 0 {
+            close_owned_fd(fd);
+            return Err(io::Error::last_os_error());
         }
 
         match addr {
@@ -199,9 +221,7 @@ impl UdpSocket {
                 let bind_result =
                     unsafe { bind(fd, &sin, std::mem::size_of::<SockAddrIn>() as SockLen) };
                 if bind_result < 0 {
-                    // SAFETY: `fd` is the owned descriptor from `socket()` above.
-                    // It is closed at most once on this error path.
-                    unsafe { close(fd) };
+                    close_owned_fd(fd);
                     return Err(io::Error::last_os_error());
                 }
             }
@@ -219,8 +239,7 @@ impl UdpSocket {
                     )
                 };
                 if bind_result < 0 {
-                    // SAFETY: `fd` is owned by this scope; closing on error.
-                    unsafe { close(fd) };
+                    close_owned_fd(fd);
                     return Err(io::Error::last_os_error());
                 }
             }
@@ -232,9 +251,7 @@ impl UdpSocket {
         let local_addr = match get_sock_name(fd, addr) {
             Ok(local_addr) => local_addr,
             Err(err) => {
-                // SAFETY: `fd` is still owned by this scope because ownership
-                // has not yet been transferred to `OwnedFd`.
-                unsafe { close(fd) };
+                close_owned_fd(fd);
                 return Err(err);
             }
         };
@@ -329,6 +346,14 @@ impl UdpSocket {
     /// Returns the local address this socket is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addr)
+    }
+}
+
+fn close_owned_fd(fd: c_int) {
+    // SAFETY: callers only pass descriptors still owned by the current setup
+    // path before they are transferred to `OwnedFd::from_raw_fd`.
+    unsafe {
+        let _ = close(fd);
     }
 }
 
