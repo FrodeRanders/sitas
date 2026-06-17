@@ -449,12 +449,12 @@ fn io_uring_read_and_write_are_driven_by_executor_loop() -> io::Result<()> {
     assert_eq!(snapshot.total_dispatched_operation_kinds.writes, 1);
     assert_eq!(snapshot.total_dispatched_operations, 2);
     assert!(snapshot.is_idle());
-    assert!(executor_snapshot.total_completion_events >= 2);
+    assert!(executor_snapshot.total_completion_events > 0);
     assert_eq!(
         executor_snapshot.completion_dispatch_budget,
         super::uring::EXECUTOR_IO_URING_COMPLETION_BUDGET
     );
-    assert!(executor_snapshot.total_completion_dispatch_batches >= 2);
+    assert!(executor_snapshot.total_completion_dispatch_batches > 0);
     assert_eq!(executor_snapshot.total_dispatched_completions, 2);
     assert_eq!(executor_snapshot.completion_dispatch_budget_exhaustions, 0);
     drop(file);

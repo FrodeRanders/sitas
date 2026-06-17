@@ -953,10 +953,7 @@ where
     fn shard_for_owned_key(&self, key: &str) -> Result<&KvShardHandle, ShardError> {
         self.ensure_running()?;
         let shard_id = self.shard_for_key(key);
-        Ok(self
-            .shards
-            .get(shard_id.0)
-            .expect("placement returned an invalid shard id"))
+        self.shards.get_by_id(shard_id)
     }
 
     fn shard(&self, shard_id: ShardId) -> Result<&KvShardHandle, ShardError> {

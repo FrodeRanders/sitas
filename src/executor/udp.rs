@@ -229,7 +229,15 @@ impl UdpSocket {
         // SAFETY: `fd` is a valid, open, bound socket descriptor.
         // Ownership is transferred to `OwnedFd` below. The raw `fd`
         // value is only used for `getsockname` before any drop can close it.
-        let local_addr = get_sock_name(fd, addr)?;
+        let local_addr = match get_sock_name(fd, addr) {
+            Ok(local_addr) => local_addr,
+            Err(err) => {
+                // SAFETY: `fd` is still owned by this scope because ownership
+                // has not yet been transferred to `OwnedFd`.
+                unsafe { close(fd) };
+                return Err(err);
+            }
+        };
         // SAFETY: `fd` is a valid, open socket descriptor. Ownership is
         // transferred to the `OwnedFd`, which will call `close()` on drop.
         let fd_owned = unsafe { OwnedFd::from_raw_fd(fd) };

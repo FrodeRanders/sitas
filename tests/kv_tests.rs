@@ -14,6 +14,15 @@ impl Placement<str> for FirstShardPlacement {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct InvalidPlacement;
+
+impl Placement<str> for InvalidPlacement {
+    fn shard_for(&self, _key: &str, shard_count: usize) -> ShardId {
+        ShardId(shard_count)
+    }
+}
+
 #[test]
 fn starting_with_zero_shards_fails() {
     let result = ShardedKv::start(0);
@@ -79,6 +88,19 @@ fn starting_with_custom_placement_routes_keys_through_strategy() {
     for shard_idx in 1..kv.shard_count() {
         assert_eq!(kv.len_on_shard(ShardId(shard_idx)).unwrap(), 0);
     }
+
+    kv.stop().unwrap();
+}
+
+#[test]
+fn custom_placement_returning_invalid_shard_is_reported() {
+    let kv = ShardedKv::start_with_placement(
+        ShardedKvConfig::new(2).with_mailbox_capacity(4),
+        InvalidPlacement,
+    )
+    .unwrap();
+
+    assert_eq!(kv.put("alpha", "one"), Err(ShardError::InvalidShardId(2)));
 
     kv.stop().unwrap();
 }

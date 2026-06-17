@@ -105,7 +105,9 @@ pub use sharded_executor::{
     current_executor_shard, join_all_shards, join_all_shards_timeout,
 };
 #[cfg(unix)]
-pub use sharded_tcp::{ShardedTcpConfig, ShardedTcpConnection, ShardedTcpServer};
+pub use sharded_tcp::{
+    ShardedTcpConfig, ShardedTcpConnection, ShardedTcpServer, ShardedTcpServerHandle,
+};
 pub use stream_reply::{
     StreamBatch, StreamError, StreamFuture, StreamProducer, StreamReply, StreamSender,
     stream_channel,
