@@ -234,9 +234,15 @@ pub struct ExecutorSnapshot {
     #[cfg(unix)]
     pub total_writable_events: u64,
     /// Number of Linux completion driver events observed by the executor.
+    ///
+    /// This counts idle-driver wake cycles that reported completion progress,
+    /// not individual completed operations. Use `total_dispatched_completions`
+    /// for the operation-completion count.
     #[cfg(target_os = "linux")]
     pub total_completion_events: u64,
     /// Number of non-empty Linux completion dispatch batches run by the executor.
+    ///
+    /// One batch can dispatch more than one operation completion.
     #[cfg(target_os = "linux")]
     pub total_completion_dispatch_batches: u64,
     /// Number of Linux completions dispatched by executor completion batches.

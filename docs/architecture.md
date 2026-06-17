@@ -101,7 +101,7 @@ Senders use an atomic refcount so intermediate clone drops do not prematurely si
 
 ### `sharded_tcp`
 
-`sharded_tcp` integrates TCP helpers with the shard-per-thread model. `ShardedTcpServer` validates its configuration, creates non-blocking listeners before returning from startup, and spawns stoppable readiness-driven accept-loop tasks. On Linux with `SO_REUSEPORT`, the kernel distributes connections across shards. Without `SO_REUSEPORT`, a single accept shard distributes connections via the `ShardedSubmitter`. Connection handlers receive the TCP stream and a submitter clone for spawning work on their shard. The server returns a stop handle, and configured per-shard connection limits are enforced by shard-local handler permits.
+`sharded_tcp` integrates TCP helpers with the shard-per-thread model. `ShardedTcpServer` validates its configuration, creates non-blocking listeners before returning from startup, and spawns stoppable readiness-driven accept-loop tasks. On Linux with `SO_REUSEPORT`, the kernel distributes connections across shards. Without `SO_REUSEPORT`, a single accept shard distributes connections via the `ShardedSubmitter`. Connection handlers receive the TCP stream and a submitter clone for spawning work on their shard. The server returns a stop handle, configured per-shard connection limits are enforced by shard-local handler permits, and handle snapshots expose owned counters for connection-limit drops, accept errors, and handler submit failures.
 
 ### `udp`
 
@@ -169,7 +169,9 @@ Responsibilities:
   timers and readiness;
 - driver-event counters split readiness wakeups from Linux completion wakeups
   in owned executor snapshots, and further split readiness events by whether
-  they carried readable or writable fd progress;
+  they carried readable or writable fd progress. Linux completion wake counters
+  count driver wake cycles, while dispatched-completion counters count
+  individual operation completions;
 - Linux completion-dispatch counters report non-empty dispatch batches,
   dispatched completion count, completion budget, and completion budget
   exhaustion events;

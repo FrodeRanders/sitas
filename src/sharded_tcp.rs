@@ -21,7 +21,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::FromRawFd;
 use std::os::raw::c_int;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::executor::{RaceOutput, StopSource, accept_async, race, stop_pair};
 use crate::shard::ShardId;
@@ -278,6 +278,36 @@ pub struct ShardedTcpServer {
 #[must_use = "dropping the handle does not stop the server; call stop first"]
 pub struct ShardedTcpServerHandle {
     stop_source: StopSource,
+    stats: Arc<ShardedTcpServerStats>,
+}
+
+/// Owned observability snapshot for a [`ShardedTcpServer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardedTcpServerSnapshot {
+    /// Number of accepted connections dropped because their target shard was
+    /// already at the configured connection limit.
+    pub connection_limit_rejections: u64,
+    /// Number of accept-loop errors that stopped an accept task.
+    pub accept_errors: u64,
+    /// Number of accepted connections whose handler could not be submitted.
+    pub handler_submit_errors: u64,
+}
+
+#[derive(Debug, Default)]
+struct ShardedTcpServerStats {
+    connection_limit_rejections: AtomicU64,
+    accept_errors: AtomicU64,
+    handler_submit_errors: AtomicU64,
+}
+
+impl ShardedTcpServerStats {
+    fn snapshot(&self) -> ShardedTcpServerSnapshot {
+        ShardedTcpServerSnapshot {
+            connection_limit_rejections: self.connection_limit_rejections.load(Ordering::Acquire),
+            accept_errors: self.accept_errors.load(Ordering::Acquire),
+            handler_submit_errors: self.handler_submit_errors.load(Ordering::Acquire),
+        }
+    }
 }
 
 impl ShardedTcpServerHandle {
@@ -289,6 +319,11 @@ impl ShardedTcpServerHandle {
     /// Returns whether stop has already been requested.
     pub fn is_stopped(&self) -> bool {
         self.stop_source.is_stopped()
+    }
+
+    /// Returns an owned snapshot of server-level accept-loop counters.
+    pub fn snapshot(&self) -> ShardedTcpServerSnapshot {
+        self.stats.snapshot()
     }
 }
 
@@ -356,6 +391,7 @@ impl ShardedTcpServer {
         let backlog = self.config.backlog;
         let max_connections_per_shard = self.config.max_connections_per_shard;
         let connection_counts = connection_counts(submitter.shard_count());
+        let stats = Arc::new(ShardedTcpServerStats::default());
         let (stop_source, stop_token) = stop_pair();
         let mut listener_addr = self.bind_addr;
         let mut listeners = Vec::with_capacity(submitter.shard_count());
@@ -385,6 +421,7 @@ impl ShardedTcpServer {
             let shard_submitter = submitter.clone();
             let accept_stop = stop_token.clone();
             let connection_counts = Arc::clone(&connection_counts);
+            let stats = Arc::clone(&stats);
 
             if let Err(error) = submitter.submit_named_to(
                 shard_id,
@@ -398,6 +435,9 @@ impl ShardedTcpServer {
                                     shard_id,
                                     max_connections_per_shard,
                                 ) else {
+                                    stats
+                                        .connection_limit_rejections
+                                        .fetch_add(1, Ordering::AcqRel);
                                     continue;
                                 };
                                 let conn = ShardedTcpConnection {
@@ -413,6 +453,7 @@ impl ShardedTcpServer {
                                         permit,
                                     ),
                                 ) {
+                                    stats.handler_submit_errors.fetch_add(1, Ordering::AcqRel);
                                     eprintln!(
                                         "[sitas-tcp] shard {} handler submit failed: {}",
                                         shard_idx, error
@@ -420,6 +461,7 @@ impl ShardedTcpServer {
                                 }
                             }
                             RaceOutput::First(Err(e)) => {
+                                stats.accept_errors.fetch_add(1, Ordering::AcqRel);
                                 eprintln!("[sitas-tcp] shard {} accept error: {}", shard_idx, e);
                                 break;
                             }
@@ -433,7 +475,7 @@ impl ShardedTcpServer {
             }
         }
 
-        Ok(ShardedTcpServerHandle { stop_source })
+        Ok(ShardedTcpServerHandle { stop_source, stats })
     }
 
     fn start_with_single_accept<MakeHandler, HandlerFut>(
@@ -454,8 +496,10 @@ impl ShardedTcpServer {
         let shard_submitter = submitter.clone();
         let max_connections_per_shard = self.config.max_connections_per_shard;
         let connection_counts = connection_counts(shard_count);
+        let stats = Arc::new(ShardedTcpServerStats::default());
         let (stop_source, stop_token) = stop_pair();
         let listener = create_single_listener(bind_addr)?;
+        let accept_stats = Arc::clone(&stats);
 
         if let Err(error) = submitter.submit_named_to(ShardId(0), "tcp-accept-0", async move {
             loop {
@@ -467,6 +511,9 @@ impl ShardedTcpServer {
                             target_shard,
                             max_connections_per_shard,
                         ) else {
+                            accept_stats
+                                .connection_limit_rejections
+                                .fetch_add(1, Ordering::AcqRel);
                             continue;
                         };
                         let conn = ShardedTcpConnection {
@@ -478,6 +525,9 @@ impl ShardedTcpServer {
                         if let Err(error) = shard_submitter
                             .submit_to(target_shard, run_handler_with_permit(handler, permit))
                         {
+                            accept_stats
+                                .handler_submit_errors
+                                .fetch_add(1, Ordering::AcqRel);
                             eprintln!(
                                 "[sitas-tcp] shard {} handler submit failed: {}",
                                 target_shard.0, error
@@ -485,6 +535,7 @@ impl ShardedTcpServer {
                         }
                     }
                     RaceOutput::First(Err(e)) => {
+                        accept_stats.accept_errors.fetch_add(1, Ordering::AcqRel);
                         eprintln!("[sitas-tcp] accept error: {}", e);
                         break;
                     }
@@ -496,7 +547,7 @@ impl ShardedTcpServer {
             return Err(error.into());
         }
 
-        Ok(ShardedTcpServerHandle { stop_source })
+        Ok(ShardedTcpServerHandle { stop_source, stats })
     }
 }
 
@@ -801,6 +852,14 @@ mod bind_sockaddr_tests {
         let handle = server
             .start(&submitter, |_conn, _submitter| async move {})
             .unwrap();
+        assert_eq!(
+            handle.snapshot(),
+            ShardedTcpServerSnapshot {
+                connection_limit_rejections: 0,
+                accept_errors: 0,
+                handler_submit_errors: 0,
+            }
+        );
         assert!(handle.stop());
         assert!(handle.is_stopped());
 

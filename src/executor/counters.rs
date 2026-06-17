@@ -2,8 +2,10 @@
 //!
 //! [`SchedulerCounters`] accumulates task lifecycle metrics (spawned,
 //! completed, polls, budget exhaustion), driver events (readiness,
-//! completion dispatch), and Linux `io_uring` completion accounting. All
-//! counters are monotonic and reported in executor snapshots.
+//! completion wake cycles), and Linux `io_uring` completion dispatch
+//! accounting. Driver completion events count wake cycles; dispatched
+//! completions count individual operation completions. All counters are
+//! monotonic and reported in executor snapshots.
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct SchedulerCounters {
