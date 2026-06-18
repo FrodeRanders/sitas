@@ -27,16 +27,15 @@ The project is guided by a small set of invariants:
 The central design rule: application state has one owner. In the
 standard-library services that owner is a shard thread receiving typed
 commands. In the async runtime it is an executor shard polling futures.
-The form changes; the rule does not.
 
 This is why the project avoids \texttt{Arc<Mutex<Service\textgreater{}\textgreater{}}.
 A mutex makes mutation mechanically safe but hides the question the project
 studies: which shard owns this state, where does work run, and when does the
 ownership boundary get crossed?
 
-Shared-nothing does not mean synchronization-free. Wakers, reply state,
-lifecycle flags, counters, and submission queues use synchronization.
-Application service state does not. It stays local to its shard.
+Shared-nothing does not mean synchronization-free. While wakers, reply state,
+lifecycle flags, counters, and submission queues use synchronization, application 
+service state does not. It stays local to its shard.
 
 \begin{notabene}[Why avoid a service mutex?]
 A service mutex answers only one question: can two threads mutate this value at

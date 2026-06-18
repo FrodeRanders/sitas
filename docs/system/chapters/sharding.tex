@@ -120,8 +120,8 @@ the logical name alone is not the owner; the name plus its placement determines
 which executor may mutate the associated state.
 
 \begin{notabene}[Mailbox routing is not load balancing]
-The mailbox layer does not steal work and does not rebalance a hot work unit.
-It makes routing explicit. Changing the cluster shape means changing the
+The mailbox layer does not steal work and does not rebalance a hot work unit, but
+it makes routing explicit. Changing the cluster shape means changing the
 router targets or the work-unit placement table, then observing the new
 behavior through owned snapshots and example output.
 \end{notabene}
