@@ -1,4 +1,5 @@
 \chapter{Hands-on Labs}
+\label{chap:labs}
 
 \section{Purpose}
 
@@ -17,7 +18,7 @@ runtime module it exercises. The examples are small enough that modifying them
 is part of learning them.
 \end{notabene}
 
-\section{Lab 1: Timers and cooperative polling}
+\section{Lab 1: Timers and cooperative polling \hfill \textnormal{\textit{Beginner}}}
 
 Run:
 
@@ -42,7 +43,7 @@ Try this:
 The lesson: timers do not run in their own thread. The executor records
 deadlines, waits until the next event, and wakes tasks whose deadlines expire.
 
-\section{Lab 2: Wake coalescing}
+\section{Lab 2: Wake coalescing \hfill \textnormal{\textit{Beginner}}}
 
 Run the unit tests that mention repeated wakes:
 
@@ -66,7 +67,7 @@ Try this:
 The lesson: a waker requests another poll; it does not flood the scheduler
 with duplicate queue entries.
 
-\section{Lab 3: Readiness-driven TCP}
+\section{Lab 3: Readiness-driven TCP \hfill \textnormal{\textit{Intermediate}}}
 
 Run:
 
@@ -91,7 +92,7 @@ Try this:
 The lesson: readiness is retry-oriented. A writable notification does not mean
 every byte has been written; the helper retries until the operation completes.
 
-\section{Lab 4: Scheduling groups}
+\section{Lab 4: Scheduling groups \hfill \textnormal{\textit{Intermediate}}}
 
 Run:
 
@@ -117,7 +118,7 @@ Try this:
 The lesson: scheduling groups are cooperative accounting classes, not
 preemptive priorities. Long-running futures must yield.
 
-\section{Lab 5: Observability snapshots}
+\section{Lab 5: Observability snapshots \hfill \textnormal{\textit{Beginner}}}
 
 Run:
 
@@ -140,7 +141,7 @@ Try this:
 The lesson: snapshots are owned samples, not tracing events. To build a
 console-like view, sample repeatedly and compute differences.
 
-\section{Lab 6: Cross-shard submission}
+\section{Lab 6: Cross-shard submission \hfill \textnormal{\textit{Intermediate}}}
 
 Run:
 
@@ -165,7 +166,7 @@ Try this:
 The lesson: the remote future is polled remotely, and the result crosses back
 as an owned value.
 
-\section{Lab 7: Shard-local state}
+\section{Lab 7: Shard-local state \hfill \textnormal{\textit{Intermediate}}}
 
 Run:
 
@@ -189,7 +190,7 @@ Try this:
 The lesson: shard-local access is synchronous. To await, first produce an
 owned value and await outside the local-state closure.
 
-\section{Lab 8: CPU placement}
+\section{Lab 8: CPU placement \hfill \textnormal{\textit{Intermediate}}}
 
 Run:
 
@@ -217,7 +218,7 @@ Try this:
 The lesson: CPU placement is an explicit request to the OS. It is not a load
 balancer.
 
-\section{Lab 9: Linux \texttt{io\_uring}}
+\section{Lab 9: Linux \texttt{io\_uring} \hfill \textnormal{\textit{Advanced}}}
 
 This lab requires a Linux host or container where \texttt{io\_uring} setup is
 allowed.
@@ -245,7 +246,7 @@ The lesson: completion-based I/O has a different cancellation problem than
 readiness-based I/O. The kernel may still own an operation after the future is
 gone.
 
-\section{Lab 10: Sharded index build}
+\section{Lab 10: Sharded index build \hfill \textnormal{\textit{Advanced}}}
 
 Run:
 
@@ -287,7 +288,7 @@ shard-local work combined through explicit owned results or messages.
 
 \section{After the labs}
 
-After running these labs, return to the walkthrough chapter and re-read the
+After running these labs, return to \autoref{chap:walkthroughs} and re-read the
 modules. The source is easier to follow after seeing observable behavior. If a
-result is surprising, use the debugging checklist from the walkthrough chapter
-before changing code.
+result is surprising, use the debugging checklist
+(\autoref{sec:debugging-checklist}) before changing code.

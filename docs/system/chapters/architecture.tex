@@ -1,4 +1,5 @@
 \chapter{Architecture}
+\label{chap:architecture}
 
 \section{Invariants}
 
@@ -45,17 +46,22 @@ another shard request a change? Keeping service state shard-owned preserves
 that answer in the program structure.
 \end{notabene}
 
-\begin{lstlisting}[language={},caption={State ownership model}]
-Caller thread or task
-    |
-    | owned command / owned future / typed submitter call
-    v
-Owning shard
-    |
-    | synchronous local mutation
-    v
-Owned reply or owned snapshot
-\end{lstlisting}
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=48mm, minimum height=8mm, font=\footnotesize\ttfamily,
+        rounded corners=1.5pt},
+    arr/.style={->, >=stealth, thick, color=sitasAccent},
+    lbl/.style={font=\tiny\itshape, color=sitasMuted}
+]
+\node[box] (caller) at (0, 0) {Caller thread or task};
+\node[box] (shard)  at (0, -1.8) {Owning shard};
+\node[box] (reply)  at (0, -3.6) {Owned reply or snapshot};
+
+\draw[arr] (caller) -- node[right, lbl, align=left] {owned command /\\owned future /\\typed submitter call} (shard);
+\draw[arr] (shard) -- node[right, lbl] {synchronous local mutation} (reply);
+\end{tikzpicture}
+\end{center}
 
 \section{Boundaries and lifetimes}
 

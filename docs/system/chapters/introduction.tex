@@ -1,4 +1,5 @@
 \chapter{Introduction}
+\label{chap:introduction}
 
 \section{Purpose}
 
@@ -14,6 +15,17 @@ current branch extends that baseline with a custom executor, Unix readiness
 primitives, TCP helpers, sharded async execution, shard-local values,
 observability snapshots, CPU placement, and experimental Linux \texttt{io\_uring}
 support.
+
+\section{Prerequisites}
+
+This manual assumes familiarity with:
+
+\begin{itemize}
+    \item Rust ownership, borrowing, and lifetimes;
+    \item \texttt{Future}, \texttt{Poll}, \texttt{Waker}, and \texttt{Pin};
+    \item basic concurrency: threads, channels, mutexes;
+    \item Unix file descriptors and non-blocking I/O (for the I/O chapters).
+\end{itemize}
 
 \section{How to read this project}
 
@@ -32,11 +44,11 @@ The runtime keeps that model honest:
     \item observability returns copies, not borrowed internals.
 \end{enumerate}
 
-This manual follows that path. The architecture chapter explains the ownership
-rules. The executor chapter explains how futures become runnable work. The
-sharding chapter explains how one executor becomes many independent shards.
-The I/O chapter explains why readiness and completion are different mechanisms
-and how both appear in the runtime.
+This manual follows that path. \autoref{chap:architecture} explains the
+ownership rules. \autoref{chap:executor} explains how futures become runnable
+work. \autoref{chap:sharding} explains how one executor becomes many
+independent shards. \autoref{chap:io-runtime} explains why readiness and
+completion are different mechanisms and how both appear in the runtime.
 
 \begin{notabene}[Learning goal]
 If you can explain where a future is polled, who owns the state it mutates,
@@ -110,3 +122,17 @@ This makes the project useful as a learning resource. It has enough machinery
 to demonstrate timers, wakers, readiness, \texttt{io\_uring}, shard-local
 values, scheduling groups, and CPU placement while keeping those mechanisms
 visible in ordinary Rust modules.
+
+\section{Further reading}
+
+\begin{description}
+    \item[Seastar] The C++ shard-per-core framework that inspired the
+        ownership model.\\
+        \url{https://seastar.io}
+    \item[ScyllaDB shard-per-core architecture] Practical discussion of
+        shared-nothing database design on top of Seastar.\\
+        \url{https://www.scylladb.com/product/technology/shard-per-core-architecture/}
+    \item[Glommio] A Rust thread-per-core runtime using \texttt{io\_uring},
+        useful for comparing design choices.\\
+        \url{https://github.com/DataDog/glommio}
+\end{description}

@@ -32,7 +32,7 @@ A sharded executor:
 - CPU affinity on Linux (sched_setaffinity), container cpuset-aware
 - ShardLocal<T> — per-shard owned values with no mutex, closure-based access, stoppable workers
   
-Eperimental io_uring (Linux):
+Experimental io_uring (Linux):
 - Full ring, dispatcher lifecycle, tracked operations, abandoned buffer safety, completion counting
 - Integrated for file I/O futures (read_at_uring, write_all_at_uring)
 - Not yet unified with readiness/timers into a production I/O engine
@@ -193,250 +193,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Run the included example:
+Examples are grouped by concept level. Start at the top and work down.
+
+### Sharded services (std-only baseline)
 
 ```sh
-cargo run --example basic_kv
+cargo run --example basic_kv                # basic key-value store
+cargo run --example concurrent_kv           # concurrent callers
+cargo run --example submit_kv               # submit-and-wait-later
+cargo run --example async_kv                # custom-executor async replies
+cargo run --example custom_placement        # caller-provided key placement
+cargo run --example basic_counter           # second service proving runtime reuse
 ```
 
-Run the concurrent caller example:
+### Executor basics (timers, cancellation, composition)
 
 ```sh
-cargo run --example concurrent_kv
+cargo run --example executor_sleep          # timer futures
+cargo run --example executor_abort          # task abort
+cargo run --example executor_timeout        # timeout cancellation
+cargo run --example executor_race           # racing two futures
+cargo run --example executor_task_scope     # structured child tasks
 ```
 
-Run the submit-and-wait-later example:
+### I/O readiness (non-blocking descriptor helpers)
 
 ```sh
-cargo run --example submit_kv
+cargo run --example async_readable          # read-readiness future
+cargo run --example async_write             # async write helper
+cargo run --example async_copy              # async copy helper
 ```
 
-Run the custom-executor async reply example:
+### TCP (accept, connect, server patterns)
 
 ```sh
-cargo run --example async_kv
+cargo run --example async_accept            # accept helper
+cargo run --example async_connect           # connect helper
+cargo run --example async_tcp_echo          # TCP echo
+cargo run --example async_tcp_pair          # same-executor TCP pair
+cargo run --example async_tcp_server        # bounded server
+cargo run --example async_tcp_server_timeout        # bounded shutdown
+cargo run --example async_tcp_idle_server           # idle-timeout server
+cargo run --example async_tcp_idle_server_timeout    # bounded idle shutdown
+cargo run --example async_tcp_stoppable_server      # stop-token server
+cargo run --example async_tcp_scoped_server         # scoped server with handler propagation
+cargo run --example async_tcp_timeout       # I/O timeout helpers
+cargo run --example async_tcp_multi_echo    # multi-client echo
 ```
 
-Run the shard-per-thread executor example:
+### Sharded runtime (shard-per-thread executor)
 
 ```sh
-cargo run --example sharded_executor
+cargo run --example sharded_executor        # one executor per shard
+cargo run --example sharded_observability   # task snapshots across shards
+cargo run --example sharded_submit          # cross-shard async submission
+cargo run --example sharded_broadcast       # broadcast to all shards
+cargo run --example sharded_map_reduce      # map/reduce over shards
+cargo run --example sharded_index_build     # fixed-record index build
 ```
 
-Run the shard-per-thread observability example:
+### Shard-local state (per-shard owned values)
 
 ```sh
-cargo run --example sharded_observability
+cargo run --example shard_local             # basic shard-local access
+cargo run --example shard_local_handle      # cloneable handles
+cargo run --example shard_local_current     # direct current-shard access
+cargo run --example shard_local_workers     # per-shard workers
+cargo run --example shard_local_stoppable_workers           # cooperative stop
+cargo run --example shard_local_stoppable_workers_timeout    # bounded shutdown
+cargo run --example shard_local_worker_observability        # worker snapshots
 ```
 
-Run the cross-shard async submit example:
+### OS primitives (low-level reactor)
 
 ```sh
-cargo run --example sharded_submit
-```
-
-Run the shard broadcast example:
-
-```sh
-cargo run --example sharded_broadcast
-```
-
-Run the shard map-reduce example:
-
-```sh
-cargo run --example sharded_map_reduce
-```
-
-Run the sharded fixed-record index build example:
-
-```sh
-cargo run --example sharded_index_build
-```
-
-Run the shard-local state example:
-
-```sh
-cargo run --example shard_local
-```
-
-Run the cloneable shard-local handle example:
-
-```sh
-cargo run --example shard_local_handle
-```
-
-Run the direct current-shard shard-local access example:
-
-```sh
-cargo run --example shard_local_current
-```
-
-Run the shard-local worker example:
-
-```sh
-cargo run --example shard_local_workers
-```
-
-Run the stoppable shard-local worker example:
-
-```sh
-cargo run --example shard_local_stoppable_workers
-```
-
-Run the bounded stoppable shard-local worker shutdown example:
-
-```sh
-cargo run --example shard_local_stoppable_workers_timeout
-```
-
-Run the shard-local worker observability example:
-
-```sh
-cargo run --example shard_local_worker_observability
-```
-
-Run the executor async accept helper example:
-
-```sh
-cargo run --example async_accept
-```
-
-Run the executor async connect helper example:
-
-```sh
-cargo run --example async_connect
-```
-
-Run the executor TCP echo example:
-
-```sh
-cargo run --example async_tcp_echo
-```
-
-Run the same-executor TCP echo pair example:
-
-```sh
-cargo run --example async_tcp_pair
-```
-
-Run the bounded async TCP server helper example:
-
-```sh
-cargo run --example async_tcp_server
-```
-
-Run the bounded-shutdown fixed-count TCP server helper example:
-
-```sh
-cargo run --example async_tcp_server_timeout
-```
-
-Run the idle-timeout async TCP server helper example:
-
-```sh
-cargo run --example async_tcp_idle_server
-```
-
-Run the bounded-shutdown idle-timeout TCP server helper example:
-
-```sh
-cargo run --example async_tcp_idle_server_timeout
-```
-
-Run the stoppable async TCP server helper example:
-
-```sh
-cargo run --example async_tcp_stoppable_server
-```
-
-Run the scoped async TCP server helper example:
-
-```sh
-cargo run --example async_tcp_scoped_server
-```
-
-Run the async TCP timeout example:
-
-```sh
-cargo run --example async_tcp_timeout
-```
-
-Run the executor multi-client TCP echo example:
-
-```sh
-cargo run --example async_tcp_multi_echo
-```
-
-Run the executor async copy helper example:
-
-```sh
-cargo run --example async_copy
-```
-
-Run the executor read-readiness future example:
-
-```sh
-cargo run --example async_readable
-```
-
-Run the executor async write helper example:
-
-```sh
-cargo run --example async_write
-```
-
-Run the executor timer example:
-
-```sh
-cargo run --example executor_sleep
-```
-
-Run the executor task abort example:
-
-```sh
-cargo run --example executor_abort
-```
-
-Run the executor timeout example:
-
-```sh
-cargo run --example executor_timeout
-```
-
-Run the executor race example:
-
-```sh
-cargo run --example executor_race
-```
-
-Run the executor task scope example:
-
-```sh
-cargo run --example executor_task_scope
-```
-
-Run the custom placement example:
-
-```sh
-cargo run --example custom_placement
-```
-
-Run the counter example:
-
-```sh
-cargo run --example basic_counter
-```
-
-Run the OS reactor wake example:
-
-```sh
-cargo run --example os_reactor
-```
-
-Run the OS read-readiness example:
-
-```sh
-cargo run --example os_readable
+cargo run --example os_reactor              # reactor wake
+cargo run --example os_readable             # read-readiness
 ```
 
 ## Development

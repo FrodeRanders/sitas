@@ -1,4 +1,5 @@
 \chapter{Sharding}
+\label{chap:sharding}
 
 \section{Shard-per-core direction}
 
@@ -19,13 +20,23 @@ state and works on its own queue, so no global lock is needed. Cross-shard
 communication is an explicit design cost, not an accidental side effect of
 shared references.
 
-\begin{lstlisting}[language={},caption={Shard-per-core runtime shape}]
-Shard 0 thread        Shard 1 thread        Shard 2 thread
-  Executor              Executor              Executor
-  local tasks           local tasks           local tasks
-  local timers          local timers          local timers
-  local state           local state           local state
-\end{lstlisting}
+\begin{center}
+\begin{tikzpicture}[
+    shardbox/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=28mm, minimum height=7mm, font=\footnotesize\ttfamily},
+    shardlabel/.style={font=\footnotesize\bfseries}
+]
+\foreach \x/\name in {0/Shard 0, 1/Shard 1, 2/Shard 2} {
+    \begin{scope}[xshift=\x*35mm]
+        \node[shardlabel] at (0, 2.0) {\name{} thread};
+        \node[shardbox] at (0, 1.3) {Executor};
+        \node[shardbox] at (0, 0.5) {local tasks};
+        \node[shardbox] at (0, -0.3) {local timers};
+        \node[shardbox] at (0, -1.1) {local state};
+    \end{scope}
+}
+\end{tikzpicture}
+\end{center}
 
 \section{Cross-shard submission}
 
@@ -42,18 +53,24 @@ shard 1 and awaits the join handle. The submitted future is polled on shard 1.
 On completion, the awaiting future on shard 0 wakes and continues on shard 0.
 The result crosses the boundary as an owned value.
 
-\begin{lstlisting}[language={},caption={Cross-shard async flow}]
-Shard 0 task
-    submit future to Shard 1
-    await JoinHandle
+\begin{center}
+\begin{tikzpicture}[
+    sbox/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=38mm, minimum height=8mm, font=\footnotesize\ttfamily,
+        rounded corners=1.5pt},
+    arr/.style={->, >=stealth, thick, color=sitasAccent},
+    lbl/.style={font=\tiny\itshape, color=sitasMuted}
+]
+\node[sbox] (s0a) at (0, 0) {Shard 0: submit future};
+\node[sbox] (s1)  at (6, 0) {Shard 1: poll future};
+\node[sbox] (s1r) at (6, -1.4) {Shard 1: owned result};
+\node[sbox] (s0b) at (0, -1.4) {Shard 0: receive result};
 
-Shard 1 executor
-    poll submitted future
-    complete owned result
-
-Shard 0 task
-    wakes and receives result
-\end{lstlisting}
+\draw[arr] (s0a) -- node[above, lbl] {Send + 'static} (s1);
+\draw[arr] (s1) -- (s1r);
+\draw[arr] (s1r) -- node[above, lbl] {owned value} (s0b);
+\end{tikzpicture}
+\end{center}
 
 This is why cross-shard APIs require \texttt{Send + 'static} where a future or
 value can move to another thread. It is also why references into shard-local
