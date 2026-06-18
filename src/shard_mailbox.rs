@@ -280,6 +280,8 @@ pub struct ShardMailboxSnapshot {
     pub full_rejections: u64,
     /// Total send attempts rejected because the receiver was closed.
     pub closed_rejections: u64,
+    /// Number of senders currently parked waiting for capacity.
+    pub send_waiter_count: usize,
 }
 
 /// A single bounded inbound mailbox owned by one shard.
@@ -300,6 +302,7 @@ impl<M> ShardMailbox<M> {
                     receiver_taken: false,
                     receiver_closed: false,
                     recv_waker: None,
+                    send_wakers: VecDeque::new(),
                 }),
                 sent: AtomicU64::new(0),
                 received: AtomicU64::new(0),
@@ -767,6 +770,14 @@ impl<M: Send + 'static> ShardSender<M> {
         self.shared.try_send(message)
     }
 
+    /// Sends one owned message, waiting for capacity if the mailbox is full.
+    pub fn send(&self, message: M) -> ShardSend<'_, M> {
+        ShardSend {
+            sender: self,
+            message: Some(message),
+        }
+    }
+
     /// Closes the target receiver side and wakes any pending receiver.
     pub fn close(&self) {
         self.shared.close_receiver();
@@ -862,6 +873,42 @@ impl<M> fmt::Debug for ShardRecv<'_, M> {
     }
 }
 
+/// Future returned by [`ShardSender::send`].
+#[must_use = "mailbox send futures do nothing unless polled or awaited"]
+pub struct ShardSend<'a, M> {
+    sender: &'a ShardSender<M>,
+    message: Option<M>,
+}
+
+// Safety: the message field is accessed by value (take/replace), never pinned.
+impl<M> Unpin for ShardSend<'_, M> {}
+
+impl<M: Send + 'static> Future for ShardSend<'_, M> {
+    type Output = Result<(), ShardSendError<M>>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.sender.shared.poll_send(&mut this.message, context)
+    }
+}
+
+impl<M> Drop for ShardSend<'_, M> {
+    fn drop(&mut self) {
+        if self.message.is_some() {
+            self.sender.shared.wake_one_sender();
+        }
+    }
+}
+
+impl<M> fmt::Debug for ShardSend<'_, M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardSend")
+            .field("target_shard", &self.sender.shared.shard_id)
+            .field("pending", &self.message.is_some())
+            .finish()
+    }
+}
+
 struct SharedMailbox<M> {
     shard_id: ShardId,
     state: Mutex<MailboxState<M>>,
@@ -879,6 +926,7 @@ struct MailboxState<M> {
     receiver_taken: bool,
     receiver_closed: bool,
     recv_waker: Option<Waker>,
+    send_wakers: VecDeque<Waker>,
 }
 
 impl<M> SharedMailbox<M> {
@@ -906,50 +954,79 @@ impl<M> SharedMailbox<M> {
     }
 
     fn try_recv(&self) -> Result<M, ShardRecvError> {
-        let mut state = self.state.lock().expect("mailbox mutex poisoned");
-        if let Some(message) = state.queue.pop_front() {
-            self.received.fetch_add(1, Ordering::AcqRel);
-            return Ok(message);
+        let send_wake;
+        let result;
+        {
+            let mut state = self.state.lock().expect("mailbox mutex poisoned");
+            if let Some(message) = state.queue.pop_front() {
+                self.received.fetch_add(1, Ordering::AcqRel);
+                send_wake = state.send_wakers.pop_front();
+                result = Ok(message);
+            } else if state.receiver_closed
+                || (!state.sender_factory_open && state.sender_count == 0)
+            {
+                send_wake = None;
+                result = Err(ShardRecvError::Closed);
+            } else {
+                send_wake = None;
+                result = Err(ShardRecvError::Empty);
+            }
         }
-        if state.receiver_closed || (!state.sender_factory_open && state.sender_count == 0) {
-            Err(ShardRecvError::Closed)
-        } else {
-            Err(ShardRecvError::Empty)
+        if let Some(waker) = send_wake {
+            waker.wake();
         }
+        result
     }
 
     fn poll_recv(&self, context: &mut Context<'_>) -> Poll<Result<M, ShardRecvError>> {
-        let mut state = self.state.lock().expect("mailbox mutex poisoned");
-        if let Some(message) = state.queue.pop_front() {
-            self.received.fetch_add(1, Ordering::AcqRel);
-            return Poll::Ready(Ok(message));
-        }
-        if state.receiver_closed || (!state.sender_factory_open && state.sender_count == 0) {
-            Poll::Ready(Err(ShardRecvError::Closed))
-        } else {
-            if !state
-                .recv_waker
-                .as_ref()
-                .is_some_and(|waker| waker.will_wake(context.waker()))
+        let send_wake;
+        let result;
+        {
+            let mut state = self.state.lock().expect("mailbox mutex poisoned");
+            if let Some(message) = state.queue.pop_front() {
+                self.received.fetch_add(1, Ordering::AcqRel);
+                send_wake = state.send_wakers.pop_front();
+                result = Poll::Ready(Ok(message));
+            } else if state.receiver_closed
+                || (!state.sender_factory_open && state.sender_count == 0)
             {
-                state.recv_waker = Some(context.waker().clone());
+                send_wake = None;
+                result = Poll::Ready(Err(ShardRecvError::Closed));
+            } else {
+                if !state
+                    .recv_waker
+                    .as_ref()
+                    .is_some_and(|waker| waker.will_wake(context.waker()))
+                {
+                    state.recv_waker = Some(context.waker().clone());
+                }
+                send_wake = None;
+                result = Poll::Pending;
             }
-            Poll::Pending
         }
+        if let Some(waker) = send_wake {
+            waker.wake();
+        }
+        result
     }
 
     fn close_receiver(&self) {
-        let wake = {
+        let recv_wake;
+        let send_wakes;
+        {
             let mut state = self.state.lock().expect("mailbox mutex poisoned");
             if state.receiver_closed {
-                None
-            } else {
-                state.receiver_closed = true;
-                state.recv_waker.take()
+                return;
             }
-        };
+            state.receiver_closed = true;
+            recv_wake = state.recv_waker.take();
+            send_wakes = state.send_wakers.drain(..).collect::<Vec<_>>();
+        }
 
-        if let Some(waker) = wake {
+        if let Some(waker) = recv_wake {
+            waker.wake();
+        }
+        for waker in send_wakes {
             waker.wake();
         }
     }
@@ -990,6 +1067,45 @@ impl<M> SharedMailbox<M> {
         }
     }
 
+    fn poll_send(
+        &self,
+        message: &mut Option<M>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), ShardSendError<M>>> {
+        let recv_wake;
+        {
+            let mut state = self.state.lock().expect("mailbox mutex poisoned");
+            let msg = message.take().expect("poll_send called after completion");
+            if state.receiver_closed {
+                self.closed_rejections.fetch_add(1, Ordering::AcqRel);
+                return Poll::Ready(Err(ShardSendError::Closed(msg)));
+            }
+            if state.queue.len() < state.capacity {
+                state.queue.push_back(msg);
+                self.sent.fetch_add(1, Ordering::AcqRel);
+                recv_wake = state.recv_waker.take();
+            } else {
+                *message = Some(msg);
+                state.send_wakers.push_back(context.waker().clone());
+                return Poll::Pending;
+            }
+        }
+        if let Some(waker) = recv_wake {
+            waker.wake();
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn wake_one_sender(&self) {
+        let wake = {
+            let mut state = self.state.lock().expect("mailbox mutex poisoned");
+            state.send_wakers.pop_front()
+        };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+    }
+
     fn snapshot(&self) -> ShardMailboxSnapshot {
         let state = self.state.lock().expect("mailbox mutex poisoned");
         ShardMailboxSnapshot {
@@ -1003,6 +1119,7 @@ impl<M> SharedMailbox<M> {
             received: self.received.load(Ordering::Acquire),
             full_rejections: self.full_rejections.load(Ordering::Acquire),
             closed_rejections: self.closed_rejections.load(Ordering::Acquire),
+            send_waiter_count: state.send_wakers.len(),
         }
     }
 }
@@ -1208,6 +1325,7 @@ mod tests {
                 received: 1,
                 full_rejections: 1,
                 closed_rejections: 0,
+                send_waiter_count: 0,
             }
         );
     }
@@ -1433,6 +1551,113 @@ mod tests {
             assert_eq!(seen.len(), 3);
             assert!(seen.iter().all(|(_, target)| *target == shard_id.0));
         }
+
+        drop(mailboxes);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn send_await_waits_for_capacity() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let mailboxes = Arc::new(
+            ShardMailboxSet::<usize>::with_shard_count(2, ShardMailboxConfig::new(1)).unwrap(),
+        );
+        let sender = mailboxes.sender_to(ShardId(1)).unwrap();
+        sender.try_send(1).unwrap();
+        assert!(matches!(sender.try_send(2), Err(ShardSendError::Full(2))));
+
+        let receiver_mailboxes = Arc::clone(&mailboxes);
+        let receiver = runtime
+            .spawn_with_handle_on(ShardId(1), async move {
+                let mut receiver = receiver_mailboxes.receiver_for_current_shard().unwrap();
+                yield_now().await;
+                let a = receiver.recv().await.unwrap();
+                let b = receiver.recv().await.unwrap();
+                (a, b)
+            })
+            .unwrap();
+
+        let send_handle = runtime
+            .spawn_with_handle_on(ShardId(0), async move {
+                sender.send(2).await.unwrap();
+            })
+            .unwrap();
+
+        block_on(send_handle).unwrap();
+        let (a, b) = block_on(receiver).unwrap();
+
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+
+        drop(mailboxes);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn send_await_returns_closed_when_receiver_drops() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let mailboxes = Arc::new(
+            ShardMailboxSet::<usize>::with_shard_count(2, ShardMailboxConfig::new(1)).unwrap(),
+        );
+        let sender = mailboxes.sender_to(ShardId(0)).unwrap();
+        sender.try_send(1).unwrap();
+
+        let receiver_mailboxes = Arc::clone(&mailboxes);
+        let closer = runtime
+            .spawn_with_handle_on(ShardId(0), async move {
+                let receiver = receiver_mailboxes.receiver_for_current_shard().unwrap();
+                yield_now().await;
+                drop(receiver);
+            })
+            .unwrap();
+
+        let send_handle = runtime
+            .spawn_with_handle_on(ShardId(1), async move { sender.send(2).await })
+            .unwrap();
+
+        block_on(closer).unwrap();
+        let result = block_on(send_handle).unwrap();
+        assert!(matches!(result, Err(ShardSendError::Closed(2))));
+
+        drop(mailboxes);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn send_await_snapshot_tracks_waiters() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let mailboxes = Arc::new(
+            ShardMailboxSet::<usize>::with_shard_count(2, ShardMailboxConfig::new(1)).unwrap(),
+        );
+        let sender = mailboxes.sender_to(ShardId(1)).unwrap();
+        sender.try_send(1).unwrap();
+
+        let snap_mailboxes = Arc::clone(&mailboxes);
+        let receiver_mailboxes = Arc::clone(&mailboxes);
+
+        let send_handle = runtime
+            .spawn_with_handle_on(ShardId(0), async move {
+                sender.send(2).await.unwrap();
+            })
+            .unwrap();
+
+        let snap_handle = runtime
+            .spawn_with_handle_on(ShardId(1), async move {
+                yield_now().await;
+                yield_now().await;
+                let snap = snap_mailboxes.snapshot(ShardId(1)).unwrap();
+                let waiters = snap.send_waiter_count;
+                let mut receiver = receiver_mailboxes.receiver_for_current_shard().unwrap();
+                receiver.recv().await.unwrap();
+                receiver.recv().await.unwrap();
+                waiters
+            })
+            .unwrap();
+
+        block_on(send_handle).unwrap();
+        let waiters_before_drain = block_on(snap_handle).unwrap();
+
+        assert!(waiters_before_drain >= 1);
 
         drop(mailboxes);
         runtime.stop().unwrap();

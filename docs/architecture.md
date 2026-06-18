@@ -105,7 +105,29 @@ Senders use an atomic refcount so intermediate clone drops do not prematurely si
 
 ### `shard_mailbox`
 
-`shard_mailbox` provides typed owned-message transfer between executor shards. A `ShardMailboxSet<M>` owns one bounded inbound mailbox per shard. Cloneable `ShardSender<M>` handles may enqueue owned `M: Send + 'static` values for a target shard, while a single `ShardReceiver<M>` drains that target shard's queue. For non-uniform work assignment, `WorkUnitMailboxSet<N, M>` maps logical work-unit names to independently assigned shard-local receivers; multiple work units may run on one shard and some shards may have no work unit for a given protocol. `UniformShardRouter` keeps the original key-to-`ShardId` route explicit, while `WorkUnitRouter<N>` routes keys to logical names before placement resolves those names to shards. The mailbox is a transport boundary, not shared application state: producers transfer ownership and only receiver tasks running on the owning shard should mutate the state associated with received messages. Mailbox snapshots are owned values that expose queue length, capacity, close state, sender count, and send/receive/rejection counters without exposing message references or queue internals.
+`shard_mailbox` provides typed owned-message transfer between executor shards. A `ShardMailboxSet<M>` owns one bounded inbound mailbox per shard. Cloneable `ShardSender<M>` handles may enqueue owned `M: Send + 'static` values for a target shard, while a single `ShardReceiver<M>` drains that target shard's queue. `ShardSender` provides non-blocking `try_send` (returning `Full(M)` or `Closed(M)` on failure with the original owned message) and awaitable `send` (parking until capacity is available or the receiver closes). For non-uniform work assignment, `WorkUnitMailboxSet<N, M>` maps logical work-unit names to independently assigned shard-local receivers; multiple work units may run on one shard and some shards may have no work unit for a given protocol. `UniformShardRouter` keeps the original key-to-`ShardId` route explicit, while `WorkUnitRouter<N>` routes keys to logical names before placement resolves those names to shards. The mailbox is a transport boundary, not shared application state: producers transfer ownership and only receiver tasks running on the owning shard should mutate the state associated with received messages. Mailbox snapshots are owned values that expose queue length, capacity, close state, sender count, send waiter count, and send/receive/rejection counters without exposing message references or queue internals.
+
+#### Performance comparison: mailbox transfer vs file-backed exchange
+
+The `sharded_index_mailbox` and `sharded_index_build` examples build the same sorted secondary index over a fixed-record data file, differing only in how intermediate data crosses shard boundaries. The build example writes per-shard sorted run files and performs multi-round pairwise merge I/O. The mailbox example routes entries by key through owned mailbox messages to logical assembler work units, which sort and write pre-partitioned files before a single k-way merge.
+
+Measured on macOS (Apple Silicon, 8 CPUs), release mode, deterministic input, default seed:
+
+| Records | Shards | Build total | Mailbox total | Build merge | Mailbox scan+xfer |
+|---------|--------|-------------|---------------|-------------|-------------------|
+| 1M      | 1      | 6.1s        | 8.9s          | ~0          | 20ms              |
+| 1M      | 2      | 8.6s        | 8.9s          | 2.9s        | 13ms              |
+| 1M      | 4      | 10.2s       | 8.2s          | 5.3s        | 9ms               |
+| 1M      | 8      | 13.3s       | 9.3s          | 6.9s        | 12ms              |
+| 5M      | 2      | 47.2s       | 46.3s         | 15.0s       | 63ms              |
+| 5M      | 4      | 57.4s       | 45.4s         | 27.4s       | 39ms              |
+| 5M      | 8      | 69.9s       | 51.0s         | 34.9s       | 43ms              |
+
+The build example anti-scales with shard count: more shards produce more run files, requiring more merge rounds of full-dataset file I/O. At 5M records, going from 2 to 8 shards increases build total by 48%. The mailbox example stays roughly flat because in-memory transfer replaces intermediate file exchange and the final k-way merge reads each partition file once.
+
+Both totals are dominated by unbuffered I/O overhead: data file creation, `write_index_entry` (two 8-byte `write_all` calls per entry), and verification. The mailbox's reported work phases (scan+transfer in tens of milliseconds, assembler join in microseconds) reflect concurrent shard execution where scanning, mailbox transfer, assembler sort, and partition writes overlap on executor threads.
+
+The build example wins at 1 shard because it has no merge phase and copies one file. At 4+ shards the mailbox approach pulls ahead because it avoids O(N log S) merge I/O. Neither example uses buffered writers, so both pay per-entry syscall costs that dwarf the architectural difference at small scale.
 
 ### `udp`
 

@@ -18,13 +18,12 @@
 //! coordinator reads their sorted run files during the final k-way merge.
 
 use sitas::{
-    CpuPlacement, RouteByKey, ShardId, ShardLocal, ShardMailboxConfig, ShardSendError,
-    ShardedExecutor, ShardedExecutorConfig, WorkUnitMailboxSet, WorkUnitRouter, WorkUnitSpec,
-    available_cpu_ids, current_executor_cpu_placement, current_executor_shard,
-    executor::{block_on, yield_now},
+    CpuPlacement, RouteByKey, ShardId, ShardLocal, ShardMailboxConfig, ShardedExecutor,
+    ShardedExecutorConfig, WorkUnitMailboxSet, WorkUnitRouter, WorkUnitSpec, available_cpu_ids,
+    current_executor_cpu_placement, current_executor_shard, executor::block_on,
 };
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -73,7 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // answer "which shard should I send to?" directly. WorkUnitMailboxSet uses
     // the work-unit placement table to resolve the logical name to a receiver.
     let router = WorkUnitRouter::new(work_units.iter().map(|spec| spec.name))?;
-    let progress = ShardLocal::new(runtime.submitter(), |_| ShardProgress::default());
+    let progress: ShardLocal<BTreeMap<String, ShardProgress>> =
+        ShardLocal::new(runtime.submitter(), |_| BTreeMap::new());
     let mailboxes = Arc::new(WorkUnitMailboxSet::new(
         &runtime.submitter(),
         work_units.clone(),
@@ -185,29 +185,26 @@ async fn scan_and_send(
     partition: Partition,
     router: WorkUnitRouter<IndexWorkUnit>,
     mailboxes: Arc<WorkUnitMailboxSet<IndexWorkUnit, IndexMessage>>,
-    progress: ShardLocal<ShardProgress>,
+    progress: ShardLocal<BTreeMap<String, ShardProgress>>,
 ) -> io::Result<()> {
     let shard_id = current_executor_shard().expect("scanner runs on a shard");
+    let task_label = format!("scan-{}", shard_id.0);
 
-    // Keep one sender and one pending batch per logical assembler. The router
-    // returns an assembler index; the sender hides the physical shard assigned
-    // to that assembler.
     let senders = senders_for_assemblers(&mailboxes, router.work_unit_count())?;
     let mut batches = vec![Vec::with_capacity(SEND_BATCH_ENTRIES); router.work_unit_count()];
     let mut data = File::open(data_path)?;
     let mut next_record = partition.start_record;
     let mut scanned = 0usize;
     let mut sent = 0usize;
-    let mut full_retries = 0usize;
 
     set_progress(
         &progress,
+        &task_label,
         Phase::Scanning,
         ProgressNumbers {
             records_scanned: 0,
             entries_sent: 0,
             entries_received: 0,
-            mailbox_full_retries: 0,
             bytes_read: 0,
             bytes_written: 0,
         },
@@ -219,9 +216,6 @@ async fn scan_and_send(
         let mut buffer = vec![0u8; chunk_records * RECORD_SIZE];
         data.read_exact(&mut buffer)?;
 
-        // Routing happens per record, but sending happens per destination
-        // batch. This keeps message counts bounded without changing ownership:
-        // every batch moved into IndexMessage is owned by the receiving shard.
         for (chunk_idx, record_bytes) in buffer.chunks_exact(RECORD_SIZE).enumerate() {
             let record_idx = next_record + chunk_idx;
             let record = record_from_bytes(record_bytes)?;
@@ -234,23 +228,22 @@ async fn scan_and_send(
 
             if batches[destination].len() == SEND_BATCH_ENTRIES {
                 let batch = std::mem::take(&mut batches[destination]);
-                full_retries += send_message_retry(
-                    &senders[destination],
-                    IndexMessage::Entries {
+                senders[destination]
+                    .send(IndexMessage::Entries {
                         from: shard_id,
                         batch,
-                    },
-                )
-                .await?;
+                    })
+                    .await
+                    .map_err(io_other)?;
                 sent += SEND_BATCH_ENTRIES;
                 set_progress(
                     &progress,
+                    &task_label,
                     Phase::Sending,
                     ProgressNumbers {
                         records_scanned: scanned,
                         entries_sent: sent,
                         entries_received: 0,
-                        mailbox_full_retries: full_retries,
                         bytes_read: scanned * RECORD_SIZE,
                         bytes_written: 0,
                     },
@@ -261,39 +254,34 @@ async fn scan_and_send(
         next_record += chunk_records;
     }
 
-    // Flush partial batches after the final chunk. These are often the only
-    // batches for small demos, so correctness cannot depend on hitting the
-    // SEND_BATCH_ENTRIES boundary.
     for (destination, batch) in batches.into_iter().enumerate() {
         if !batch.is_empty() {
             sent += batch.len();
-            full_retries += send_message_retry(
-                &senders[destination],
-                IndexMessage::Entries {
+            senders[destination]
+                .send(IndexMessage::Entries {
                     from: shard_id,
                     batch,
-                },
-            )
-            .await?;
+                })
+                .await
+                .map_err(io_other)?;
         }
     }
 
-    // Each assembler expects one completion marker from every scanner shard.
-    // The marker is the close-of-input protocol for that producer; the mailbox
-    // itself can remain open because other producers may still be active.
     for sender in &senders {
-        full_retries +=
-            send_message_retry(sender, IndexMessage::ProducerDone { from: shard_id }).await?;
+        sender
+            .send(IndexMessage::ProducerDone { from: shard_id })
+            .await
+            .map_err(io_other)?;
     }
 
     set_progress(
         &progress,
+        &task_label,
         Phase::Done,
         ProgressNumbers {
             records_scanned: scanned,
             entries_sent: sent,
             entries_received: 0,
-            mailbox_full_retries: full_retries,
             bytes_read: scanned * RECORD_SIZE,
             bytes_written: 0,
         },
@@ -305,35 +293,36 @@ async fn scan_and_send(
 async fn assemble_partition(
     mailboxes: Arc<WorkUnitMailboxSet<IndexWorkUnit, IndexMessage>>,
     work_unit: IndexWorkUnit,
-    progress: ShardLocal<ShardProgress>,
+    progress: ShardLocal<BTreeMap<String, ShardProgress>>,
     producer_count: usize,
     output_path: PathBuf,
 ) -> io::Result<PartitionRun> {
     let shard_id = current_executor_shard().expect("assembler runs on a shard");
     let cpu_placement =
         current_executor_cpu_placement().expect("assembler runs on a sharded executor");
+    let task_label = work_unit.label();
 
-    // This is the guard that makes logical naming safe: a work-unit receiver
-    // can only be taken by the shard it was assigned to. After this point the
-    // assembler owns its local Vec and no other shard can mutate it.
     let mut receiver = mailboxes
         .receiver_for_current_shard(&work_unit)
         .map_err(io_other)?;
     let mut entries = Vec::new();
     let mut producers_done = 0usize;
 
-    set_progress(&progress, Phase::Receiving, ProgressNumbers::default());
+    set_progress(
+        &progress,
+        &task_label,
+        Phase::Receiving,
+        ProgressNumbers::default(),
+    );
 
     while producers_done < producer_count {
         match receiver.recv().await.map_err(io_other)? {
             IndexMessage::Entries { from, batch } => {
                 debug_assert!(from.0 < producer_count);
-                // The batch crosses the shard boundary by value. Extending the
-                // local Vec consumes the received batch rather than borrowing
-                // from scanner state.
                 entries.extend(batch);
                 set_progress(
                     &progress,
+                    &task_label,
                     Phase::Receiving,
                     ProgressNumbers {
                         entries_received: entries.len(),
@@ -343,19 +332,14 @@ async fn assemble_partition(
             }
             IndexMessage::ProducerDone { from } => {
                 debug_assert!(from.0 < producer_count);
-                // Count producer completions instead of relying on receiver
-                // closure; the mailbox may have many senders and closure would
-                // conflate normal end-of-input with a dropped sender bug.
                 producers_done += 1;
             }
         }
     }
 
-    // The assembler owns one logical partition of the index keyspace. It sorts
-    // only that partition, writes one run file, and returns owned metadata to
-    // the coordinating main thread.
     set_progress(
         &progress,
+        &task_label,
         Phase::Sorting,
         ProgressNumbers {
             entries_received: entries.len(),
@@ -367,6 +351,7 @@ async fn assemble_partition(
     let bytes_written = entries.len() * INDEX_ENTRY_SIZE;
     set_progress(
         &progress,
+        &task_label,
         Phase::Done,
         ProgressNumbers {
             entries_received: entries.len(),
@@ -392,32 +377,6 @@ fn senders_for_assemblers(
     (0..assembler_count)
         .map(|idx| mailboxes.sender_to(&IndexWorkUnit(idx)).map_err(io_other))
         .collect()
-}
-
-async fn send_message_retry(
-    sender: &sitas::ShardSender<IndexMessage>,
-    mut message: IndexMessage,
-) -> io::Result<usize> {
-    let mut full_retries = 0usize;
-    loop {
-        match sender.try_send(message) {
-            Ok(()) => return Ok(full_retries),
-            Err(ShardSendError::Full(returned)) => {
-                // Backpressure is explicit. The bounded mailbox returns the
-                // unsent message, so the producer can yield cooperatively and
-                // retry without cloning or losing ownership of the payload.
-                full_retries += 1;
-                message = returned;
-                yield_now().await;
-            }
-            Err(ShardSendError::Closed(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "destination mailbox closed",
-                ));
-            }
-        }
-    }
 }
 
 fn assembler_work_units(
@@ -562,57 +521,59 @@ fn verify_index_file(
     Ok(())
 }
 
-fn print_progress(label: &str, runtime: &ShardedExecutor, progress: &ShardLocal<ShardProgress>) {
-    // Runtime snapshots and ShardLocal snapshots are intentionally owned
-    // values. The reporting code never borrows shard-local state out of its
-    // owning executor.
+fn print_progress(
+    label: &str,
+    runtime: &ShardedExecutor,
+    progress: &ShardLocal<BTreeMap<String, ShardProgress>>,
+) {
     let snapshot = runtime.snapshot();
-    let progress_values: Vec<(ShardId, ShardProgress)> =
-        block_on(progress.map_all(|_, p| *p)).unwrap_or_default();
+    let progress_values: Vec<(ShardId, BTreeMap<String, ShardProgress>)> =
+        block_on(progress.map_all(|_, p| p.clone())).unwrap_or_default();
 
     println!("{label}:");
     for shard in &snapshot.shards {
-        let progress = progress_values
-            .iter()
-            .find(|(id, _)| *id == shard.shard_id)
-            .map(|(_, p)| *p)
-            .unwrap_or_default();
         let task_count = shard
             .executor
             .as_ref()
             .map_or(0, |executor| executor.task_count);
-        println!(
-            "  shard {} {} phase={} scanned={} sent={} received={} full-retries={} read={}B wrote={}B tasks={}",
-            shard.shard_id.0,
-            shard.cpu_placement,
-            progress.phase.name(),
-            progress.numbers.records_scanned,
-            progress.numbers.entries_sent,
-            progress.numbers.entries_received,
-            progress.numbers.mailbox_full_retries,
-            progress.numbers.bytes_read,
-            progress.numbers.bytes_written,
-            task_count
-        );
+        let tasks = progress_values
+            .iter()
+            .find(|(id, _)| *id == shard.shard_id)
+            .map(|(_, map)| map);
+        if let Some(map) = tasks {
+            for (task_label, p) in map {
+                println!(
+                    "  shard {} {} {task_label} phase={} scanned={} sent={} received={} read={}B wrote={}B tasks={}",
+                    shard.shard_id.0,
+                    shard.cpu_placement,
+                    p.phase.name(),
+                    p.numbers.records_scanned,
+                    p.numbers.entries_sent,
+                    p.numbers.entries_received,
+                    p.numbers.bytes_read,
+                    p.numbers.bytes_written,
+                    task_count
+                );
+            }
+        } else {
+            println!(
+                "  shard {} {} phase=idle tasks={task_count}",
+                shard.shard_id.0, shard.cpu_placement,
+            );
+        }
     }
 }
 
-fn set_progress(progress: &ShardLocal<ShardProgress>, phase: Phase, numbers: ProgressNumbers) {
-    let _ = progress.with_current_result(|p| {
-        // Scanner and assembler tasks can both update the same shard-local
-        // progress slot when non-uniform placement puts multiple work units on
-        // one shard. Max counters keep the display monotonic for demo output;
-        // they are not a synchronization protocol.
+fn set_progress(
+    progress: &ShardLocal<BTreeMap<String, ShardProgress>>,
+    task_label: &str,
+    phase: Phase,
+    numbers: ProgressNumbers,
+) {
+    let _ = progress.with_current_result(|map| {
+        let p = map.entry(task_label.to_string()).or_default();
         p.phase = phase;
-        p.numbers.records_scanned = p.numbers.records_scanned.max(numbers.records_scanned);
-        p.numbers.entries_sent = p.numbers.entries_sent.max(numbers.entries_sent);
-        p.numbers.entries_received = p.numbers.entries_received.max(numbers.entries_received);
-        p.numbers.mailbox_full_retries = p
-            .numbers
-            .mailbox_full_retries
-            .max(numbers.mailbox_full_retries);
-        p.numbers.bytes_read = p.numbers.bytes_read.max(numbers.bytes_read);
-        p.numbers.bytes_written = p.numbers.bytes_written.max(numbers.bytes_written);
+        p.numbers = numbers;
     });
 }
 
@@ -879,7 +840,6 @@ struct ProgressNumbers {
     records_scanned: usize,
     entries_sent: usize,
     entries_received: usize,
-    mailbox_full_retries: usize,
     bytes_read: usize,
     bytes_written: usize,
 }

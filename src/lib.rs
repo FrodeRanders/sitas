@@ -100,9 +100,9 @@ pub use shard_local::{
 pub use shard_mailbox::{
     KeyRouterCreateError, RouteByKey, ShardMailbox, ShardMailboxAddressError, ShardMailboxConfig,
     ShardMailboxCreateError, ShardMailboxSet, ShardMailboxSnapshot, ShardReceiver, ShardRecv,
-    ShardRecvError, ShardSendError, ShardSender, UniformShardRouter, WorkUnitMailboxAddressError,
-    WorkUnitMailboxCreateError, WorkUnitMailboxSet, WorkUnitMailboxSnapshot, WorkUnitRouter,
-    WorkUnitSpec,
+    ShardRecvError, ShardSend, ShardSendError, ShardSender, UniformShardRouter,
+    WorkUnitMailboxAddressError, WorkUnitMailboxCreateError, WorkUnitMailboxSet,
+    WorkUnitMailboxSnapshot, WorkUnitRouter, WorkUnitSpec,
 };
 pub use sharded::{ShardService, Sharded, ShardedConfig};
 pub use sharded_executor::{

@@ -158,6 +158,54 @@ The final index is still a file because it is the externally visible result.
 The point of the example is that intermediate cross-shard exchange is typed
 message transfer, not shared mutable state and not borrowed data.
 
+\subsubsection{Performance aside: mailbox transfer vs file-backed exchange}
+
+The two index variants produce identical results but differ in how intermediate
+data crosses shard boundaries. The build example writes per-shard sorted run
+files and performs multi-round pairwise merge I/O. The mailbox example routes
+entries by key through owned messages to assembler work units, which sort and
+write pre-partitioned files before a single k-way merge.
+
+Measured on macOS (Apple Silicon, 8 CPUs), release mode, deterministic input:
+
+\begin{center}
+\rowcolors{2}{sitasCodeBackground}{white}
+\begin{tabular}{r r r r r r}
+\hline
+\textbf{Records} & \textbf{Shards} & \textbf{Build total} & \textbf{Mailbox total}
+    & \textbf{Build merge} & \textbf{Mailbox scan+xfer} \\
+\hline
+1\,M & 1 & 6.1\,s  & 8.9\,s  & \(\approx\)0 & 20\,ms \\
+1\,M & 2 & 8.6\,s  & 8.9\,s  & 2.9\,s  & 13\,ms \\
+1\,M & 4 & 10.2\,s & 8.2\,s  & 5.3\,s  & 9\,ms  \\
+1\,M & 8 & 13.3\,s & 9.3\,s  & 6.9\,s  & 12\,ms \\
+5\,M & 2 & 47.2\,s & 46.3\,s & 15.0\,s & 63\,ms \\
+5\,M & 4 & 57.4\,s & 45.4\,s & 27.4\,s & 39\,ms \\
+5\,M & 8 & 69.9\,s & 51.0\,s & 34.9\,s & 43\,ms \\
+\hline
+\end{tabular}
+\end{center}
+
+The build example anti-scales with shard count: more shards produce more run
+files, requiring more merge rounds of full-dataset file I/O. At 5\,M records,
+going from 2 to 8 shards increases the build total by 48\%. The mailbox
+example stays roughly flat because in-memory transfer replaces intermediate
+file exchange and the final k-way merge reads each partition file once.
+
+Both totals are dominated by unbuffered I/O overhead. \texttt{write\_index\_entry}
+performs two 8-byte \texttt{write\_all} calls per entry. At 5\,M records that
+is 10\,M write syscalls for the index alone. Data file creation and
+verification suffer the same pattern. The mailbox's reported work phases
+(scan+transfer in tens of milliseconds, assembler join in microseconds)
+reflect concurrent shard execution where scanning, mailbox transfer, assembler
+sort, and partition writes overlap on executor threads.
+
+The build example wins at 1~shard because it has no merge phase and copies one
+file. At 4+ shards the mailbox approach pulls ahead because it avoids
+\(O(N \log S)\) merge I/O. Neither example uses buffered writers, so both pay
+per-entry syscall costs that dwarf the architectural difference at small
+scale.
+
 \section{Representative commands}
 
 \begin{lstlisting}[language=bash,caption={Local validation}]
