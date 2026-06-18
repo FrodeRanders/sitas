@@ -36,18 +36,27 @@ const PARTITION_READ_CHUNK_RECORDS: usize = 256;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    // Keep non-Linux platforms honest: this example demonstrates the Linux
+    // io_uring path, so other Unix targets report unsupported instead of
+    // silently falling back to the std file implementation.
     println!("sharded_index_build_uring requires Linux io_uring support");
 }
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = DemoConfig::from_args(env::args())?;
+
+    // Probe before doing setup work. The kernel or container may not expose
+    // io_uring even on Linux, and the example should exit as an unsupported
+    // runtime path rather than failing halfway through the index build.
     if available_io_uring(8)?.is_none() {
         report_io_uring_unavailable();
         return Ok(());
     }
     let overall_start = Instant::now();
 
+    // The data model mirrors sharded_index_build. The only intended variable
+    // is how the shard tasks perform file I/O.
     let paths = DemoPaths::new();
     fs::create_dir_all(&paths.run_dir)?;
     create_data_file(&paths.data, config.record_count, config.seed)?;
@@ -71,6 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.record_count * RECORD_SIZE
     );
 
+    // Partitioning remains shard-affine. Each shard gets a deterministic file
+    // range and uses offset-based io_uring reads/writes inside that task.
     let partition_start = Instant::now();
     let run_pairs = block_on(runtime.map_all(|shard_id| {
         let data_path = paths.data.clone();
@@ -152,6 +163,8 @@ async fn build_sorted_run_uring(
 
     set_progress(&progress, Phase::Scanning, 0, 0, 0);
 
+    // File ownership stays in this task; only the raw descriptor is borrowed
+    // for offset-based io_uring operations while the File remains alive.
     let data = File::open(data_path)?;
     let mut entries =
         read_partition_entries_uring(data.as_raw_fd(), partition, shard_id, &progress).await?;
@@ -194,6 +207,9 @@ async fn read_partition_entries_uring(
 
     while next_record < partition.end_record {
         let chunk_records = PARTITION_READ_CHUNK_RECORDS.min(partition.end_record - next_record);
+
+        // The offset parameter is what lets each shard read its own partition
+        // without mutating a shared file cursor.
         let buffer =
             read_exact_at_uring(fd, record_offset(next_record), chunk_records * RECORD_SIZE)
                 .await?;
@@ -225,6 +241,9 @@ async fn read_partition_entries_uring(
 #[cfg(target_os = "linux")]
 async fn write_index_file_uring(path: &Path, entries: &[IndexEntry]) -> io::Result<()> {
     let file = File::create(path)?;
+
+    // Build the run file as one owned buffer before submitting it. The helper
+    // owns that buffer until the kernel completion is observed.
     let mut buffer = Vec::with_capacity(entries.len() * INDEX_ENTRY_SIZE);
     for entry in entries {
         encode_index_entry(*entry, &mut buffer);

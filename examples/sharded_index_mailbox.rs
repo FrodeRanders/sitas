@@ -32,18 +32,34 @@ const DEFAULT_MAILBOX_CAPACITY: usize = 64;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = DemoConfig::from_args(env::args())?;
     let overall_start = Instant::now();
+
+    // The input and final index remain ordinary files because they are the
+    // externally visible data set. The experiment here is only about replacing
+    // intermediate cross-shard exchange with typed owned messages.
     let paths = DemoPaths::new();
 
     fs::create_dir_all(&paths.partition_dir)?;
     create_data_file(&paths.data, config.record_count, config.seed)?;
     File::create(&paths.index)?;
 
+    // Use the same shard-per-thread executor shape as the file-backed index
+    // demo so the interesting difference is the transfer mechanism, not the
+    // runtime topology.
     let runtime = ShardedExecutor::start_with_config(
         ShardedExecutorConfig::new(config.shard_count).with_cpu_placement(CpuPlacement::Sequential),
     )?;
     let shard_count = runtime.shard_count();
+
+    // By default the demo uses one more logical assembler than physical
+    // shards. That makes non-uniform assignment visible: work-unit names are
+    // stable logical destinations, while their shard placement is a separate
+    // table that can put several receivers on one shard.
     let assembler_count = config.assembler_count.unwrap_or(shard_count + 1);
     let work_units = assembler_work_units(assembler_count, shard_count);
+
+    // The router answers "which logical assembler owns this key?" It does not
+    // answer "which shard should I send to?" directly. WorkUnitMailboxSet uses
+    // the work-unit placement table to resolve the logical name to a receiver.
     let router = WorkUnitRouter::new(work_units.iter().map(|spec| spec.name))?;
     let progress = ShardLocal::new(runtime.submitter(), |_| ShardProgress::default());
     let mailboxes = Arc::new(WorkUnitMailboxSet::new(
@@ -65,6 +81,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {} -> shard {}", spec.name.label(), spec.shard_id.0);
     }
 
+    // Start receivers before producers. A sender may be cloned freely, but
+    // each work-unit mailbox has exactly one receiver and it must be taken on
+    // the shard named by the placement table.
     let mut assembler_handles = Vec::with_capacity(work_units.len());
     for spec in &work_units {
         let mailboxes = Arc::clone(&mailboxes);
@@ -80,6 +99,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?);
     }
 
+    // Scanner tasks keep the original partitioning model: each shard reads a
+    // contiguous slice of the data file. The difference is that each record is
+    // routed by key to a logical assembler instead of being kept in the
+    // scanning shard's local run.
     let scan_start = Instant::now();
     let mut scanner_handles = Vec::with_capacity(shard_count);
     for shard_idx in 0..shard_count {
@@ -110,6 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let assemble_elapsed = assemble_start.elapsed();
     print_progress("assembly complete", &runtime, &progress);
 
+    // Assemblers write locally sorted partition files. A final k-way merge is
+    // still needed because the example wants one externally visible sorted
+    // index file, but the records reached the assemblers through mailboxes
+    // instead of through intermediate cross-shard files.
     k_way_merge_partition_files(&partitions, &paths.index)?;
     verify_index_file(&paths.data, &paths.index, config.record_count)?;
 
@@ -149,6 +176,10 @@ async fn scan_and_send(
     progress: ShardLocal<ShardProgress>,
 ) -> io::Result<()> {
     let shard_id = current_executor_shard().expect("scanner runs on a shard");
+
+    // Keep one sender and one pending batch per logical assembler. The router
+    // returns an assembler index; the sender hides the physical shard assigned
+    // to that assembler.
     let senders = senders_for_assemblers(&mailboxes, router.work_unit_count())?;
     let mut batches = vec![Vec::with_capacity(SEND_BATCH_ENTRIES); router.work_unit_count()];
     let mut data = File::open(data_path)?;
@@ -176,6 +207,9 @@ async fn scan_and_send(
         let mut buffer = vec![0u8; chunk_records * RECORD_SIZE];
         data.read_exact(&mut buffer)?;
 
+        // Routing happens per record, but sending happens per destination
+        // batch. This keeps message counts bounded without changing ownership:
+        // every batch moved into IndexMessage is owned by the receiving shard.
         for (chunk_idx, record_bytes) in buffer.chunks_exact(RECORD_SIZE).enumerate() {
             let record_idx = next_record + chunk_idx;
             let record = record_from_bytes(record_bytes)?;
@@ -215,6 +249,9 @@ async fn scan_and_send(
         next_record += chunk_records;
     }
 
+    // Flush partial batches after the final chunk. These are often the only
+    // batches for small demos, so correctness cannot depend on hitting the
+    // SEND_BATCH_ENTRIES boundary.
     for (destination, batch) in batches.into_iter().enumerate() {
         if !batch.is_empty() {
             sent += batch.len();
@@ -229,6 +266,9 @@ async fn scan_and_send(
         }
     }
 
+    // Each assembler expects one completion marker from every scanner shard.
+    // The marker is the close-of-input protocol for that producer; the mailbox
+    // itself can remain open because other producers may still be active.
     for sender in &senders {
         full_retries +=
             send_message_retry(sender, IndexMessage::ProducerDone { from: shard_id }).await?;
@@ -260,6 +300,10 @@ async fn assemble_partition(
     let shard_id = current_executor_shard().expect("assembler runs on a shard");
     let cpu_placement =
         current_executor_cpu_placement().expect("assembler runs on a sharded executor");
+
+    // This is the guard that makes logical naming safe: a work-unit receiver
+    // can only be taken by the shard it was assigned to. After this point the
+    // assembler owns its local Vec and no other shard can mutate it.
     let mut receiver = mailboxes
         .receiver_for_current_shard(&work_unit)
         .map_err(io_other)?;
@@ -272,6 +316,9 @@ async fn assemble_partition(
         match receiver.recv().await.map_err(io_other)? {
             IndexMessage::Entries { from, batch } => {
                 debug_assert!(from.0 < producer_count);
+                // The batch crosses the shard boundary by value. Extending the
+                // local Vec consumes the received batch rather than borrowing
+                // from scanner state.
                 entries.extend(batch);
                 set_progress(
                     &progress,
@@ -284,11 +331,17 @@ async fn assemble_partition(
             }
             IndexMessage::ProducerDone { from } => {
                 debug_assert!(from.0 < producer_count);
+                // Count producer completions instead of relying on receiver
+                // closure; the mailbox may have many senders and closure would
+                // conflate normal end-of-input with a dropped sender bug.
                 producers_done += 1;
             }
         }
     }
 
+    // The assembler owns one logical partition of the index keyspace. It sorts
+    // only that partition, writes one run file, and returns owned metadata to
+    // the coordinating main thread.
     set_progress(
         &progress,
         Phase::Sorting,
@@ -338,6 +391,9 @@ async fn send_message_retry(
         match sender.try_send(message) {
             Ok(()) => return Ok(full_retries),
             Err(ShardSendError::Full(returned)) => {
+                // Backpressure is explicit. The bounded mailbox returns the
+                // unsent message, so the producer can yield cooperatively and
+                // retry without cloning or losing ownership of the payload.
                 full_retries += 1;
                 message = returned;
                 yield_now().await;
@@ -358,6 +414,10 @@ fn assembler_work_units(
 ) -> Vec<WorkUnitSpec<IndexWorkUnit>> {
     (0..assembler_count)
         .map(|idx| {
+            // Intentionally non-uniform: the last logical assembler is placed
+            // on shard 0. With the default assembler_count = shard_count + 1,
+            // this gives shard 0 two receivers and makes the naming/placement
+            // split visible in output.
             let assigned = if idx == assembler_count - 1 {
                 ShardId(0)
             } else {
@@ -369,6 +429,8 @@ fn assembler_work_units(
 }
 
 fn create_data_file(path: &Path, record_count: usize, seed: u64) -> io::Result<()> {
+    // Deterministic input makes the demo reproducible across shard counts and
+    // across runs when comparing the file-backed and mailbox variants.
     let mut file = File::create(path)?;
     let mut rng = Lcg::new(seed);
     for _ in 0..record_count {
@@ -405,6 +467,8 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
 }
 
 fn k_way_merge_partition_files(partitions: &[PartitionRun], output_path: &Path) -> io::Result<()> {
+    // Each assembler run is internally sorted. A heap over the current head of
+    // each run is enough to produce one globally sorted output stream.
     let mut readers = partitions
         .iter()
         .map(|partition| RunReader::open(&partition.path))
@@ -446,6 +510,9 @@ fn verify_index_file(
     index_path: &Path,
     expected_entries: usize,
 ) -> io::Result<()> {
+    // Verification checks the product, not the implementation path: sorted
+    // order across the final index and each stored offset pointing to a record
+    // with the matching key.
     let mut data = File::open(data_path)?;
     let mut index = File::open(index_path)?;
     let mut previous = None;
@@ -484,6 +551,9 @@ fn verify_index_file(
 }
 
 fn print_progress(label: &str, runtime: &ShardedExecutor, progress: &ShardLocal<ShardProgress>) {
+    // Runtime snapshots and ShardLocal snapshots are intentionally owned
+    // values. The reporting code never borrows shard-local state out of its
+    // owning executor.
     let snapshot = runtime.snapshot();
     let progress_values: Vec<(ShardId, ShardProgress)> =
         block_on(progress.map_all(|_, p| *p)).unwrap_or_default();
@@ -517,6 +587,10 @@ fn print_progress(label: &str, runtime: &ShardedExecutor, progress: &ShardLocal<
 
 fn set_progress(progress: &ShardLocal<ShardProgress>, phase: Phase, numbers: ProgressNumbers) {
     let _ = progress.with_current_result(|p| {
+        // Scanner and assembler tasks can both update the same shard-local
+        // progress slot when non-uniform placement puts multiple work units on
+        // one shard. Max counters keep the display monotonic for demo output;
+        // they are not a synchronization protocol.
         p.phase = phase;
         p.numbers.records_scanned = p.numbers.records_scanned.max(numbers.records_scanned);
         p.numbers.entries_sent = p.numbers.entries_sent.max(numbers.entries_sent);
