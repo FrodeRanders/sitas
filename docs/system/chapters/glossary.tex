@@ -31,6 +31,22 @@ field guide for those words.
     \item[Submitter] A sharded capability for explicit cross-shard async
         submission. It owns the ability to place work on shard executors.
 
+    \item[Shard mailbox] A bounded typed queue for transferring owned messages
+        to one shard-local receiver. \texttt{ShardMailboxSet<M>} is the
+        uniform form: one inbound mailbox per shard.
+
+    \item[Work unit] A logical receiver role, such as an index assembler. A
+        work unit has a name and an assigned shard. Multiple work units may be
+        assigned to the same shard.
+
+    \item[Work-unit mailbox] A named mailbox for non-uniform work assignment.
+        The work-unit mailbox set routes by logical name and checks that the
+        receiver is taken on the assigned shard.
+
+    \item[Router] The key discriminator for message placement.
+        \texttt{UniformShardRouter} maps a key to \texttt{ShardId};
+        \texttt{WorkUnitRouter<N>} maps a key to a logical work-unit name.
+
     \item[Join handle] An awaitable handle for a spawned task result. It is
         also the cancellation handle: aborting it requests that the task be
         dropped if it has not completed. Dropping a join handle without

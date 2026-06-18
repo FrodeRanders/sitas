@@ -29,9 +29,9 @@
 //! 3. **Shard-per-thread async runtime** (`sharded_executor`, `shard_local`):
 //!    one executor thread per shard, cross-shard submission via
 //!    `ShardedSubmitter`, shard-local state via `ShardLocal<T>`, CPU placement,
-//!    backpressure-aware spawning, sharded TCP server, sharded scheduling
-//!    groups, async-std bridge, and snapshot-based observability with metrics
-//!    collection.
+//!    owned message transfer via `shard_mailbox`, backpressure-aware spawning,
+//!    sharded TCP server, sharded scheduling groups, async-std bridge, and
+//!    snapshot-based observability with metrics collection.
 
 #![warn(missing_docs)]
 #![warn(unsafe_op_in_unsafe_fn)]
@@ -59,6 +59,8 @@ pub mod runtime;
 pub mod shard;
 /// Shard-local async state helpers.
 pub mod shard_local;
+/// Typed owned-message transfer between executor shards.
+pub mod shard_mailbox;
 /// Generic sharded service trait and runtime.
 pub mod sharded;
 /// Shard-per-thread async executor runtime.
@@ -94,6 +96,13 @@ pub use shard::{ShardId, ShardSnapshot};
 pub use shard_local::{
     ShardLocal, ShardLocalAccessError, ShardLocalWorkerTimeoutError, ShardLocalWorkers,
     StoppableShardLocalWorkers,
+};
+pub use shard_mailbox::{
+    KeyRouterCreateError, RouteByKey, ShardMailbox, ShardMailboxAddressError, ShardMailboxConfig,
+    ShardMailboxCreateError, ShardMailboxSet, ShardMailboxSnapshot, ShardReceiver, ShardRecv,
+    ShardRecvError, ShardSendError, ShardSender, UniformShardRouter, WorkUnitMailboxAddressError,
+    WorkUnitMailboxCreateError, WorkUnitMailboxSet, WorkUnitMailboxSnapshot, WorkUnitRouter,
+    WorkUnitSpec,
 };
 pub use sharded::{ShardService, Sharded, ShardedConfig};
 pub use sharded_executor::{

@@ -12,7 +12,8 @@ show the runtime pieces in isolation before combining them:
     \item shard-local values;
     \item CPU placement reporting;
     \item observability snapshots;
-    \item standard-file and \texttt{io\_uring} index-building demos.
+    \item standard-file, mailbox-transfer, and \texttt{io\_uring}
+          index-building demos.
 \end{itemize}
 
 The examples are deliberately not just smoke tests. Each one is a small
@@ -124,6 +125,32 @@ mutable index structure with other shards. The merge phase then makes the
 coordination cost explicit by exchanging owned run files and summaries rather
 than borrowing another shard's working set.
 
+\subsection{Mailbox-transfer index build}
+
+\filepath{sharded\_index\_mailbox.rs} keeps the existing index demo intact and
+shows a different assembly path. Scan tasks still run on executor shards, but
+they send owned \texttt{IndexMessage} batches through mailbox senders instead
+of using intermediate run files as the cross-shard exchange medium.
+
+The demo deliberately separates logical ownership from physical shard
+placement:
+
+\begin{itemize}
+    \item \texttt{WorkUnitRouter<IndexWorkUnit>} maps each record key to a
+          logical assembler work unit.
+    \item \texttt{WorkUnitMailboxSet<IndexWorkUnit, IndexMessage>} maps each
+          assembler name to the shard that owns its receiver.
+    \item The default run starts one more assembler than shards, so one shard
+          owns two logical assembler work units. This makes non-uniform
+          placement visible in the printed placement table.
+    \item Each assembler receives owned batches, sorts its own entries, writes
+          one final partition file, and returns owned metadata.
+\end{itemize}
+
+The final index is still a file because it is the externally visible result.
+The point of the example is that intermediate cross-shard exchange is typed
+message transfer, not shared mutable state and not borrowed data.
+
 \section{Representative commands}
 
 \begin{lstlisting}[language=bash,caption={Local validation}]
@@ -131,6 +158,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo doc --no-deps
+cargo run --example sharded_index_mailbox -- --records 512 --shards 4
 \end{lstlisting}
 
 \begin{lstlisting}[language=bash,caption={Linux validation through Docker}]

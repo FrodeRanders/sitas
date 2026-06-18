@@ -66,6 +66,53 @@ this runtime is trying to preserve: placement is part of the program's
 semantics. When code submits to shard 1, it is saying that shard 1 is the
 correct owner for that unit of work.
 
+\section{Mailbox routing}
+
+\texttt{ShardedSubmitter} moves futures. \texttt{shard\_mailbox} moves owned
+messages. A mailbox does not make application state shared; it gives one
+producer or many producers a typed way to transfer ownership to a receiver that
+is still local to its assigned shard.
+
+There are two routing modes.
+
+\begin{description}
+    \item[Uniform shard routing] A key maps directly to a physical
+          \texttt{ShardId}. The target is one inbound mailbox per shard:
+          \texttt{ShardMailboxSet<M>}. This is the original shard-key model.
+    \item[Non-uniform work-unit routing] A key maps to a logical work-unit
+          name. A placement table maps that name to the shard that owns its
+          receiver: \texttt{WorkUnitMailboxSet<N, M>}. Multiple work units can
+          be assigned to the same shard, and some shards can have no work unit
+          for a particular protocol.
+\end{description}
+
+\begin{lstlisting}[language={},caption={Uniform and non-uniform routing}]
+Uniform:
+    key -> ShardId -> ShardMailboxSet<M>
+
+Non-uniform:
+    key -> WorkUnitName -> WorkUnitMailboxSet<N, M> -> assigned ShardId
+\end{lstlisting}
+
+\texttt{UniformShardRouter} makes the first path explicit. It routes a
+hashable key to a \texttt{ShardId}. \texttt{WorkUnitRouter<N>} makes the
+second path explicit. It routes a hashable key to a logical name. In both
+cases the key is still the discriminator; what changes is the target type.
+
+The receiving side remains shard-local. A named work unit has exactly one
+receiver, and \texttt{receiver\_for\_current\_shard} checks that the receiver is
+being taken by a task running on the work unit's assigned shard. That check is
+important for non-uniform placement: the logical name is not the owner by
+itself; the name plus its placement says which executor may mutate the
+associated state.
+
+\begin{notabene}[Mailbox routing is not load balancing]
+The mailbox layer does not steal work and does not rebalance a hot work unit.
+It makes routing explicit. Changing the cluster shape means changing the
+router targets or the work-unit placement table, then observing the new
+behavior through owned snapshots and example output.
+\end{notabene}
+
 \section{Shard-local values}
 
 \texttt{ShardLocal<T>} owns one value per executor shard. Access is routed to

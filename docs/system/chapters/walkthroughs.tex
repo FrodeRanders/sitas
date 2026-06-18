@@ -265,6 +265,43 @@ replaces partition reads, run writes, and merge run I/O with
 It keeps the same \texttt{ShardLocal}, \texttt{map\_all}, and
 \texttt{RunningStatistics} shape.
 
+\subsection{Mailbox-transfer index path}
+
+Then run the mailbox variant:
+
+\begin{lstlisting}[language=bash,caption={Mailbox index example}]
+cargo run --example sharded_index_mailbox -- --records 512 --shards 4 --seed 0xbeef
+\end{lstlisting}
+
+Read:
+
+\begin{lstlisting}[language={},caption={Mailbox index reading path}]
+examples/sharded_index_mailbox.rs
+src/shard_mailbox.rs
+src/placement.rs
+src/sharded_executor.rs
+\end{lstlisting}
+
+This variant keeps scan work sharded, but replaces intermediate file-mediated
+exchange with typed mailbox messages. The key question changes from ``which
+shard owns this key?'' to ``which target type does this router produce?''
+
+\begin{itemize}
+    \item \texttt{UniformShardRouter} produces a physical \texttt{ShardId}.
+          That is the uniform route into \texttt{ShardMailboxSet<M>}.
+    \item \texttt{WorkUnitRouter<IndexWorkUnit>} produces a logical assembler
+          name. That is the non-uniform route into
+          \texttt{WorkUnitMailboxSet<N, M>}.
+    \item \texttt{WorkUnitSpec<N>} assigns each logical assembler to an
+          executor shard. The default example assigns two assemblers to shard
+          0, making non-uniform placement visible.
+\end{itemize}
+
+While reading \filepath{src/shard\_mailbox.rs}, distinguish the transport from
+the ownership model. The mailbox queue uses synchronization internally, but
+the message is an owned value and the receiver task is still the only code that
+mutates the work unit's local assembly state.
+
 \section{Debugging checklist}
 
 When something behaves unexpectedly, ask these questions in order:

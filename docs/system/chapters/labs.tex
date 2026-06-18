@@ -266,16 +266,29 @@ SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo run --example sharded_index_
 Observe how partition work is spread across shards, then merged into one final
 sorted index.
 
+For the mailbox-transfer variant:
+
+\begin{lstlisting}[language=bash,caption={Mailbox index build}]
+cargo run --example sharded_index_mailbox -- --records 512 --shards 4 --seed 0xbeef
+\end{lstlisting}
+
+Observe the printed logical assembler placement. The default mailbox variant
+uses one more assembler work unit than shards, so one shard owns two logical
+receivers. Record keys route to assembler names first, and the placement table
+then resolves those names to shards.
+
 Try this:
 
 \begin{enumerate}
     \item Change the record count.
     \item Change the shard count.
+    \item Change \texttt{--assemblers} in the mailbox variant.
     \item Compare per-shard partition summaries and final verification output.
 \end{enumerate}
 
 The lesson is that the runtime's value appears when a problem can be split into
-owned shard-local work, then combined through explicit owned results.
+owned shard-local work, then combined through explicit owned results or owned
+messages.
 
 \section{After the labs}
 

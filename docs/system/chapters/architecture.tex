@@ -155,6 +155,10 @@ the same shared-nothing service direction.
         checked local access. Provides \texttt{with\_current},
         \texttt{with\_current\_result}, \texttt{get\_current},
         \texttt{map\_all}, and worker/scope APIs.
+    \item[\texttt{shard\_mailbox}] Typed owned-message transfer between
+        shards. Provides uniform key-to-shard routing through
+        \texttt{ShardMailboxSet<M>} and non-uniform logical work-unit routing
+        through \texttt{WorkUnitMailboxSet<N, M>}.
     \item[\texttt{sharded\_tcp}] Network-facing sharded TCP server with
         \texttt{SO\_REUSEPORT} on Linux and single-accept distribution on
         other platforms.
