@@ -118,7 +118,7 @@ unsafe extern "C" {
         buf: *const u8,
         len: usize,
         flags: c_int,
-        address: *const SockAddrStorage,
+        address: *const SockAddrIn,
         address_len: SockLen,
     ) -> isize;
     fn setsockopt(
@@ -199,50 +199,16 @@ impl UdpSocket {
             return Err(io::Error::last_os_error());
         }
 
-        match addr {
-            SocketAddr::V4(v4) => {
-                let octets = v4.ip().octets();
-                let sin = SockAddrIn {
-                    #[cfg(not(target_os = "linux"))]
-                    sin_len: std::mem::size_of::<SockAddrIn>() as u8,
-                    #[cfg(target_os = "linux")]
-                    sin_family: AF_INET as u16,
-                    #[cfg(not(target_os = "linux"))]
-                    sin_family: AF_INET as u8,
-                    sin_port: v4.port().to_be(),
-                    sin_addr: InAddr {
-                        s_addr: u32::from_ne_bytes(octets),
-                    },
-                    sin_zero: [0; 8],
-                };
-                // SAFETY: `bind` is called on an open socket descriptor with
-                // a pointer to a properly initialized `SockAddrIn` struct.
-                // `sizeof(SockAddrIn)` is passed as the address length.
-                let bind_result =
-                    unsafe { bind(fd, &sin, std::mem::size_of::<SockAddrIn>() as SockLen) };
-                if bind_result < 0 {
-                    close_owned_fd(fd);
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            SocketAddr::V6(v6) => {
-                let sin6 = create_sockaddr_in6(v6);
-                // SAFETY: `bind` with a pointer to a properly initialized
-                // `SockAddrIn6` struct. The cast through `*const SockAddrIn` is
-                // safe because the kernel reads only the first `sizeof(SockAddrIn6)`
-                // bytes, which are correctly laid out for the AF_INET6 family.
-                let bind_result = unsafe {
-                    bind(
-                        fd,
-                        &sin6 as *const SockAddrIn6 as *const SockAddrIn,
-                        std::mem::size_of::<SockAddrIn6>() as SockLen,
-                    )
-                };
-                if bind_result < 0 {
-                    close_owned_fd(fd);
-                    return Err(io::Error::last_os_error());
-                }
-            }
+        let bind_addr = BindSockAddr::new(&addr);
+        let (bind_ptr, bind_len) = bind_addr.as_ptr_len();
+        // SAFETY: `bind` is called on an open socket descriptor with a pointer
+        // to a properly initialized sockaddr value owned by `bind_addr`, which
+        // remains alive for the duration of this call. The length matches the
+        // concrete sockaddr struct.
+        let bind_result = unsafe { bind(fd, bind_ptr, bind_len) };
+        if bind_result < 0 {
+            close_owned_fd(fd);
+            return Err(io::Error::last_os_error());
         }
 
         // SAFETY: `fd` is a valid, open, bound socket descriptor.
@@ -269,20 +235,22 @@ impl UdpSocket {
     ///
     /// Returns `io::ErrorKind::WouldBlock` when no data is available.
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let mut addr_buf = [0u8; 128];
-        let mut addr_len = 128u32;
+        // SAFETY: zero-initializing sockaddr storage produces a valid writable
+        // buffer for the kernel to fill.
+        let mut addr_storage: SockAddrStorage = unsafe { std::mem::zeroed() };
+        let mut addr_len = std::mem::size_of::<SockAddrStorage>() as SockLen;
 
         // SAFETY: `recvfrom` reads into `buf` (valid writable memory of
-        // `buf.len()` bytes) and writes the sender address into `addr_buf`
-        // (a 128-byte stack buffer). `addr_len` is initialized and passed
-        // by mutable reference. The socket fd is valid and owned.
+        // `buf.len()` bytes) and writes the sender address into
+        // `addr_storage`. `addr_len` is initialized and passed by mutable
+        // reference. The socket fd is valid and owned.
         let n = unsafe {
             recvfrom(
                 self.fd.as_raw_fd(),
                 buf.as_mut_ptr(),
                 buf.len(),
                 0,
-                &mut addr_buf as *mut u8 as *mut SockAddrStorage,
+                &mut addr_storage,
                 &mut addr_len,
             )
         };
@@ -295,7 +263,7 @@ impl UdpSocket {
             return Err(err);
         }
 
-        let addr = decode_sockaddr_from_buf(&addr_buf)
+        let addr = decode_sockaddr_storage(&addr_storage)
             .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "invalid address"))?;
 
         Ok((n as usize, addr))
@@ -305,19 +273,20 @@ impl UdpSocket {
     ///
     /// Returns `io::ErrorKind::WouldBlock` when the socket is not writable.
     pub fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        let sockaddr_storage = socket_addr_to_sockaddr_storage(&addr);
-        let sockaddr_len = socket_addr_len(&addr);
+        let sockaddr = BindSockAddr::new(&addr);
+        let (sockaddr_ptr, sockaddr_len) = sockaddr.as_ptr_len();
 
         // SAFETY: `sendto` reads from `buf` (valid readable memory of
-        // `buf.len()` bytes) and writes to the socket. `sockaddr_storage`
-        // contains a properly encoded sockaddr. The socket fd is valid.
+        // `buf.len()` bytes) and writes to the socket. `sockaddr` owns a
+        // properly initialized sockaddr value that remains alive for this call.
+        // The socket fd is valid.
         let n = unsafe {
             sendto(
                 self.fd.as_raw_fd(),
                 buf.as_ptr(),
                 buf.len(),
                 0,
-                &sockaddr_storage,
+                sockaddr_ptr,
                 sockaddr_len,
             )
         };
@@ -418,107 +387,92 @@ fn get_sock_name(fd: c_int, addr: SocketAddr) -> io::Result<SocketAddr> {
     }
 }
 
-// Helper: convert SocketAddr to a raw byte buffer suitable for sendto/connect
-fn socket_addr_to_sockaddr_storage(addr: &SocketAddr) -> SockAddrStorage {
-    let mut buf = [0u8; 128];
-    encode_sockaddr_to_buf(addr, &mut buf);
-    // Copy to SockAddrStorage for FFI
-    let mut storage = SockAddrStorage {
-        ss_family: 0,
-        __data: [0; 126],
-    };
-    // SAFETY: copying at most 128 bytes from `buf` (a stack buffer containing
-    // a properly encoded sockaddr) into `storage` (a `SockAddrStorage` of
-    // equal or larger size). Both pointers are valid and the regions do not
-    // overlap.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            buf.as_ptr(),
-            &mut storage as *mut SockAddrStorage as *mut u8,
-            128.min(std::mem::size_of::<SockAddrStorage>()),
-        );
-    }
-    storage
+enum BindSockAddr {
+    V4(SockAddrIn),
+    V6(SockAddrIn6),
 }
 
-fn encode_sockaddr_to_buf(addr: &SocketAddr, buf: &mut [u8; 128]) {
-    buf.fill(0);
-    match addr {
-        SocketAddr::V4(v4) => {
-            #[cfg(target_os = "linux")]
-            {
-                buf[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+impl BindSockAddr {
+    fn new(addr: &SocketAddr) -> Self {
+        match addr {
+            SocketAddr::V4(v4) => {
+                let octets = v4.ip().octets();
+                Self::V4(SockAddrIn {
+                    #[cfg(not(target_os = "linux"))]
+                    sin_len: std::mem::size_of::<SockAddrIn>() as u8,
+                    #[cfg(target_os = "linux")]
+                    sin_family: AF_INET as u16,
+                    #[cfg(not(target_os = "linux"))]
+                    sin_family: AF_INET as u8,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: InAddr {
+                        s_addr: u32::from_ne_bytes(octets),
+                    },
+                    sin_zero: [0; 8],
+                })
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                buf[0] = std::mem::size_of::<SockAddrIn>() as u8;
-                buf[1] = AF_INET as u8;
-            }
-            buf[2..4].copy_from_slice(&v4.port().to_be_bytes());
-            buf[4..8].copy_from_slice(&v4.ip().octets());
+            SocketAddr::V6(v6) => Self::V6(SockAddrIn6 {
+                #[cfg(not(target_os = "linux"))]
+                sin6_len: std::mem::size_of::<SockAddrIn6>() as u8,
+                #[cfg(target_os = "linux")]
+                sin6_family: AF_INET6 as u16,
+                #[cfg(not(target_os = "linux"))]
+                sin6_family: AF_INET6 as u8,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: In6Addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            }),
         }
-        SocketAddr::V6(v6) => {
-            #[cfg(target_os = "linux")]
-            {
-                buf[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                buf[0] = std::mem::size_of::<SockAddrIn6>() as u8;
-                buf[1] = AF_INET6 as u8;
-            }
-            buf[2..4].copy_from_slice(&v6.port().to_be_bytes());
-            buf[4..8].copy_from_slice(&v6.flowinfo().to_be_bytes());
-            buf[8..24].copy_from_slice(&v6.ip().octets());
-            buf[24..28].copy_from_slice(&v6.scope_id().to_be_bytes());
+    }
+
+    fn as_ptr_len(&self) -> (*const SockAddrIn, SockLen) {
+        match self {
+            Self::V4(sin) => (
+                sin as *const SockAddrIn,
+                std::mem::size_of::<SockAddrIn>() as SockLen,
+            ),
+            Self::V6(sin6) => (
+                sin6 as *const SockAddrIn6 as *const SockAddrIn,
+                std::mem::size_of::<SockAddrIn6>() as SockLen,
+            ),
         }
     }
 }
 
-fn create_sockaddr_in6(v6: std::net::SocketAddrV6) -> SockAddrIn6 {
-    SockAddrIn6 {
-        #[cfg(not(target_os = "linux"))]
-        sin6_len: std::mem::size_of::<SockAddrIn6>() as u8,
-        #[cfg(target_os = "linux")]
-        sin6_family: AF_INET6 as u16,
-        #[cfg(not(target_os = "linux"))]
-        sin6_family: AF_INET6 as u8,
-        sin6_port: v6.port().to_be(),
-        sin6_flowinfo: v6.flowinfo(),
-        sin6_addr: In6Addr {
-            s6_addr: v6.ip().octets(),
-        },
-        sin6_scope_id: v6.scope_id(),
-    }
-}
-
-fn socket_addr_len(addr: &SocketAddr) -> SockLen {
-    match addr {
-        SocketAddr::V4(_) => std::mem::size_of::<SockAddrIn>() as SockLen,
-        SocketAddr::V6(_) => std::mem::size_of::<SockAddrIn6>() as SockLen,
-    }
-}
-
-fn decode_sockaddr_from_buf(buf: &[u8; 128]) -> Option<SocketAddr> {
-    // On Linux, family is at offset 0 as u16. On macOS/BSD, length at offset 0 (u8), family at offset 1 (u8).
+fn decode_sockaddr_storage(storage: &SockAddrStorage) -> Option<SocketAddr> {
     #[cfg(target_os = "linux")]
-    let family = u16::from_ne_bytes([buf[0], buf[1]]);
+    let family = storage.ss_family;
     #[cfg(not(target_os = "linux"))]
-    let family = buf[1] as u16;
+    let family = {
+        // SAFETY: `storage` is a valid sockaddr_storage object. BSD-family
+        // sockaddrs store length at byte 0 and family at byte 1.
+        unsafe { *(storage as *const SockAddrStorage as *const u8).add(1) as u16 }
+    };
 
     match family as c_int {
         AF_INET => {
-            let port = u16::from_be_bytes([buf[2], buf[3]]);
-            let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+            // SAFETY: the kernel reported AF_INET. Use an unaligned read from
+            // storage because `sockaddr_storage` alignment varies by platform.
+            let sin = unsafe {
+                std::ptr::read_unaligned(storage as *const SockAddrStorage as *const SockAddrIn)
+            };
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let port = u16::from_be(sin.sin_port);
             Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
         }
         AF_INET6 => {
-            let port = u16::from_be_bytes([buf[2], buf[3]]);
-            let flowinfo = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-            let mut ip_bytes = [0u8; 16];
-            ip_bytes.copy_from_slice(&buf[8..24]);
-            let ip = std::net::Ipv6Addr::from(ip_bytes);
-            let scope_id = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
+            // SAFETY: the kernel reported AF_INET6. Use an unaligned read from
+            // storage because `sockaddr_storage` alignment varies by platform.
+            let sin6 = unsafe {
+                std::ptr::read_unaligned(storage as *const SockAddrStorage as *const SockAddrIn6)
+            };
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            let port = u16::from_be(sin6.sin6_port);
+            let flowinfo = sin6.sin6_flowinfo;
+            let scope_id = sin6.sin6_scope_id;
             Some(SocketAddr::V6(std::net::SocketAddrV6::new(
                 ip, port, flowinfo, scope_id,
             )))
@@ -530,7 +484,37 @@ fn decode_sockaddr_from_buf(buf: &[u8; 128]) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn bind_sockaddr_builds_ipv4_address_with_stable_pointer() {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080));
+        let bind_addr = BindSockAddr::new(&addr);
+        let (ptr, len) = bind_addr.as_ptr_len();
+
+        assert!(!ptr.is_null());
+        assert_eq!(len, std::mem::size_of::<SockAddrIn>() as SockLen);
+        if let BindSockAddr::V4(sin) = bind_addr {
+            assert_eq!(sin.sin_port, 8080u16.to_be());
+        } else {
+            panic!("expected ipv4 sockaddr");
+        }
+    }
+
+    #[test]
+    fn bind_sockaddr_builds_ipv6_address_with_stable_pointer() {
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9090, 0, 0));
+        let bind_addr = BindSockAddr::new(&addr);
+        let (ptr, len) = bind_addr.as_ptr_len();
+
+        assert!(!ptr.is_null());
+        assert_eq!(len, std::mem::size_of::<SockAddrIn6>() as SockLen);
+        if let BindSockAddr::V6(sin6) = bind_addr {
+            assert_eq!(sin6.sin6_port, 9090u16.to_be());
+        } else {
+            panic!("expected ipv6 sockaddr");
+        }
+    }
 
     #[test]
     fn udp_socket_bind_and_send_recv() {

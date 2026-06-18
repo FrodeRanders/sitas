@@ -20,6 +20,7 @@ use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::FromRawFd;
 use std::os::raw::c_int;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -164,7 +165,7 @@ pub struct ShardedTcpConnection {
 }
 
 /// Configuration for a sharded TCP server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ShardedTcpConfig {
     /// Maximum concurrent connections per shard.
     pub max_connections_per_shard: usize,
@@ -172,6 +173,8 @@ pub struct ShardedTcpConfig {
     pub reuse_port: bool,
     /// Connection backlog.
     pub backlog: u32,
+    /// Optional structured event sink for server-level runtime events.
+    pub event_sink: Option<Arc<dyn ShardedTcpEventSink>>,
 }
 
 impl Default for ShardedTcpConfig {
@@ -180,7 +183,19 @@ impl Default for ShardedTcpConfig {
             max_connections_per_shard: 128,
             reuse_port: true,
             backlog: 128,
+            event_sink: None,
         }
+    }
+}
+
+impl fmt::Debug for ShardedTcpConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardedTcpConfig")
+            .field("max_connections_per_shard", &self.max_connections_per_shard)
+            .field("reuse_port", &self.reuse_port)
+            .field("backlog", &self.backlog)
+            .field("event_sink", &self.event_sink.as_ref().map(|_| "<sink>"))
+            .finish()
     }
 }
 
@@ -207,6 +222,56 @@ impl ShardedTcpConfig {
         self.backlog = backlog;
         self
     }
+
+    /// Sets a structured event sink for server-level runtime events.
+    pub fn with_event_sink<S>(mut self, sink: S) -> Self
+    where
+        S: ShardedTcpEventSink,
+    {
+        self.event_sink = Some(Arc::new(sink));
+        self
+    }
+
+    /// Sets a shared structured event sink for server-level runtime events.
+    pub fn with_shared_event_sink(mut self, sink: Arc<dyn ShardedTcpEventSink>) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+}
+
+/// Structured event emitted by a [`ShardedTcpServer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardedTcpEvent {
+    /// An accepted connection was dropped because its target shard was already
+    /// at the configured connection limit.
+    ConnectionLimitRejected {
+        /// The target shard for the connection.
+        shard_id: ShardId,
+    },
+    /// An accept-loop error stopped an accept task.
+    AcceptError {
+        /// The shard that owned the failing listener, or `None` for the
+        /// single-accept path.
+        shard_id: Option<ShardId>,
+        /// The stable `io::ErrorKind` for the accept failure.
+        kind: io::ErrorKind,
+    },
+    /// An accepted connection's handler could not be submitted.
+    HandlerSubmitError {
+        /// The target shard for the handler.
+        shard_id: ShardId,
+        /// The submit error returned by the sharded executor.
+        error: ShardedSpawnError,
+    },
+}
+
+/// Sink for structured [`ShardedTcpEvent`] values.
+pub trait ShardedTcpEventSink: Send + Sync + 'static {
+    /// Records one server event.
+    ///
+    /// Panics from this method are isolated by the server event recorder after
+    /// built-in snapshot counters have been updated.
+    fn record(&self, event: ShardedTcpEvent);
 }
 
 /// Error returned when a sharded TCP server cannot be started.
@@ -301,11 +366,48 @@ struct ShardedTcpServerStats {
 }
 
 impl ShardedTcpServerStats {
+    fn record(&self, event: ShardedTcpEvent) {
+        match event {
+            ShardedTcpEvent::ConnectionLimitRejected { .. } => {
+                self.connection_limit_rejections
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            ShardedTcpEvent::AcceptError { .. } => {
+                self.accept_errors.fetch_add(1, Ordering::AcqRel);
+            }
+            ShardedTcpEvent::HandlerSubmitError { .. } => {
+                self.handler_submit_errors.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
     fn snapshot(&self) -> ShardedTcpServerSnapshot {
         ShardedTcpServerSnapshot {
             connection_limit_rejections: self.connection_limit_rejections.load(Ordering::Acquire),
             accept_errors: self.accept_errors.load(Ordering::Acquire),
             handler_submit_errors: self.handler_submit_errors.load(Ordering::Acquire),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ShardedTcpEventRecorder {
+    stats: Arc<ShardedTcpServerStats>,
+    event_sink: Option<Arc<dyn ShardedTcpEventSink>>,
+}
+
+impl ShardedTcpEventRecorder {
+    fn new(
+        stats: Arc<ShardedTcpServerStats>,
+        event_sink: Option<Arc<dyn ShardedTcpEventSink>>,
+    ) -> Self {
+        Self { stats, event_sink }
+    }
+
+    fn record(&self, event: ShardedTcpEvent) {
+        self.stats.record(event);
+        if let Some(sink) = &self.event_sink {
+            let _ = catch_unwind(AssertUnwindSafe(|| sink.record(event)));
         }
     }
 }
@@ -392,6 +494,8 @@ impl ShardedTcpServer {
         let max_connections_per_shard = self.config.max_connections_per_shard;
         let connection_counts = connection_counts(submitter.shard_count());
         let stats = Arc::new(ShardedTcpServerStats::default());
+        let recorder =
+            ShardedTcpEventRecorder::new(Arc::clone(&stats), self.config.event_sink.clone());
         let (stop_source, stop_token) = stop_pair();
         let mut listener_addr = self.bind_addr;
         let mut listeners = Vec::with_capacity(submitter.shard_count());
@@ -421,7 +525,7 @@ impl ShardedTcpServer {
             let shard_submitter = submitter.clone();
             let accept_stop = stop_token.clone();
             let connection_counts = Arc::clone(&connection_counts);
-            let stats = Arc::clone(&stats);
+            let recorder = recorder.clone();
 
             if let Err(error) = submitter.submit_named_to(
                 shard_id,
@@ -435,9 +539,9 @@ impl ShardedTcpServer {
                                     shard_id,
                                     max_connections_per_shard,
                                 ) else {
-                                    stats
-                                        .connection_limit_rejections
-                                        .fetch_add(1, Ordering::AcqRel);
+                                    recorder.record(ShardedTcpEvent::ConnectionLimitRejected {
+                                        shard_id,
+                                    });
                                     continue;
                                 };
                                 let conn = ShardedTcpConnection {
@@ -453,16 +557,17 @@ impl ShardedTcpServer {
                                         permit,
                                     ),
                                 ) {
-                                    stats.handler_submit_errors.fetch_add(1, Ordering::AcqRel);
-                                    eprintln!(
-                                        "[sitas-tcp] shard {} handler submit failed: {}",
-                                        shard_idx, error
-                                    );
+                                    recorder.record(ShardedTcpEvent::HandlerSubmitError {
+                                        shard_id,
+                                        error,
+                                    });
                                 }
                             }
                             RaceOutput::First(Err(e)) => {
-                                stats.accept_errors.fetch_add(1, Ordering::AcqRel);
-                                eprintln!("[sitas-tcp] shard {} accept error: {}", shard_idx, e);
+                                recorder.record(ShardedTcpEvent::AcceptError {
+                                    shard_id: Some(shard_id),
+                                    kind: e.kind(),
+                                });
                                 break;
                             }
                             RaceOutput::Second(()) => break,
@@ -497,9 +602,10 @@ impl ShardedTcpServer {
         let max_connections_per_shard = self.config.max_connections_per_shard;
         let connection_counts = connection_counts(shard_count);
         let stats = Arc::new(ShardedTcpServerStats::default());
+        let recorder =
+            ShardedTcpEventRecorder::new(Arc::clone(&stats), self.config.event_sink.clone());
         let (stop_source, stop_token) = stop_pair();
         let listener = create_single_listener(bind_addr)?;
-        let accept_stats = Arc::clone(&stats);
 
         if let Err(error) = submitter.submit_named_to(ShardId(0), "tcp-accept-0", async move {
             loop {
@@ -511,9 +617,9 @@ impl ShardedTcpServer {
                             target_shard,
                             max_connections_per_shard,
                         ) else {
-                            accept_stats
-                                .connection_limit_rejections
-                                .fetch_add(1, Ordering::AcqRel);
+                            recorder.record(ShardedTcpEvent::ConnectionLimitRejected {
+                                shard_id: target_shard,
+                            });
                             continue;
                         };
                         let conn = ShardedTcpConnection {
@@ -525,18 +631,17 @@ impl ShardedTcpServer {
                         if let Err(error) = shard_submitter
                             .submit_to(target_shard, run_handler_with_permit(handler, permit))
                         {
-                            accept_stats
-                                .handler_submit_errors
-                                .fetch_add(1, Ordering::AcqRel);
-                            eprintln!(
-                                "[sitas-tcp] shard {} handler submit failed: {}",
-                                target_shard.0, error
-                            );
+                            recorder.record(ShardedTcpEvent::HandlerSubmitError {
+                                shard_id: target_shard,
+                                error,
+                            });
                         }
                     }
                     RaceOutput::First(Err(e)) => {
-                        accept_stats.accept_errors.fetch_add(1, Ordering::AcqRel);
-                        eprintln!("[sitas-tcp] accept error: {}", e);
+                        recorder.record(ShardedTcpEvent::AcceptError {
+                            shard_id: None,
+                            kind: e.kind(),
+                        });
                         break;
                     }
                     RaceOutput::Second(()) => break,
@@ -797,6 +902,26 @@ mod bind_sockaddr_tests {
     use super::*;
     use crate::ShardedExecutor;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<ShardedTcpEvent>>,
+    }
+
+    impl ShardedTcpEventSink for RecordingSink {
+        fn record(&self, event: ShardedTcpEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    struct PanickingSink;
+
+    impl ShardedTcpEventSink for PanickingSink {
+        fn record(&self, _event: ShardedTcpEvent) {
+            panic!("sink panic");
+        }
+    }
 
     #[test]
     fn bind_sockaddr_builds_ipv4_address_with_stable_pointer() {
@@ -838,6 +963,50 @@ mod bind_sockaddr_tests {
         assert!(second.is_none());
         drop(first);
         assert!(ConnectionPermit::try_acquire(counts, ShardId(0), 1).is_some());
+    }
+
+    #[test]
+    fn event_recorder_updates_snapshot_and_custom_sink() {
+        let stats = Arc::new(ShardedTcpServerStats::default());
+        let sink = Arc::new(RecordingSink::default());
+        let sink_for_recorder: Arc<dyn ShardedTcpEventSink> = sink.clone();
+        let recorder = ShardedTcpEventRecorder::new(Arc::clone(&stats), Some(sink_for_recorder));
+        let event = ShardedTcpEvent::ConnectionLimitRejected {
+            shard_id: ShardId(0),
+        };
+
+        recorder.record(event);
+
+        assert_eq!(
+            stats.snapshot(),
+            ShardedTcpServerSnapshot {
+                connection_limit_rejections: 1,
+                accept_errors: 0,
+                handler_submit_errors: 0,
+            }
+        );
+        assert_eq!(sink.events.lock().unwrap().as_slice(), &[event]);
+    }
+
+    #[test]
+    fn event_recorder_isolates_sink_panics() {
+        let stats = Arc::new(ShardedTcpServerStats::default());
+        let sink = Arc::new(PanickingSink);
+        let recorder = ShardedTcpEventRecorder::new(Arc::clone(&stats), Some(sink));
+
+        recorder.record(ShardedTcpEvent::AcceptError {
+            shard_id: Some(ShardId(0)),
+            kind: io::ErrorKind::ConnectionAborted,
+        });
+
+        assert_eq!(
+            stats.snapshot(),
+            ShardedTcpServerSnapshot {
+                connection_limit_rejections: 0,
+                accept_errors: 1,
+                handler_submit_errors: 0,
+            }
+        );
     }
 
     #[test]

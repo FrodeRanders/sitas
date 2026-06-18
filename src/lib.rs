@@ -106,8 +106,8 @@ pub use sharded_executor::{
 };
 #[cfg(unix)]
 pub use sharded_tcp::{
-    ShardedTcpConfig, ShardedTcpConnection, ShardedTcpServer, ShardedTcpServerHandle,
-    ShardedTcpServerSnapshot, ShardedTcpStartError,
+    ShardedTcpConfig, ShardedTcpConnection, ShardedTcpEvent, ShardedTcpEventSink, ShardedTcpServer,
+    ShardedTcpServerHandle, ShardedTcpServerSnapshot, ShardedTcpStartError,
 };
 pub use stream_reply::{
     StreamBatch, StreamError, StreamFuture, StreamProducer, StreamReply, StreamSender,
