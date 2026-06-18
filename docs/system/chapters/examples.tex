@@ -147,6 +147,13 @@ placement:
           one final partition file, and returns owned metadata.
 \end{itemize}
 
+The communication paths are intentionally mixed. Scanner tasks send
+\texttt{Vec<IndexEntry>} batches to assembler work units through mailboxes.
+Assemblers do not send mailbox messages to the coordinator. Instead, each
+assembler returns small owned \texttt{PartitionRun} metadata through its task
+handle, and the coordinator reads the assembler run files during the final
+k-way merge.
+
 The final index is still a file because it is the externally visible result.
 The point of the example is that intermediate cross-shard exchange is typed
 message transfer, not shared mutable state and not borrowed data.

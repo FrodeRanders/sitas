@@ -297,6 +297,12 @@ shard owns this key?'' to ``which target type does this router produce?''
           0, making non-uniform placement visible.
 \end{itemize}
 
+Keep the roles separate while reading the example. Scanner tasks message
+assembler work units through mailboxes. Assemblers report completion metadata
+to \texttt{main} through task handles, not through another mailbox, and their
+sorted data reaches coordination as run files consumed by the final k-way
+merge.
+
 While reading \filepath{src/shard\_mailbox.rs}, distinguish the transport from
 the ownership model. The mailbox queue uses synchronization internally, but
 the message is an owned value and the receiver task is still the only code that

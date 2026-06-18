@@ -4,6 +4,18 @@
 //! send owned index-entry batches to destination shard assemblers through
 //! logical work-unit mailboxes, so intermediate cross-shard exchange does not
 //! use files and the logical work assignment does not have to be uniform.
+//!
+//! There are three roles in this demo:
+//!
+//! - scanner tasks read contiguous input-file partitions on executor shards;
+//! - assembler work units receive mailbox batches and build sorted runs;
+//! - the coordinator in `main` starts work, waits for task handles, merges the
+//!   assembler run files, verifies the final index, and shuts the runtime down.
+//!
+//! The mailbox path is deliberately scoped to scanner -> assembler transfer.
+//! Assemblers do not send mailbox messages back to coordination. They return
+//! small owned `PartitionRun` metadata through their task handles, and the
+//! coordinator reads their sorted run files during the final k-way merge.
 
 use sitas::{
     CpuPlacement, RouteByKey, ShardId, ShardLocal, ShardMailboxConfig, ShardSendError,
