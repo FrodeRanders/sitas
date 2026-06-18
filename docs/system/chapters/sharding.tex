@@ -3,22 +3,21 @@
 \section{Shard-per-core direction}
 
 \texttt{ShardedExecutor} connects the single-threaded executor to the
-shard-per-core model. It starts one executor on each shard thread and provides
-APIs for submitting work to one shard, all shards, or a map/reduce over shards.
+shard-per-core model. It starts one executor per shard thread and provides APIs
+for submitting work to one shard, all shards, or a map/reduce over shards.
 
-The model is explicit: work does not migrate implicitly. A future runs on its
-assigned shard until code deliberately submits work elsewhere.
+Work does not migrate implicitly. A future runs on its assigned shard until
+code deliberately submits work elsewhere.
 
 This mirrors the most important Seastar idea without copying its C++ API:
-parallelism comes from many mostly-independent shards, not from many threads
-mutating the same service object. Each shard has its own executor, task queues,
-timers, readiness registrations, and shard-local values.
+parallelism comes from many independent shards, not from many threads mutating
+the same service object. Each shard has its own executor, task queues, timers,
+readiness registrations, and shard-local values.
 
-The reason for this shape is cache locality and ownership clarity. If each
-shard owns its state and mostly works on its own queue, the runtime does not
-need a global lock around application data. Cross-shard communication still
-exists, but it becomes an explicit cost in the design instead of an accidental
-side effect of shared references.
+Cache locality and ownership clarity drive this shape. Each shard owns its
+state and works on its own queue, so no global lock is needed. Cross-shard
+communication is an explicit design cost, not an accidental side effect of
+shared references.
 
 \begin{lstlisting}[language={},caption={Shard-per-core runtime shape}]
 Shard 0 thread        Shard 1 thread        Shard 2 thread
@@ -38,10 +37,10 @@ resumes on its original shard after the remote work completes.
 Submitters own spawner clones. They are lifetime capabilities and must be
 dropped before a runtime can fully drain.
 
-The important detail is the return path. A task on shard 0 can submit work to
-shard 1 and await the join handle. The submitted future is polled on shard 1.
-When it completes, the awaiting future on shard 0 is woken and continues on
-shard 0. The result crosses the boundary as an owned value.
+The important detail is the return path. A task on shard 0 submits work to
+shard 1 and awaits the join handle. The submitted future is polled on shard 1.
+On completion, the awaiting future on shard 0 wakes and continues on shard 0.
+The result crosses the boundary as an owned value.
 
 \begin{lstlisting}[language={},caption={Cross-shard async flow}]
 Shard 0 task
@@ -60,18 +59,16 @@ This is why cross-shard APIs require \texttt{Send + 'static} where a future or
 value can move to another thread. It is also why references into shard-local
 state cannot be submitted.
 
-The submitter API is deliberately more explicit than a general work-stealing
-pool. Work stealing would be interesting later, but it would blur the lesson
-this runtime is trying to preserve: placement is part of the program's
-semantics. When code submits to shard 1, it is saying that shard 1 is the
-correct owner for that unit of work.
+The submitter API is more explicit than work stealing. Work stealing would blur
+the core lesson: placement is part of the program's semantics. Submitting to
+shard 1 means shard 1 is the correct owner for that work.
 
 \section{Mailbox routing}
 
 \texttt{ShardedSubmitter} moves futures. \texttt{shard\_mailbox} moves owned
-messages. A mailbox does not make application state shared; it gives one
-producer or many producers a typed way to transfer ownership to a receiver that
-is still local to its assigned shard.
+messages. A mailbox does not make application state shared; it gives producers
+a typed way to transfer ownership to a receiver that remains local to its
+assigned shard.
 
 There are two routing modes.
 
@@ -101,10 +98,9 @@ cases the key is still the discriminator; what changes is the target type.
 
 The receiving side remains shard-local. A named work unit has exactly one
 receiver, and \texttt{receiver\_for\_current\_shard} checks that the receiver is
-being taken by a task running on the work unit's assigned shard. That check is
-important for non-uniform placement: the logical name is not the owner by
-itself; the name plus its placement says which executor may mutate the
-associated state.
+taken by a task on the work unit's assigned shard. For non-uniform placement,
+the logical name alone is not the owner; the name plus its placement determines
+which executor may mutate the associated state.
 
 \begin{notabene}[Mailbox routing is not load balancing]
 The mailbox layer does not steal work and does not rebalance a hot work unit.
@@ -116,15 +112,15 @@ behavior through owned snapshots and example output.
 \section{Shard-local values}
 
 \texttt{ShardLocal<T>} owns one value per executor shard. Access is routed to
-the owning shard and the user closure receives \texttt{\&mut T} synchronously.
-The implementation uses internal unchecked storage plus runtime owner checks,
-not a mutex around application state.
+the owning shard and the closure receives \texttt{\&mut T} synchronously. The
+implementation uses internal unchecked storage plus runtime owner checks, not a
+mutex.
 
-The critical rule is that references to local state cannot escape the closure
-and cannot cross \texttt{.await}. This keeps ownership local even when the
-runtime itself uses synchronization for task bookkeeping.
+References to local state cannot escape the closure and cannot cross
+\texttt{.await}. Ownership stays local even when the runtime uses
+synchronization for task bookkeeping.
 
-There are two useful ways to read \texttt{ShardLocal<T>}:
+Two ways to read \texttt{ShardLocal<T>}:
 
 \begin{itemize}
     \item as a safe teaching model for shared-nothing state, because each shard
@@ -133,10 +129,9 @@ There are two useful ways to read \texttt{ShardLocal<T>}:
           to \texttt{T} from becoming async state.
 \end{itemize}
 
-The API therefore prefers closures returning owned results. If a computation
-needs to wait, split it into two phases: first copy or compute an owned value
-from the shard-local state, then \texttt{await} using that owned value outside
-the access closure.
+The API prefers closures returning owned results. If a computation needs to
+wait, copy or compute an owned value from the shard-local state first, then
+\texttt{await} using that owned value outside the access closure.
 
 \begin{notabene}[Why not async closures for local access?]
 An async closure can suspend while holding references captured from its
@@ -150,16 +145,16 @@ or mutate local state now, return an owned value, and only then await.
 A sharded scheduling group is not a global queue. It is a convenience handle
 containing one executor-local scheduling group per shard. Creating a group
 called \texttt{foreground} on a four-shard runtime creates four independent
-executor-local \texttt{foreground} groups, all with the same shares.
+local \texttt{foreground} groups, all with the same shares.
 
-This preserves the shared-nothing model. Each shard still schedules only its
-own tasks. The sharded group handle simply lets callers use one typed API to
-spawn or submit matching classes of work across shards.
+Each shard still schedules only its own tasks. The sharded group handle lets
+callers use one typed API to spawn or submit matching classes of work across
+shards.
 
-Per-shard snapshots keep the same boundary. They report each shard's local
-group poll count, charged poll time, average poll duration, and poll-time
-share. A monitoring tool can compare those owned values across shards, but the
-runtime does not introduce a global scheduling queue to produce them.
+Per-shard snapshots keep the same boundary: each shard's local group poll
+count, charged poll time, average poll duration, and poll-time share. A
+monitoring tool can compare those owned values across shards, but the runtime
+does not introduce a global scheduling queue to produce them.
 
 Runtime identity matters. A sharded group created by one
 \texttt{ShardedExecutor} is rejected by another runtime, even if both runtimes
@@ -169,22 +164,19 @@ same-numbered executor-local group ids in the wrong runtime.
 \section{CPU placement}
 
 CPU placement is an experimental Linux-supported runtime request. Linux applies
-hard affinity with \texttt{sched\_setaffinity} where supported and observes
-container cpuset restrictions through \texttt{sched\_getaffinity}. Non-Linux
-platforms report unsupported placement honestly.
+hard affinity with \texttt{sched\_setaffinity} and observes container cpuset
+restrictions through \texttt{sched\_getaffinity}. Non-Linux platforms report
+unsupported.
 
-By default, placement failures are recorded in shard snapshots and startup can
-still succeed. Required placement turns that into fail-fast startup behavior.
+By default, placement failures are recorded in shard snapshots and startup
+succeeds. Required placement turns that into fail-fast behavior.
 
-CPU placement is best understood as an explicit request, not as a finished
-portable scheduler. On Linux, the runtime asks the kernel to pin shard threads
-to particular CPUs. In containers, the available CPU set may already be
-restricted, so the runtime first observes what the kernel says is available.
-On macOS and other unsupported platforms, placement reports unsupported rather
-than pretending that pinning happened.
+On Linux, the runtime asks the kernel to pin shard threads to particular CPUs.
+In containers, the available CPU set may already be restricted, so the runtime
+first queries what the kernel allows. On macOS and other platforms, placement
+reports unsupported rather than pretending that pinning happened.
 
-The feature is useful even in this experimental form because it forces the
-runtime to separate desired placement from observed placement. A shard can say
-which CPU it asked for, which CPU set the host allowed, and whether startup
-treated failure as advisory or fatal. Those facts are more valuable than a
-portable abstraction that hides when pinning did not actually occur.
+The feature is useful even in experimental form because it forces the runtime
+to separate desired placement from observed placement. A shard can report which
+CPU it asked for, which CPU set the host allowed, and whether startup treated
+failure as advisory or fatal.

@@ -15,13 +15,13 @@ The output is \filepath{docs/system/sysdoc.pdf}. The build uses
 If the build fails, first check that the LaTeX distribution has the standard
 packages used by \filepath{sitasdoc.cls}: \texttt{geometry}, \texttt{fancyhdr},
 \texttt{titlesec}, \texttt{titletoc}, \texttt{listings}, \texttt{xcolor}, and
-\texttt{hyperref}. The manual intentionally avoids project-specific generated
+\texttt{hyperref}. The manual avoids project-specific generated
 assets so it can be rebuilt from text alone.
 
-Keeping the manual build simple is intentional. The documentation should not
+Keeping the manual build simple is intentional. The documentation does not
 depend on the runtime being runnable, Docker being available, or generated
-diagrams being checked out from another tool. A plain text-to-PDF path makes it
-cheap to update design explanations in the same commits as code changes.
+diagrams. A plain text-to-PDF path makes it cheap to update design
+explanations alongside code changes.
 
 \section{Cleaning generated files}
 
@@ -49,9 +49,9 @@ Linux-only examples report that the backend is unavailable rather than faking a
 successful run.
 
 The Docker path exists because macOS is a good development environment for most
-of the code, while Linux is the only honest place to test Linux primitives such
-as hard CPU affinity and \texttt{io\_uring}. The helper keeps that platform
-check repeatable without pretending the project is platform-neutral in areas
+of the code, while Linux is the only honest target for Linux-specific
+primitives like hard CPU affinity and \texttt{io\_uring}. The helper keeps that
+platform check repeatable without pretending the project is platform-neutral
 where it is not.
 
 \section{Continuous integration}
@@ -104,8 +104,8 @@ cargo doc --no-deps
 
 \section{Validation strategy}
 
-Use narrow tests first, then broaden. This keeps iteration fast while still
-protecting the runtime invariants.
+Use narrow tests first, then broaden. This keeps iteration fast while
+protecting runtime invariants.
 
 \begin{lstlisting}[language=bash,caption={Typical focused-to-broad workflow}]
 cargo test task_snapshot -- --nocapture
@@ -125,20 +125,20 @@ SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test
 SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo clippy --all-targets -- -D warnings
 \end{lstlisting}
 
-The order matters. Focused tests make it easier to understand the mechanism
-that failed. Broad tests then protect against regressions in adjacent runtime
-paths. This is especially important in executor code, where a small lifecycle
-change can affect timers, readiness, joins, and shutdown at the same time.
+The order matters. Focused tests make it easier to understand the failure.
+Broad tests protect against regressions in adjacent runtime paths. This is
+especially important in executor code, where a small lifecycle change can
+affect timers, readiness, joins, and shutdown simultaneously.
 
 \section{Interpreting unsupported features}
 
 Unsupported is a valid result when the platform cannot provide a feature. CPU
 placement is unsupported on non-Linux platforms. \texttt{io\_uring} may be
-unavailable if the host kernel, container runtime, or security profile blocks
-ring setup. The project should report those cases honestly instead of hiding
-them behind a fake success path.
+unavailable if the kernel, container runtime, or security profile blocks ring
+setup. The project reports those cases honestly instead of hiding them behind
+fake success.
 
-This matters for learning. A runtime experiment should make platform boundaries
-visible: readiness works on several Unix backends, hard CPU affinity is
-Linux-specific, and \texttt{io\_uring} is both Linux-specific and dependent on
-host/container permissions.
+A runtime experiment should make platform boundaries visible: readiness works
+on several Unix backends, hard CPU affinity is Linux-specific, and
+\texttt{io\_uring} is both Linux-specific and dependent on host/container
+permissions.

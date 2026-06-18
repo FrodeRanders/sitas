@@ -2,7 +2,7 @@
 
 \section{Learning examples}
 
-The \filepath{examples/} directory is part of the teaching surface. The examples
+The \filepath{examples/} directory is part of the teaching material. The examples
 show the runtime pieces in isolation before combining them:
 
 \begin{itemize}
@@ -16,15 +16,14 @@ show the runtime pieces in isolation before combining them:
           index-building demos.
 \end{itemize}
 
-The examples are deliberately not just smoke tests. Each one is a small
-experiment with a visible runtime question: what wakes this future, which shard
-polls it, what state does the snapshot show, or what happens when the work is
-cancelled? That is why several examples print more internal state than a normal
-library example would.
+The examples are not just smoke tests. Each one is a small experiment with a
+visible runtime question: what wakes this future, which shard polls it, what
+state does the snapshot show, or what happens when cancelled? Several examples
+print more internal state than a normal library example would.
 
 \section{Suggested reading path}
 
-The examples are easiest to learn from in layers:
+The examples are easiest to learn in layers:
 
 \begin{enumerate}
     \item Start with \filepath{executor_sleep.rs},
@@ -47,12 +46,12 @@ The examples are easiest to learn from in layers:
 \end{enumerate}
 
 Treat examples as executable documentation. Run them, then inspect the modules
-they use. Most examples intentionally print runtime counters or snapshots so
-that the mechanism is visible rather than merely implied.
+they use. Most examples print runtime counters or snapshots so the mechanism is
+visible rather than implied.
 
-If an example feels a little verbose, that is usually intentional. The output
-is meant to connect a user-visible event to an internal mechanism. A compact
-demo that hides the executor state would be less useful for this project.
+If an example feels verbose, that is usually intentional. The output connects
+a user-visible event to an internal mechanism. A compact demo that hides
+executor state would be less useful.
 
 \section{Observability examples}
 
@@ -69,9 +68,8 @@ sleep and wake. The interesting columns are:
 
 \filepath{async_tcp_scheduling_groups.rs} shows a different form of
 observability. It starts two TCP accept loops, parks accepted handlers, takes a
-snapshot, and prints which scheduling group each live task belongs to. This is
-a small substitute for a console UI: the snapshot is just owned data, so a tool
-can render it however it wants.
+snapshot, and prints which scheduling group each live task belongs to. The
+snapshot is owned data, so any tool can render it.
 
 \filepath{scheduling\_group\_demo.rs} and
 \filepath{sharded\_scheduling\_groups.rs} expose group-level progress as well:
@@ -86,8 +84,7 @@ sorted index of offsets into that data file. Each shard scans one partition,
 sorts its partition-local index entries, writes a materialized run file, and
 then participates in merge rounds until one sorted index remains.
 
-The example demonstrates several of the runtime's most important APIs in
-combination:
+The example demonstrates several runtime APIs in combination:
 
 \begin{itemize}
     \item \texttt{ShardLocal<ShardProgress>} tracks per-shard phase,
@@ -112,18 +109,16 @@ same \texttt{ShardLocal} and \texttt{map\_all} shape as the std variant. Final
 verification still uses ordinary file I/O because it checks the externally
 visible result rather than the runtime path that produced it.
 
-The index examples are intentionally more involved than the small teaching
-examples. They exercise the Seastar-like direction: split work by shard, keep
-partition-local state local while sorting, materialize intermediate runs,
-merge owned outputs, and collect per-shard timing statistics with
-\texttt{RunningStatistics}. They are useful for studying where the project is
-heading, but they are not the first examples to read.
+The index examples are more involved than the small teaching examples. They
+exercise the Seastar-like direction: split work by shard, keep partition-local
+state local while sorting, materialize intermediate runs, merge owned outputs,
+and collect per-shard timing statistics. They are useful for studying where the
+project is heading, but not the first examples to read.
 
-The reason the index build is a good larger example is that it is naturally
-partitionable. Each shard can sort a portion of the data without sharing a
-mutable index structure with other shards. The merge phase then makes the
-coordination cost explicit by exchanging owned run files and summaries rather
-than borrowing another shard's working set.
+The index build is a good larger example because it is naturally partitionable.
+Each shard sorts a portion of the data without sharing a mutable index
+structure. The merge phase makes coordination cost explicit by exchanging owned
+run files and summaries rather than borrowing another shard's working set.
 
 \subsection{Mailbox-transfer index build}
 
@@ -132,8 +127,7 @@ shows a different assembly path. Scan tasks still run on executor shards, but
 they send owned \texttt{IndexMessage} batches through mailbox senders instead
 of using intermediate run files as the cross-shard exchange medium.
 
-The demo deliberately separates logical ownership from physical shard
-placement:
+The demo separates logical ownership from physical shard placement:
 
 \begin{itemize}
     \item \texttt{WorkUnitRouter<IndexWorkUnit>} maps each record key to a
@@ -147,8 +141,7 @@ placement:
           one final partition file, and returns owned metadata.
 \end{itemize}
 
-The communication paths are intentionally mixed. Scanner tasks send
-\texttt{Vec<IndexEntry>} batches to assembler work units through mailboxes.
+The communication paths are mixed. Scanner tasks send \texttt{Vec<IndexEntry>} batches to assembler work units through mailboxes.
 Assemblers do not send mailbox messages to the coordinator. Instead, each
 assembler returns small owned \texttt{PartitionRun} metadata through its task
 handle, and the coordinator reads the assembler run files during the final

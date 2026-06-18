@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-`sitas` is an experimental Rust runtime and service model inspired by Seastar's shard-per-core architecture. It is not a direct Seastar clone. The project explores how the same broad ideas can be expressed in a Rust-native way:
+`sitas` is an experimental Rust runtime and service model inspired by Seastar's shard-per-core architecture. Not a Seastar clone. The project explores how the same broad ideas work in Rust:
 
 - shard-local ownership;
 - explicit cross-shard communication;
@@ -12,11 +12,11 @@
 - small safe APIs over isolated unsafe/OS-specific mechanisms;
 - dependency-light runtime experimentation.
 
-The project started with a standard-library-only sharded key-value store. That baseline remains the semantic reference point. Newer branches extend it with a custom executor, Unix readiness primitives, TCP helpers, sharded async execution, shard-local values, observability snapshots, CPU placement, and experimental Linux `io_uring` support.
+The project started with a standard-library-only sharded key-value store. That baseline remains the semantic reference. Newer branches extend it with a custom executor, Unix readiness primitives, TCP helpers, sharded async execution, shard-local values, observability snapshots, CPU placement, and experimental Linux `io_uring` support.
 
 ## 2. Architectural invariants
 
-These invariants define the project more than any particular implementation detail.
+These invariants define the project.
 
 1. **Shard ownership:** each piece of application service state is owned by a shard.
 2. **Local mutation:** only the owning shard may mutate its service state.
@@ -55,7 +55,7 @@ The std-only baseline exercises the upper part of this model without a custom as
 
 ### `runtime`
 
-`runtime` is the reusable standard-library kernel. It deliberately does not know about key-value commands or concrete service state.
+`runtime` is the reusable standard-library kernel. It does not know about key-value commands or concrete service state.
 
 Responsibilities:
 
@@ -77,7 +77,7 @@ The service exposes blocking methods, non-blocking enqueue variants, submit/wait
 
 ### `counter`
 
-`ShardedCounter` is the deliberately small second service. It proves that the runtime primitives are not key-value-specific without forcing premature generic service abstractions.
+`ShardedCounter` is a small second service. It proves that the runtime primitives are not key-value-specific without forcing premature generic service abstractions.
 
 ### `sharded`
 
@@ -139,7 +139,7 @@ The build example wins at 1 shard because it has no merge phase and copies one f
 
 ### `placement`
 
-`placement` defines routing from keys to shards. The default strategy is hash-based. The goal is to make placement explicit and replaceable, not to provide production-grade consistent hashing yet.
+`placement` defines routing from keys to shards. The default strategy is hash-based. Placement is explicit and replaceable, but not production-grade consistent hashing yet.
 
 ### `os`
 
@@ -156,7 +156,7 @@ Current responsibilities:
 - blocking `OsReactor::wait` that can be woken by the pipe;
 - experimental Linux `io_uring` operations and dispatcher support.
 
-This layer is intentionally smaller than a full production reactor. It establishes the FFI boundary and wake/readiness mechanisms before deeper production `io_uring` integration.
+This layer is smaller than a full production reactor. It establishes the FFI boundary and wake/readiness mechanisms before deeper `io_uring` integration.
 
 Because the project uses Rust edition 2024, C FFI declarations must use `unsafe extern "C" { ... }`.
 
@@ -204,25 +204,22 @@ Responsibilities:
 - cumulative executor counters for spawned tasks, completed tasks, task polls,
   and ready-poll budget exhaustion events.
 
-The executor is intentionally small and dependency-free. It is a semantic experiment before a production runtime.
+The executor is small and dependency-free---a semantic experiment before a production runtime.
 
 ### Scheduling groups
 
-Scheduling groups are the first small Seastar-like resource-class mechanism in
-the custom executor. A [`Spawner`](../src/executor/spawner.rs) can create an
-executor-local group with a name and relative share count, then spawn tasks into
-that group. Ordinary `spawn` calls use the default group with 100 shares. A
-group handle created by one executor is rejected by other executors; the default
-group handle is the only portable single-executor group handle because it names
-the built-in default queue rather than an allocated executor-local queue.
+Scheduling groups are the first Seastar-like resource-class mechanism. A
+[`Spawner`](../src/executor/spawner.rs) can create an executor-local group with
+a name and relative share count, then spawn tasks into that group. Ordinary
+`spawn` calls use the default group with 100 shares. A group handle created by
+one executor is rejected by other executors; the default group handle is
+portable because it names the built-in default queue.
 
 Each group owns its own ready queue. When the executor chooses the next ready
 task, it selects a non-empty group with the lowest weighted virtual runtime,
-then pops one task from that group's FIFO queue. After the task is polled, the
-executor charges the group with actual wall-clock poll time scaled by its
-shares. This is intentionally simple: it gives CPU-heavy cooperative tasks a
-real weighted scheduling signal without introducing preemption, priorities,
-load balancing, or a production resource controller.
+pops one task from that group's FIFO queue, and charges the group for
+wall-clock poll time scaled by its shares. Simple: weighted scheduling without
+preemption, priorities, load balancing, or a production resource controller.
 
 Scheduling group snapshots are owned values and include group id, name, shares,
 ready queue length, total charged poll count, total charged poll time, and
@@ -233,19 +230,16 @@ name when the snapshot builder can resolve it. The `scheduling_group_demo`
 example first runs all work in the default group as a baseline, then repeats the
 workload with weighted groups.
 
-`TaskScope` can spawn ordinary children or cooperative stop-token children into
-a scheduling group. The scope does not own scheduling policy itself; it keeps
-structured child lifetime management while delegating group ownership checks to
-the underlying `Spawner`.
+`TaskScope` can spawn children into a scheduling group. The scope does not own
+scheduling policy; it keeps structured child lifetime management while
+delegating group ownership checks to the underlying `Spawner`.
 
-On `ShardedExecutor`, a sharded scheduling group is represented as one
-executor-local scheduling group per shard. Creating a group on all shards does
-not introduce a global scheduler or shared runtime state; it is a convenience
-for giving matching per-shard groups the same name and shares. Grouped fan-out
-spawns and grouped submitter calls still place work explicitly on each shard.
-Sharded scheduling group handles are tied to the runtime that created them;
-using a group handle with another runtime is rejected rather than silently
-targeting same-numbered executor-local groups.
+On `ShardedExecutor`, a sharded scheduling group is one executor-local group
+per shard. Creating a group on all shards does not introduce a global scheduler
+or shared state; it gives matching per-shard groups the same name and shares.
+Grouped fan-out spawns and grouped submitter calls place work explicitly per
+shard. Sharded group handles are tied to the runtime that created them; using
+one with another runtime is rejected.
 
 ### TCP helpers
 
@@ -263,10 +257,6 @@ The executor currently supports readiness-driven TCP helpers:
 - stop-token-controlled accept loops;
 - scoped stoppable server helpers that propagate shutdown to handlers;
 - bounded handler shutdown with abort of uncooperative handlers.
-
-Server helpers have default-group and explicit scheduling-group variants. The
-grouped variants place accepted handler tasks into the requested executor-local
-group while keeping the accept loop itself in the caller's current task.
 
 These helpers validate that one executor thread can interleave client and server TCP work using readiness events.
 
@@ -300,9 +290,9 @@ Current responsibilities:
 - `submitter` creates cloneable cross-shard submission capability;
 - runtime shutdown drops owned spawners and joins executor threads.
 
-CPU placement is an explicit runtime request. Linux applies hard affinity with `sched_setaffinity` where supported and observes container cpuset restrictions through `sched_getaffinity`. Explicit CPU lists are preflighted against `available_cpu_ids` before shard threads are started. Non-Linux platforms report unsupported placement honestly rather than pretending to pin. By default, placement failures are recorded in shard snapshots and startup still succeeds. `require_cpu_placement` turns that into fail-fast startup behavior for deployments that depend on hard affinity.
+CPU placement is an explicit runtime request. Linux applies hard affinity with `sched_setaffinity` and observes container cpuset restrictions through `sched_getaffinity`. Explicit CPU lists are preflighted against `available_cpu_ids` before shard threads start. Non-Linux platforms report unsupported. By default, placement failures are recorded in shard snapshots and startup succeeds. `require_cpu_placement` turns that into fail-fast behavior.
 
-This layer is not yet load balancing or scheduling classes. It establishes the shared-nothing async shape: work is owned by a shard thread and moves only through explicit submission.
+Not yet load balancing or scheduling classes. It establishes the shared-nothing async shape: work is owned by a shard thread and moves only through explicit submission.
 
 The `sharded_index_build` example demonstrates this shape on a fixed-record file: each shard scans and sorts one data-file partition into a materialized local index run file, then merge rounds submitted back onto shards stream those run files into new materialized runs before the final sorted offset index is written. Its command-line options can vary record count, shard count, seed, and cleanup behavior, while progress output reports per-shard phase, records, task count, and file bytes read/written.
 
@@ -312,7 +302,7 @@ The `sharded_index_build` example demonstrates this shape on a fixed-record file
 
 A task on one shard can submit work to another shard and await the returned join handle. The remote future is polled by the target shard executor. The awaiting task resumes on its original shard after the remote work completes.
 
-Submitters own spawner clones. They are therefore lifetime capabilities: they must be dropped before the runtime can fully drain.
+Submitters own spawner clones. They are lifetime capabilities: they must be dropped before the runtime can fully drain.
 
 Supported higher-level forms:
 
@@ -429,7 +419,7 @@ Executor snapshots expose:
 - helper methods for deriving age, time since last scheduling/poll activity,
   and current coarse-state duration from a caller-supplied `Instant`.
 
-Snapshots are designed to support simple progress views without adding a logging framework, Tokio console, or third-party observability dependency.
+Snapshots support simple progress views without a logging framework, Tokio console, or third-party observability dependency.
 
 ## 8. Shutdown model
 
@@ -453,7 +443,7 @@ Stopping the sharded executor requires dropping owned spawners/submitters and jo
 
 ## 9. I/O readiness model
 
-The readiness path is intentionally small:
+The readiness path is small:
 
 - file descriptors are set non-blocking where required;
 - operations attempt normal read/write/accept/connect work first;
@@ -497,7 +487,7 @@ thread so a later `run` or `run_until` can continue driving those operations.
 A different executor may not take over that thread-local dispatcher while it
 still has live state.
 
-This integration deliberately keeps some limits visible:
+This integration keeps some limits visible:
 
 - it is Linux-only and reports normal unsupported behavior when `io_uring` is
   unavailable;

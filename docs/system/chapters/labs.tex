@@ -3,20 +3,18 @@
 \section{Purpose}
 
 This chapter turns the manual into a workbook. Each lab has a command to run,
-something specific to observe, and a small modification to try. The goal is not
-to benchmark the runtime. The goal is to connect visible behavior to the
-mechanisms described earlier.
+something to observe, and a small modification to try. The goal is to connect
+visible behavior to the mechanisms described earlier.
 
-The labs are organized around ``why'' questions rather than feature coverage.
-Why does a timer need a waker? Why does readiness require retrying the system
-call? Why does cross-shard submission return an owned result? Why does
-\texttt{io\_uring} need abandonment tracking? Running the examples first makes
-those design choices less abstract.
+The labs are organized around ``why'' questions. Why does a timer need a waker?
+Why does readiness require retrying? Why does cross-shard submission return an
+owned result? Why does \texttt{io\_uring} need abandonment tracking? Running
+the examples first makes those design choices concrete.
 
 \begin{notabene}[Lab style]
 Run one lab at a time. After each command, inspect the example source and the
-runtime module it exercises. The examples are intentionally small enough that
-changing them should be part of learning them.
+runtime module it exercises. The examples are small enough that modifying them
+is part of learning them.
 \end{notabene}
 
 \section{Lab 1: Timers and cooperative polling}
@@ -41,9 +39,8 @@ Try this:
     \item Print which task completes first.
 \end{enumerate}
 
-The lesson is that timers do not run in their own thread. The executor records
-deadlines, waits until the next interesting event, and wakes tasks whose
-deadlines expire.
+The lesson: timers do not run in their own thread. The executor records
+deadlines, waits until the next event, and wakes tasks whose deadlines expire.
 
 \section{Lab 2: Wake coalescing}
 
@@ -66,8 +63,8 @@ Try this:
           entries for the same task.
 \end{enumerate}
 
-The lesson is that a waker requests another poll; it is not permission to flood
-the scheduler with duplicate queue entries.
+The lesson: a waker requests another poll; it does not flood the scheduler
+with duplicate queue entries.
 
 \section{Lab 3: Readiness-driven TCP}
 
@@ -91,9 +88,8 @@ Try this:
           server task suspends between writes.
 \end{enumerate}
 
-The lesson is that readiness is retry-oriented. A writable notification does
-not mean every byte has been written; the helper must keep retrying until the
-operation is complete.
+The lesson: readiness is retry-oriented. A writable notification does not mean
+every byte has been written; the helper retries until the operation completes.
 
 \section{Lab 4: Scheduling groups}
 
@@ -118,8 +114,8 @@ Try this:
           \texttt{vruntime} columns.
 \end{enumerate}
 
-The lesson is that scheduling groups are cooperative accounting classes, not
-preemptive priorities. Long-running futures still need to yield.
+The lesson: scheduling groups are cooperative accounting classes, not
+preemptive priorities. Long-running futures must yield.
 
 \section{Lab 5: Observability snapshots}
 
@@ -141,8 +137,8 @@ Try this:
     \item Observe how task count, timer count, and state duration change.
 \end{enumerate}
 
-The lesson is that snapshots are owned samples. They are not tracing events.
-To build a console-like view, sample repeatedly and compute differences.
+The lesson: snapshots are owned samples, not tracing events. To build a
+console-like view, sample repeatedly and compute differences.
 
 \section{Lab 6: Cross-shard submission}
 
@@ -166,8 +162,8 @@ Try this:
           caller's shard.
 \end{enumerate}
 
-The lesson is that the remote future is polled remotely, and the result crosses
-back as an owned value.
+The lesson: the remote future is polled remotely, and the result crosses back
+as an owned value.
 
 \section{Lab 7: Shard-local state}
 
@@ -190,8 +186,8 @@ Try this:
     \item Return an owned summary instead of a reference.
 \end{enumerate}
 
-The lesson is that shard-local access is synchronous. If you need to await,
-first produce an owned value and await outside the local-state closure.
+The lesson: shard-local access is synchronous. To await, first produce an
+owned value and await outside the local-state closure.
 
 \section{Lab 8: CPU placement}
 
@@ -218,8 +214,8 @@ Try this:
     \item Inspect the shard snapshots printed by the example.
 \end{enumerate}
 
-The lesson is that CPU placement is an explicit request to the operating
-system. It is not a load balancer.
+The lesson: CPU placement is an explicit request to the OS. It is not a load
+balancer.
 
 \section{Lab 9: Linux \texttt{io\_uring}}
 
@@ -245,9 +241,9 @@ Try this:
     \item Watch how abandonment and deferred buffer counters change.
 \end{enumerate}
 
-The lesson is that completion-based I/O has a different cancellation problem
-than readiness-based I/O. The kernel may still own an operation after the
-future is gone.
+The lesson: completion-based I/O has a different cancellation problem than
+readiness-based I/O. The kernel may still own an operation after the future is
+gone.
 
 \section{Lab 10: Sharded index build}
 
@@ -286,13 +282,12 @@ Try this:
     \item Compare per-shard partition summaries and final verification output.
 \end{enumerate}
 
-The lesson is that the runtime's value appears when a problem can be split into
-owned shard-local work, then combined through explicit owned results or owned
-messages.
+The lesson: the runtime's value appears when a problem splits into owned
+shard-local work combined through explicit owned results or messages.
 
 \section{After the labs}
 
-After running these labs, return to the walkthrough chapter and read the
-modules again. The source is easier to understand after seeing the runtime's
-observable behavior. If a lab result is surprising, use the debugging checklist
-from the walkthrough chapter before changing code.
+After running these labs, return to the walkthrough chapter and re-read the
+modules. The source is easier to follow after seeing observable behavior. If a
+result is surprising, use the debugging checklist from the walkthrough chapter
+before changing code.

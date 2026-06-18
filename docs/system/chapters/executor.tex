@@ -2,13 +2,10 @@
 
 \section{Role}
 
-The executor is a minimal single-threaded async kernel. It owns pinned futures
-inside tasks, maintains a ready queue, coalesces repeated wakes, and drives a
-root future through \texttt{run\_until} while also polling spawned tasks.
-
-The executor deliberately avoids Tokio or another third-party runtime. That
-keeps the interesting internals visible: wakers, task queues, timers, readiness
-registration, cancellation, and completion dispatch all live in this code base.
+The executor is a minimal single-threaded async kernel. It deliberately avoids
+Tokio or another third-party runtime to keep the internals visible: wakers,
+task queues, timers, readiness registration, cancellation, and completion
+dispatch all live in this code base.
 
 \section{Why a custom executor}
 
@@ -18,11 +15,10 @@ computation; it is also part of a placement decision. The executor must be able
 to say that this task belongs to this shard, this scheduling group, this ready
 queue, and this local reactor state.
 
-A third-party runtime would solve many engineering problems, but it would also
-move the most interesting questions behind someone else's scheduler. Here the
-small executor is the laboratory. It makes it possible to inspect how a waker
-requeues one task, how a dropped timeout removes timer state, how a TCP future
-records fd interest, and how a completion future keeps buffers alive.
+A third-party runtime would solve many engineering problems but would hide the
+scheduler internals. The small executor makes it possible to inspect how a
+waker requeues a task, how a dropped timeout removes timer state, how a TCP
+future records fd interest, and how a completion future keeps buffers alive.
 
 \section{Responsibilities}
 
@@ -50,7 +46,7 @@ A spawned future is stored inside a task. The task has a stable executor-local
 \texttt{TaskId}, an optional name, a scheduling group id, and internal state
 describing whether it is queued, polling, waiting, completed, or cancelled.
 
-The lifecycle is intentionally explicit:
+The lifecycle is explicit:
 
 \begin{lstlisting}[language={},caption={Simplified task lifecycle}]
 spawn
@@ -63,56 +59,51 @@ spawn
   -> queue Task again
 \end{lstlisting}
 
-A repeated wake does not create repeated queue entries for the same task. The
-task records that it is already queued, so repeated wakeups coalesce. This is a
-small but important executor property: a chatty future should not multiply
-itself in the ready queue.
+A repeated wake does not create repeated queue entries. The task records that
+it is already queued, so repeated wakeups coalesce. A chatty future does not
+multiply itself in the ready queue.
 
 Cancellation is normal future dropping. Aborting a join handle or dropping an
-executor eventually drops the owned future. Timer and readiness futures must
-therefore clean up their registrations in \texttt{Drop}; otherwise the reactor
-would keep stale interests for tasks that no longer exist.
+executor drops the owned future. Timer and readiness futures must clean up
+their registrations in \texttt{Drop}; otherwise the reactor keeps stale
+interests for nonexistent tasks.
 
 \begin{notabene}[Why cancellation is treated as ordinary]
-Rust futures are cancelled by being dropped. The runtime cannot rely on a
-separate cancellation callback running later. Cleanup must therefore be owned by
-the future, task, join handle, or dispatcher state that is being dropped. This
-is why many tests exercise timeout, abort, and dropped-future paths rather than
-only successful completion.
+Rust futures are cancelled by being dropped. Cleanup must be owned by the
+future, task, join handle, or dispatcher being dropped. This is why tests
+exercise timeout, abort, and dropped-future paths.
 \end{notabene}
 
 \section{Wakers and the ready queue}
 
 The custom waker does one job: make the task runnable again on the same
-executor. It does not move the task to another shard, does not poll the task
-directly, and does not borrow application state. It marks the task queued and
-hands it back to the scheduler.
+executor. It does not move the task to another shard, poll it directly, or
+borrow application state. It marks the task queued and hands it to the
+scheduler.
 
-The executor loop then decides when to poll ready work. It does so in batches
-bounded by \texttt{READY\_POLL\_BUDGET}. That budget is a fairness valve. A
-self-waking task can keep itself ready, but it cannot prevent the executor from
-checking timers, readiness, and completions forever.
+The executor loop then decides when to poll ready work, in batches bounded by
+\texttt{READY\_POLL\_BUDGET}. That budget is a fairness valve. A self-waking
+task can keep itself ready but cannot prevent the executor from checking timers,
+readiness, and completions.
 
-The ready queue is intentionally executor-local. Cross-thread wakeups may need
-to notify an executor that work became ready, but the task itself is still
-polled by the executor that owns it. This keeps local task state, scheduling
-group accounting, and reactor registrations aligned.
+The ready queue is executor-local. Cross-thread wakeups may notify an executor
+that work became ready, but the task is still polled by its owning executor.
+This keeps local task state, scheduling group accounting, and reactor
+registrations aligned.
 
 \section{Scheduling groups}
 
-Scheduling groups are the first resource-class mechanism in the executor. Each
-group owns a ready queue and has a relative share count. Ordinary spawn calls
-use the default group. Explicit group APIs let code classify work such as
-foreground request handling and background maintenance.
+Scheduling groups are the first resource-class mechanism. Each group owns a
+ready queue and has a relative share count. Ordinary spawn calls use the
+default group. Explicit group APIs classify work such as foreground request
+handling and background maintenance.
 
-The reason to add groups before more advanced load balancing is that resource
-classification is a local scheduling problem. A shard can decide how to divide
-its own polling time among foreground and background tasks without moving
-application state to another shard. That makes scheduling groups a natural fit
-for the shared-nothing model.
+Resource classification is a local scheduling problem. A shard can divide its
+polling time among foreground and background tasks without moving application
+state to another shard. That makes scheduling groups a natural fit for the
+shared-nothing model.
 
-The selection rule is deliberately simple. The scheduler chooses a non-empty
-group with the lowest weighted virtual runtime, pops one task from that
+The selection rule is simple. The scheduler chooses a non-empty group with the lowest weighted virtual runtime, pops one task from that
 group's FIFO queue, polls it, and charges the group for the observed wall-clock
 poll duration. The charge is scaled by the group's shares.
 
@@ -142,10 +133,10 @@ requests cooperative stop and aborts still-owned children. Calling
 \texttt{shutdown} asks children to stop and waits for them. Calling
 \texttt{shutdown\_timeout} bounds that wait and aborts uncooperative children.
 
-Scopes can also spawn children into scheduling groups. This matters when a
-server accepts work that should be both lifetime-scoped and resource-classified.
-The scope does not implement scheduling itself; it delegates group validation
-and task creation to the underlying \texttt{Spawner}.
+Scopes can spawn children into scheduling groups. This matters when a server
+accepts work that should be both lifetime-scoped and resource-classified. The
+scope does not implement scheduling; it delegates group validation and task
+creation to the underlying \texttt{Spawner}.
 
 \section{Wait ordering}
 
@@ -159,10 +150,10 @@ next timer deadline. When the ring descriptor becomes readable, the dispatcher
 harvests completions and wakes the registered task wakers.
 
 This gives the executor one idle wait shape instead of a separate
-\texttt{io\_uring}-first wait path. The important semantic point is not that
-\texttt{io\_uring} has become readiness I/O; it has not. Completion ownership
-and buffer lifetime are still handled by the dispatcher. The reactor only tells
-the executor that completion queue progress is available.
+\texttt{io\_uring}-first wait path. \texttt{io\_uring} has not become readiness
+I/O; completion ownership and buffer lifetime are still handled by the
+dispatcher. The reactor only tells the executor that completion queue progress
+is available.
 
 \section{Observability}
 

@@ -3,11 +3,11 @@
 \section{Purpose}
 
 This chapter gives concrete source-reading paths. Each walkthrough starts from
-a visible API or example and follows the mechanism down through the runtime.
+a visible API or example and follows the mechanism through the runtime.
 
 \begin{notabene}[How to use these walkthroughs]
-Keep the source tree open while reading. The paths are intentionally explicit.
-Read the public function first, then follow the listed modules in order.
+Keep the source tree open while reading. Read the public function first, then
+follow the listed modules in order.
 \end{notabene}
 
 \section{Walkthrough: spawning one task}
@@ -24,7 +24,7 @@ src/executor/scheduler.rs
 src/executor/task_set.rs
 \end{lstlisting}
 
-The public surface is \texttt{executor\_and\_spawner}. It returns one executor
+The public API is \texttt{executor\_and\_spawner}. It returns one executor
 and one spawner. The spawner creates tasks; the executor polls them.
 
 The useful questions to ask while reading are:
@@ -38,9 +38,9 @@ The useful questions to ask while reading are:
     \item What happens if the executor is dropped before the task completes?
 \end{enumerate}
 
-The mechanism is deliberately local. A task spawned by a \texttt{Spawner} is
-owned by that spawner's executor. Its waker requeues it there. Nothing in this
-path migrates the task to another thread.
+The mechanism is local. A task spawned by a \texttt{Spawner} is owned by that
+spawner's executor. Its waker requeues it there. Nothing in this path migrates
+the task to another thread.
 
 \section{Walkthrough: sleeping and timers}
 
@@ -60,10 +60,9 @@ the deadline, the future stores the task waker and returns
 queues. On each loop iteration the executor checks expired timers and wakes the
 registered tasks.
 
-\texttt{timeout} is useful for learning because it demonstrates cancellation by
-drop. If the deadline wins, the inner future is dropped. Any timer or readiness
-registration owned by that future must clean itself up. This is why the runtime
-has tests for drop behavior rather than only success paths.
+\texttt{timeout} demonstrates cancellation by drop. If the deadline wins, the
+inner future is dropped. Any timer or readiness registration owned by that
+future must clean itself up.
 
 \section{Walkthrough: readiness-driven TCP}
 
@@ -78,20 +77,19 @@ src/executor/io_interest.rs
 src/os/reactor.rs
 \end{lstlisting}
 
-The TCP helper shows the application shape: accept a connection, spawn a
-handler, wait for handlers, and propagate errors. The lower layers show the
-runtime shape: try a non-blocking operation, register interest on
-\texttt{WouldBlock}, sleep in the OS reactor, and wake the task when readiness
-is reported.
+The TCP helper shows the application shape: accept, spawn a handler, wait for
+handlers, propagate errors. The lower layers show the runtime shape: try a
+non-blocking operation, register interest on \texttt{WouldBlock}, sleep in the
+OS reactor, wake the task on readiness.
 
 When reading \filepath{src/executor/tcp.rs}, notice that the accept loop and
-the handler tasks are distinct. Grouped TCP helpers use this distinction:
-the accept loop stays in the caller's current task, while accepted handler
-tasks are spawned into an explicit scheduling group.
+handler tasks are distinct. Grouped TCP helpers use this: the accept loop stays
+in the caller's task while accepted handler tasks are spawned into a scheduling
+group.
 
 \section{Walkthrough: scheduling groups}
 
-The fastest way to see scheduling groups is to run:
+The fastest way to see scheduling groups:
 
 \begin{lstlisting}[language=bash,caption={Scheduling group examples}]
 cargo run --example scheduling_group_demo -- 1
@@ -115,7 +113,7 @@ before creating a task in that group. \texttt{task\_set.rs} owns the queues and
 weighted virtual runtime accounting. \texttt{snapshot.rs} resolves group names
 into task snapshots for observability.
 
-On the sharded runtime, the interesting extra step is runtime identity. A
+On the sharded runtime, the extra step is runtime identity. A
 \texttt{ShardedSchedulingGroup} is a bundle of executor-local groups, one per
 shard. It must not be accepted by a different runtime even if names and ids
 look similar.
@@ -135,7 +133,7 @@ src/executor/spawner.rs
 A cross-shard submit is not a function call into borrowed remote state. It is
 owned work sent to another executor shard. The submitted future is polled on
 the target shard. Its owned output completes a join handle. The original task
-wakes and resumes on its original shard.
+wakes on its original shard.
 
 While reading the submitter APIs, look for the \texttt{Send + 'static}
 boundaries that mark where work can cross threads.
@@ -152,12 +150,11 @@ src/runtime.rs
 
 \texttt{ShardLocal<T>} is the clearest example of the shared-nothing idea in
 the async runtime. Each shard owns one \texttt{T}. Access is routed to the
-owning shard. The closure receives \texttt{\&mut T} synchronously and returns
-an owned result.
+owning shard. The closure receives \texttt{\&mut T} and returns an owned result.
 
-The important rule is negative: a reference to \texttt{T} must not become part
-of a future that later awaits. The API design enforces this by giving local
-access through synchronous closures rather than async callbacks.
+The key rule is negative: a reference to \texttt{T} must not become part of a
+future that later awaits. The API enforces this through synchronous closures
+rather than async callbacks.
 
 \section{Walkthrough: \texttt{io\_uring} lifecycle}
 
@@ -180,11 +177,11 @@ src/executor/tests.rs
 The key distinction is ownership. A readiness future borrows a descriptor and
 retries ordinary system calls. An \texttt{io\_uring} future submits owned
 buffers to the kernel and must keep them alive until completion or safe
-abandonment cleanup.
+abandonment.
 
-\filepath{os_uring_abandon.rs} is especially useful because success paths can
-hide lifetime complexity. Abandonment forces the dispatcher to keep enough
-state to clean up operations whose futures no longer exist.
+\filepath{os_uring_abandon.rs} is useful because success paths can hide
+lifetime complexity. Abandonment forces the dispatcher to keep enough state to
+clean up operations whose futures no longer exist.
 
 \section{Walkthrough: reading observability output}
 
@@ -209,8 +206,8 @@ The columns are a compact runtime story:
 \end{description}
 
 The output is not tracing. There is no event stream. It is repeated sampling of
-owned snapshots. This is less powerful than a full console, but it is simple,
-portable, and keeps runtime internals inspectable.
+owned snapshots---less powerful than a full console, but simple, portable, and
+keeps runtime internals inspectable.
 
 \section{Walkthrough: sharded index build}
 
@@ -252,8 +249,7 @@ The example demonstrates several runtime mechanisms working together:
           sharded runtime.
 \end{enumerate}
 
-The interesting runtime question is \emph{where} the work runs. Partition
-tasks run on assigned shards. Merge tasks are submitted to specific shards
+The runtime question is \emph{where} work runs. Partition tasks run on assigned shards. Merge tasks are submitted to specific shards
 (the left input run's shard). Progress reads happen through
 \texttt{ShardLocal::map\_all}, which submits synchronous closures to every
 shard and collects owned results. At no point does a shard borrow another
@@ -324,5 +320,5 @@ When something behaves unexpectedly, ask these questions in order:
           child is still alive?
 \end{enumerate}
 
-These questions match the runtime's own invariants. They are usually more
+These questions match the runtime's invariants. They are usually more
 productive than starting with performance guesses.

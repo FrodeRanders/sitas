@@ -17,13 +17,11 @@ support.
 
 \section{How to read this project}
 
-The important idea is that application code should see typed, owned boundaries. 
-A caller asks a service or a shard to do work. The runtime decides which shard 
-owns that work. The owning shard mutates its local state and returns an owned 
-reply. This is the same mental shape as a service call, but the implementation 
-deliberately avoids hiding service state behind a global mutex.
+Application code sees typed, owned boundaries. A caller asks a shard to do 
+work. The owning shard mutates its local state and returns an owned reply. The 
+implementation avoids hiding service state behind a global mutex.
 
-The interesting question is how the runtime keeps that model honest:
+The runtime keeps that model honest:
 
 \begin{enumerate}
     \item futures are owned by executor tasks;
@@ -48,11 +46,10 @@ important parts of this code base.
 
 \section{Why the project has this shape}
 
-The runtime is intentionally built from small visible pieces because the
-project is as much about explanation as about capability. A mature runtime can
-hide task allocation, reactor registration, cross-thread wakeups, cancellation,
-and kernel ownership behind polished APIs. That is useful in production, but it
-is not ideal when the goal is to understand the machinery.
+The runtime is built from small visible pieces. A mature runtime hides task
+allocation, reactor registration, cross-thread wakeups, cancellation, and
+kernel ownership behind polished APIs. That works in production but obscures
+the machinery.
 
 \texttt{sitas} therefore accepts some explicitness that a general-purpose
 runtime might smooth over:
@@ -69,8 +66,8 @@ runtime might smooth over:
         different contracts with the operating system.
 \end{description}
 
-This is the main design tradeoff in the code base. The project prefers APIs
-that teach the boundary they cross over APIs that hide the boundary too early.
+This is the main design tradeoff. The project prefers APIs that teach the 
+boundary they cross over APIs that hide it.
 
 \section{Scope of this manual}
 
@@ -91,7 +88,7 @@ It focuses on:
 
 \begin{notabene}
 The project is still deliberately experimental. APIs are allowed to move when
-that exposes cleaner runtime internals or a better teaching surface.
+that exposes cleaner runtime internals or a better teaching experience.
 \end{notabene}
 
 \section{What this project is not}
@@ -111,5 +108,5 @@ the mechanisms small enough that they can be inspected:
 
 This makes the project useful as a learning resource. It has enough machinery
 to demonstrate timers, wakers, readiness, \texttt{io\_uring}, shard-local
-values, scheduling groups, and CPU placement, while still leaving those
-mechanisms visible in ordinary Rust modules.
+values, scheduling groups, and CPU placement while keeping those mechanisms
+visible in ordinary Rust modules.

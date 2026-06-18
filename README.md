@@ -1,7 +1,7 @@
 # Sitas
 
 `Sitas` is a pure-Rust (edition 2024), zero-dependency exploration of Seastar-like shard-per-core architecture 
-built on Rust ownership semantics. `Sitas explores what shared-nothing looks like when designed around type
+built on Rust ownership semantics. It explores what shared-nothing looks like when designed around type
 boundaries, explicit message passing, and isolated unsafe.
 
 ## Overview
@@ -32,7 +32,7 @@ A sharded executor:
 - CPU affinity on Linux (sched_setaffinity), container cpuset-aware
 - ShardLocal<T> — per-shard owned values with no mutex, closure-based access, stoppable workers
   
-Eperimental io_uring support (on Linux):
+Eperimental io_uring (Linux):
 - Full ring, dispatcher lifecycle, tracked operations, abandoned buffer safety, completion counting
 - Integrated for file I/O futures (read_at_uring, write_all_at_uring)
 - Not yet unified with readiness/timers into a production I/O engine
@@ -40,21 +40,20 @@ Eperimental io_uring support (on Linux):
 ## Inspiration
 
 `Sitas` is inspired by Seastar's shard-per-core, shared-nothing model, but
-`Sitas` is intentionally much smaller and not an attempt to clone Seastar.
+is smaller and does not attempt to clone Seastar.
 
 ## First Milestone
 
-The current version implements a sharded key-value store as an application
-on top of the runtime, using only the Rust standard library.
+The current version implements a sharded key-value store on top of the runtime
+using only the Rust standard library.
 
-Going into more detail, `Sitas` is or has:
+`Sitas` has:
 
 - a small reusable std-only runtime layer
-- an executor experiment with custom wakers, join handles, awaitable
-  shard replies, cancellable spawned tasks, timers, timeouts, OS-backed
-  sleeping, racing futures, and read/write-readiness futures on this branch
-- direct root-future driving without requiring the root future to be `Send` or
-  `'static`
+- a custom executor with wakers, join handles, awaitable shard replies,
+  cancellable tasks, timers, timeouts, OS-backed sleeping, racing futures,
+  and read/write-readiness futures
+- root-future driving without requiring `Send` or `'static`
 - budgeted ready-queue polling so timers and I/O can progress under repeated
   task wakeups
 - task scopes that group child tasks under one cooperative stop signal and
@@ -67,8 +66,8 @@ Going into more detail, `Sitas` is or has:
   non-blocking Unix descriptors
 - a bounded async TCP server helper that spawns and joins one handler per
   accepted connection
-- a first shard-per-thread async runtime that starts one executor/reactor per
-  shard thread and places tasks explicitly by `ShardId`
+- a shard-per-thread async runtime with one executor/reactor per shard thread
+  and explicit `ShardId` placement
 - dependency-free executor snapshots for named tasks, task states, poll counts,
   queue depth, timers, and I/O interests across shards
 - weak observer handles for monitoring shard executors without keeping them
@@ -105,9 +104,9 @@ Going into more detail, `Sitas` is or has:
   connection handlers, stops accepting when a handler fails, and can bound
   handler shutdown time
 - timeout variants for the async Unix I/O helpers
-- an early Unix runtime backend experiment using direct OS FFI for reactor
-  wakes and descriptor readiness, including Linux `epoll` and a portable Unix
-  `poll` fallback
+- an early Unix runtime backend using direct OS FFI for reactor wakes and
+  descriptor readiness, including Linux `epoll` and a portable Unix `poll`
+  fallback
 - one OS thread per shard
 - one mailbox per shard
 - bounded shard mailboxes
@@ -139,8 +138,8 @@ Only the owning shard may mutate its service state.
 All cross-shard interaction happens through typed messages.
 ```
 
-No mutex protects the key-value service state because that state is never
-shared. Values returned across shard boundaries are owned values.
+No mutex protects the key-value service state because it is never shared.
+Values returned across shard boundaries are owned values.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current request flow
 and shutdown model.
@@ -164,12 +163,12 @@ OS-specific runtime backends.
 
 ## Platform Notes
 
-The std-only baseline should work on both macOS and Linux because it only uses
+The std-only baseline works on both macOS and Linux because it uses only
 portable Rust standard-library concurrency primitives. The `non-std-runtime`
 branch keeps macOS and Linux as active targets for direct Unix runtime work.
 
-Linux is expected to become the primary performance and production target for
-later low-level runtime work, especially for CPU affinity and `io_uring`.
+Linux is the primary performance and production target for later low-level
+runtime work, especially CPU affinity and `io_uring`.
 
 ## Example
 
@@ -487,7 +486,7 @@ tools/linux-docker.sh
 
 By default this proves the Linux build, formatting, clippy lints, tests, docs,
 and examples, but `io_uring` may be skipped if the container runtime blocks
-`io_uring_setup`. To require real `io_uring` coverage, run with Docker seccomp
+`io_uring_setup`. To require `io_uring` coverage, run with Docker seccomp
 disabled:
 
 ```sh

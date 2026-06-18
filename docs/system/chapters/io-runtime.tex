@@ -2,26 +2,23 @@
 
 \section{Readiness}
 
-The readiness path is intentionally small. A future registers interest in a
-file descriptor, the scheduler records the waker, the Unix reactor sleeps using
-Linux \texttt{epoll}, macOS/iOS \texttt{kqueue}, or fallback \texttt{poll} plus
-a wake pipe, and readiness wakes the interested task.
+The readiness path is small. A future registers interest in a file descriptor,
+the scheduler records the waker, the Unix reactor sleeps using Linux
+\texttt{epoll}, macOS/iOS \texttt{kqueue}, or fallback \texttt{poll} plus a
+wake pipe, and readiness wakes the interested task.
 
 This path is readiness-based, not completion-based. It is used by the current
 TCP helpers and remains separate from the experimental \texttt{io\_uring}
 completion path.
 
 Readiness is the first I/O layer because it matches Unix non-blocking sockets
-well and it is portable across the platforms used for development. It also
-keeps ownership simple: the stream or listener remains owned by user code, and
-the runtime only remembers which task should be woken when the descriptor may
-make progress.
+and is portable. Ownership stays simple: user code owns the stream or listener;
+the runtime only tracks which task to wake when the descriptor may progress.
 
-Readiness means that the operating system says an operation is likely to make
-progress. It does not mean the runtime has the bytes. A readable TCP stream
-may still return fewer bytes than requested. A writable stream may accept only
-part of a buffer. The future must attempt the operation, handle
-\texttt{WouldBlock}, and register interest again when necessary.
+Readiness means the OS reports an operation is likely to make progress, not
+that bytes are available. A readable stream may return fewer bytes than
+requested. A writable stream may accept only part of a buffer. The future must
+attempt the operation, handle \texttt{WouldBlock}, and re-register interest.
 
 \begin{lstlisting}[language={},caption={Readiness future shape}]
 poll future:
@@ -37,18 +34,17 @@ reactor wait:
     scheduler wakes interested task
 \end{lstlisting}
 
-This is why readiness futures do not own file descriptors. The caller owns the
-stream or listener. The future only borrows it for the duration of the async
-operation and registers interest in the raw descriptor while pending.
+Readiness futures do not own file descriptors. The caller owns the stream or
+listener; the future borrows it for the async operation and registers interest
+while pending.
 
-That borrowing model is useful for TCP. A connection handler can own a stream
-and call several helper futures against it in sequence. The reactor does not
-become the owner of the connection; it is only the waiting mechanism.
+A connection handler owns a stream and calls helpers against it in sequence.
+The reactor is the waiting mechanism, not the connection owner.
 
 \section{TCP helpers}
 
-The TCP helpers are intentionally written on top of readiness futures rather
-than hiding a separate runtime. They demonstrate the normal async server shape:
+The TCP helpers are built on top of readiness futures rather than hiding a
+separate runtime. They demonstrate the normal async server shape:
 
 \begin{enumerate}
     \item put the listener or stream in non-blocking mode;
@@ -59,17 +55,14 @@ than hiding a separate runtime. They demonstrate the normal async server shape:
 \end{enumerate}
 
 Grouped TCP helper variants classify accepted handler tasks into scheduling
-groups. The accept loop remains in the caller's task; only the per-connection
-handler work is moved into the requested group. This is useful for separating
-foreground request handling from background maintenance or low-priority
-connections.
+groups. The accept loop remains in the caller's task; only per-connection
+handler work enters the requested group. This separates foreground request
+handling from background maintenance or low-priority connections.
 
-This split is important because accepting connections and serving connections
-have different lifecycle and scheduling needs. The accept loop is usually one
-long-lived task. Handlers are many shorter-lived tasks whose resource class may
-depend on the service being provided. Keeping those roles separate makes
-shutdown, observability, and scheduling group assignment easier to reason
-about.
+Accepting connections and serving connections have different lifecycle and
+scheduling needs. The accept loop is one long-lived task. Handlers are many
+shorter-lived tasks. Keeping those roles separate makes shutdown,
+observability, and scheduling group assignment straightforward.
 
 \begin{notabene}[Readiness lesson]
 Readiness is a notification that retrying may be useful. Completion is a
@@ -86,8 +79,8 @@ narrow executor integration for owned-buffer \texttt{read\_at},
 \texttt{io\_uring} is included because it exercises a harder runtime problem
 than readiness. The kernel can own an operation after the Rust future that
 submitted it has been dropped. That forces the runtime to model operation ids,
-owned buffers, late completions, and abandonment. Those are exactly the kinds
-of internals this project wants to make visible.
+owned buffers, late completions, and abandonment---exactly the internals this
+project wants to make visible.
 
 Each Linux executor run loop installs a thread-local dispatcher when the host
 allows ring setup. Executor-backed \texttt{io\_uring} futures store operation
@@ -95,11 +88,11 @@ ids and owned buffers. When polled on a shard, they queue an operation against
 the thread-local dispatcher and register their task waker.
 
 When the executor becomes idle, it submits pending ring entries and polls the
-ring descriptor through the same reactor wait that handles fd readiness and
-timer deadlines. The ring descriptor readiness is only a notification that
-completion queue entries may be harvested. The completed operation still flows
-through the dispatcher, which matches operation ids, returns owned buffers, and
-wakes the waiting futures.
+ring descriptor through the same reactor wait used for fd readiness and timer
+deadlines. Ring descriptor readiness is only a notification that completion
+queue entries may be harvested. The completed operation still flows through the
+dispatcher, which matches operation ids, returns owned buffers, and wakes
+waiting futures.
 
 The dispatcher tracks:
 
@@ -121,7 +114,7 @@ readiness, the future borrows a stream and retries ordinary system calls. With
 \texttt{io\_uring}, the kernel may hold a pointer to an owned buffer until the
 completion arrives.
 
-The runtime therefore tracks operation state explicitly:
+The runtime tracks operation state explicitly:
 
 \begin{lstlisting}[language={},caption={Simplified completion lifecycle}]
 future first poll
@@ -140,17 +133,17 @@ future next poll
     return Ready(result, buffer)
 \end{lstlisting}
 
-If the future is dropped before completion, the operation may still exist in
-the kernel. The dispatcher marks it abandoned and defers buffer cleanup until a
-completion or safe discard point is observed. This is one of the most important
-differences between readiness and completion: cancellation is not just removing
-a waker; it also involves kernel-owned in-flight work.
+If the future is dropped before completion, the operation may still be in the
+kernel. The dispatcher marks it abandoned and defers buffer cleanup until a
+completion or safe discard point. This is one of the most important differences
+between readiness and completion: cancellation involves kernel-owned in-flight
+work, not just waker removal.
 
-The dispatcher is intentionally a lifecycle object, not only a syscall wrapper.
-A thin wrapper around \texttt{io\_uring\_enter} would not be enough for async
-Rust integration. The runtime needs somewhere to hold buffers, match
-completions back to futures, wake tasks, and account for futures that vanished
-before the kernel answered.
+The dispatcher is a lifecycle object, not just a syscall wrapper. A thin
+wrapper around \texttt{io\_uring\_enter} would not suffice for async Rust
+integration. The runtime needs somewhere to hold buffers, match completions to
+futures, wake tasks, and account for futures that vanished before the kernel
+answered.
 
 \section{Current limitation}
 
