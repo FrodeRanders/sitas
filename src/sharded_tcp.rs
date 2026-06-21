@@ -12,6 +12,8 @@
 //! This module uses direct Unix FFI following the same pattern as the `os`
 //! module to keep the project dependency-free.
 
+mod socket_options;
+
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::fmt;
@@ -47,28 +49,6 @@ const SOCK_CLOEXEC: c_int = 0o2000000;
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 const SOCK_CLOEXEC: c_int = 0;
-#[allow(dead_code)]
-#[cfg(target_os = "linux")]
-const SOL_SOCKET: c_int = 1;
-#[cfg(not(target_os = "linux"))]
-const SOL_SOCKET: c_int = 0xffff;
-#[allow(dead_code)]
-#[cfg(target_os = "linux")]
-const SO_REUSEADDR: c_int = 2;
-#[cfg(not(target_os = "linux"))]
-const SO_REUSEADDR: c_int = 0x0004;
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-const SO_REUSEPORT: c_int = 15;
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-const SO_REUSEPORT: c_int = 0x0200;
-#[cfg(target_os = "linux")]
-const SO_INCOMING_CPU: c_int = 49;
-#[cfg(target_os = "linux")]
-const SOL_TCP: c_int = 6;
-#[cfg(target_os = "linux")]
-const TCP_ULP: c_int = 31;
 #[allow(dead_code)]
 const F_GETFL: c_int = 3;
 #[allow(dead_code)]
@@ -151,13 +131,6 @@ unsafe extern "C" {
     fn close(fd: c_int) -> c_int;
     fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
     fn listen(fd: c_int, backlog: c_int) -> c_int;
-    fn setsockopt(
-        fd: c_int,
-        level: c_int,
-        option_name: c_int,
-        option_value: *const c_int,
-        option_len: SockLen,
-    ) -> c_int;
     fn socket(domain: c_int, socket_type: c_int, protocol: c_int) -> c_int;
 }
 
@@ -182,7 +155,7 @@ impl ShardedTcpConnection {
     /// key material boundary to the connection handler.
     #[cfg(target_os = "linux")]
     pub fn enable_kernel_tls_ulp(&self) -> io::Result<()> {
-        enable_kernel_tls_ulp(self.stream.as_raw_fd())
+        socket_options::enable_kernel_tls_ulp(self.stream.as_raw_fd())
     }
 
     /// Returns unsupported on non-Linux platforms.
@@ -859,42 +832,17 @@ fn create_listener(
         }
     }
 
-    // SAFETY: `setsockopt` on an open socket fd with well-known SOL_SOCKET
-    // level, SO_REUSEADDR option, and a pointer to a valid c_int value.
-    let optval: c_int = 1;
-    let reuse_addr_result = unsafe {
-        setsockopt(
-            fd,
-            SOL_SOCKET,
-            SO_REUSEADDR,
-            &optval,
-            std::mem::size_of::<c_int>() as SockLen,
-        )
-    };
-    if reuse_addr_result < 0 {
+    if let Err(error) = socket_options::set_reuse_addr(fd) {
         close_owned_fd(fd);
-        return Err(io::Error::last_os_error());
+        return Err(error);
     }
 
-    if reuse_port {
-        // SAFETY: `setsockopt` on an open socket fd with SOL_SOCKET level
-        // and SO_REUSEPORT option. The pointer and size are valid.
-        let reuse_port_result = unsafe {
-            setsockopt(
-                fd,
-                SOL_SOCKET,
-                SO_REUSEPORT,
-                &optval,
-                std::mem::size_of::<c_int>() as SockLen,
-            )
-        };
-        if reuse_port_result < 0 {
-            close_owned_fd(fd);
-            return Err(io::Error::last_os_error());
-        }
+    if reuse_port && let Err(error) = socket_options::set_reuse_port(fd) {
+        close_owned_fd(fd);
+        return Err(error);
     }
 
-    if let Err(error) = set_incoming_cpu(fd, incoming_cpu) {
+    if let Err(error) = socket_options::set_incoming_cpu(fd, incoming_cpu) {
         close_owned_fd(fd);
         return Err(error);
     }
@@ -922,63 +870,6 @@ fn create_listener(
     // SAFETY: `fd` is a valid, bound, listening socket descriptor. Ownership
     // transfers to the `TcpListener`, which will close it on drop.
     Ok(unsafe { TcpListener::from_raw_fd(fd) })
-}
-
-#[cfg(target_os = "linux")]
-fn set_incoming_cpu(fd: c_int, incoming_cpu: Option<CpuId>) -> io::Result<()> {
-    let Some(cpu) = incoming_cpu else {
-        return Ok(());
-    };
-    let cpu: c_int = cpu.0.try_into().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "SO_INCOMING_CPU value does not fit platform c_int",
-        )
-    })?;
-
-    // SAFETY: `fd` is an open socket. SO_INCOMING_CPU expects a c_int CPU id;
-    // the pointer and length describe the local `cpu` value for this call.
-    let result = unsafe {
-        setsockopt(
-            fd,
-            SOL_SOCKET,
-            SO_INCOMING_CPU,
-            &cpu,
-            std::mem::size_of::<c_int>() as SockLen,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn set_incoming_cpu(_fd: c_int, _incoming_cpu: Option<CpuId>) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn enable_kernel_tls_ulp(fd: c_int) -> io::Result<()> {
-    let name = b"tls\0";
-    // SAFETY: `fd` is an open TCP stream descriptor borrowed from TcpStream.
-    // TCP_ULP expects a NUL-terminated protocol name buffer; `name` remains
-    // live for the duration of the call and the kernel copies the value.
-    let result = unsafe {
-        setsockopt(
-            fd,
-            SOL_TCP,
-            TCP_ULP,
-            name.as_ptr().cast::<c_int>(),
-            name.len() as SockLen,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
 }
 
 fn close_owned_fd(fd: c_int) {

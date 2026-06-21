@@ -164,7 +164,8 @@ the same shared-nothing service direction.
     \item[\texttt{sharded\_tcp}] Network-facing sharded TCP server with
         \texttt{SO\_REUSEPORT} on Linux, optional Linux
         \texttt{SO\_INCOMING\_CPU} listener placement, an explicit kTLS ULP
-        hook for accepted connections, and single-accept distribution on other
+        hook for accepted connections, a private socket-options helper for
+        \texttt{setsockopt} details, and single-accept distribution on other
         platforms.
     \item[\texttt{metrics}] Thread-safe atomic-counter metrics collector with
         owned \texttt{MetricsSnapshot} for observability.
