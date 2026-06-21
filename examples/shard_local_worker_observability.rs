@@ -2,10 +2,12 @@
 //!
 //! The names and snapshot counters show why observability is owned data: a
 //! monitoring thread can inspect progress without borrowing runtime internals.
+mod support;
 use sitas::{ShardLocal, ShardedExecutor, TaskSnapshot, TaskStatus, TaskWait, executor::sleep};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("shard_local_worker_observability");
     let runtime = ShardedExecutor::start(2)?;
     let observer = runtime.observer();
     let submitter = runtime.submitter();

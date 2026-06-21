@@ -2,11 +2,13 @@
 //!
 //! The slower branch is dropped when the faster branch completes, which is the
 //! cancellation behavior higher-level timeout helpers build on.
+mod support;
 use std::time::Duration;
 
 use sitas::executor::{RaceOutput, block_on, race, sleep};
 
 fn main() {
+    support::announce("executor_race");
     let winner = block_on(async {
         race(
             async {

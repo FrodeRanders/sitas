@@ -2,9 +2,11 @@
 //!
 //! Submit handles decouple enqueueing from waiting, which is the std-only
 //! precursor to awaiting replies on the custom executor.
+mod support;
 use sitas::ShardedKv;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("submit_kv");
     let kv = ShardedKv::start(4)?;
 
     let alpha = kv.submit_put("alpha", "one")?;

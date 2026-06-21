@@ -2,11 +2,13 @@
 //!
 //! The service state is still shard-owned; concurrency here means many callers
 //! enqueue typed commands, not that the map itself is shared behind a mutex.
+mod support;
 use std::thread;
 
 use sitas::ShardedKv;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("concurrent_kv");
     let kv = ShardedKv::start(4)?;
     let caller_count = 8;
     let keys_per_caller = 100;

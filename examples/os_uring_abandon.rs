@@ -2,6 +2,7 @@
 //!
 //! The dispatcher must keep ownership bookkeeping for abandoned operations so
 //! later completions can be drained without waking a task that no longer exists.
+mod support;
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
     use sitas::os::{
@@ -14,6 +15,7 @@ fn main() -> std::io::Result<()> {
     use std::task::Context;
     use std::time::Duration;
 
+    support::announce("os_uring_abandon");
     let Some(ring) = available_io_uring(8)? else {
         report_io_uring_unavailable();
         return Ok(());

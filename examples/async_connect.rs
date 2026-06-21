@@ -2,12 +2,14 @@
 //!
 //! The server stays on a plain blocking thread so the example isolates the
 //! async client-side connect/read/write path without needing a second executor.
+mod support;
 use sitas::executor::{block_on, connect_async, read_exact_async, write_all_async};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_connect");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
 

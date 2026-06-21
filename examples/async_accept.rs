@@ -2,6 +2,7 @@
 //!
 //! The listener is made non-blocking because sitas readiness futures expect OS
 //! operations to return `WouldBlock` instead of parking the executor thread.
+mod support;
 use sitas::executor::{accept_async, block_on, read_exact_async};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -9,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_accept");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;

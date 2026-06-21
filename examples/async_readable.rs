@@ -2,6 +2,7 @@
 //!
 //! A helper thread writes later so the executor must register interest and
 //! sleep until the OS reactor wakes it.
+mod support;
 use sitas::executor::{block_on, read_exact_async};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -9,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_readable");
     let (mut reader, mut writer) = UnixStream::pair()?;
     reader.set_nonblocking(true)?;
 

@@ -2,9 +2,11 @@
 //!
 //! The handle is cheap to clone; the underlying values are not cloned and still
 //! remain owned by their respective executor shards.
+mod support;
 use sitas::{ShardId, ShardLocal, ShardedExecutor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("shard_local_handle");
     let runtime = ShardedExecutor::start(4)?;
     let submitter = runtime.submitter();
     let local_counts = ShardLocal::new(submitter.clone(), |_| 0usize);

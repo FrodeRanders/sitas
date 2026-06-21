@@ -2,10 +2,12 @@
 //!
 //! The timeout variant is important for service shutdown because cooperative
 //! stop requests should not be able to hang the caller forever.
+mod support;
 use sitas::{ShardLocal, ShardedExecutor, executor::sleep};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("shard_local_stoppable_workers_timeout");
     let runtime = ShardedExecutor::start(2)?;
     let submitter = runtime.submitter();
     let local_counts = ShardLocal::new(submitter.clone(), |_| 0usize);

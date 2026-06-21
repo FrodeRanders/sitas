@@ -2,11 +2,13 @@
 //!
 //! Most code should go through executor futures; this lower-level example shows
 //! the pipe/poll/epoll wake mechanism that lets another thread unpark waiting.
+mod support;
 use sitas::os::OsReactor;
 use std::thread;
 use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
+    support::announce("os_reactor");
     let reactor = OsReactor::new()?;
     let waker = reactor.waker();
 

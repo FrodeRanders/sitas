@@ -2,6 +2,7 @@
 //!
 //! The small buffer is intentional: it forces `copy_async` to make progress in
 //! chunks, which is the interesting part for executor wakeups.
+mod support;
 use sitas::executor::{block_on, copy_async};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -9,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_copy");
     let (mut source_reader, mut source_writer) = UnixStream::pair()?;
     let (mut sink_reader, mut sink_writer) = UnixStream::pair()?;
     source_reader.set_nonblocking(true)?;

@@ -5,6 +5,7 @@
 //! scheduling groups, so the executor charges actual poll time to each group
 //! and prefers the group with the lowest weighted virtual runtime.
 
+mod support;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,7 @@ use sitas::{ExecutorSnapshot, SchedulingGroupSnapshot};
 const DEFAULT_SECONDS: u64 = 3;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("scheduling_group_demo");
     let duration = std::env::args()
         .nth(1)
         .map(|arg| arg.parse::<u64>())

@@ -2,11 +2,13 @@
 //!
 //! This demonstrates timeout as composition: the inner future is not special,
 //! it is raced against executor timer wakeup.
+mod support;
 use std::time::Duration;
 
 use sitas::executor::{block_on, sleep, timeout};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("executor_timeout");
     let fast = block_on(async {
         timeout(Duration::from_millis(50), async {
             sleep(Duration::from_millis(5)).await;

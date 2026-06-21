@@ -2,11 +2,13 @@
 //!
 //! The task yields in a loop so cancellation can be observed at an executor
 //! polling boundary instead of relying on a blocking sleep.
+mod support;
 use std::time::Duration;
 
 use sitas::executor::{block_on, executor_and_spawner, sleep, yield_now};
 
 fn main() {
+    support::announce("executor_abort");
     let (executor, spawner) = executor_and_spawner();
 
     let worker = spawner

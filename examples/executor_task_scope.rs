@@ -2,11 +2,13 @@
 //!
 //! Scope shutdown gives a structured place to ask children to stop and then
 //! await them, instead of leaving detached work behind.
+mod support;
 use sitas::executor::{TaskScope, executor_and_spawner, sleep};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn main() {
+    support::announce("executor_task_scope");
     let (executor, spawner) = executor_and_spawner();
     let mut scope = TaskScope::new(spawner.clone());
     let events = Arc::new(Mutex::new(Vec::new()));

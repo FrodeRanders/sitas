@@ -2,9 +2,11 @@
 //!
 //! This keeps the focus on the original std-only shard service model: calls
 //! are routed to owning shard threads, and aggregation returns owned values.
+mod support;
 use sitas::{ShardId, ShardedCounter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("basic_counter");
     let counter = ShardedCounter::start(4)?;
 
     counter.add_on_shard(ShardId(0), 5)?;

@@ -2,9 +2,11 @@
 //!
 //! The origin task submits explicit remote futures instead of reaching into
 //! other shards, making cross-shard fan-out visible in the code.
+mod support;
 use sitas::{ShardId, ShardedExecutor, current_executor_shard, join_all_shards};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("sharded_broadcast");
     let runtime = ShardedExecutor::start(4)?;
     let submitter = runtime.submitter();
     let task_submitter = submitter.clone();

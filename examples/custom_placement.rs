@@ -2,6 +2,7 @@
 //!
 //! Placement is explicit in sitas so routing decisions can be reasoned about
 //! independently from the service implementation.
+mod support;
 use sitas::placement::Placement;
 use sitas::{ShardId, ShardedKv, ShardedKvConfig};
 
@@ -18,6 +19,7 @@ impl Placement<str> for FirstBytePlacement {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("custom_placement");
     let kv = ShardedKv::start_with_placement(
         ShardedKvConfig::new(4).with_mailbox_capacity(16),
         FirstBytePlacement,

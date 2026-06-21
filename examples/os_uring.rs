@@ -2,11 +2,13 @@
 //!
 //! This deliberately stays below the executor: it shows the kernel submission
 //! and completion lifecycle before those operations are wrapped as futures.
+mod support;
 #[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
     use sitas::os::{IoUringOperationKind, available_io_uring, report_io_uring_unavailable};
     use std::time::Duration;
 
+    support::announce("os_uring");
     let Some(mut ring) = available_io_uring(8)? else {
         report_io_uring_unavailable();
         return Ok(());

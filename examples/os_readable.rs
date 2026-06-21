@@ -2,6 +2,7 @@
 //!
 //! This sits below the executor layer and shows the raw readiness primitive
 //! that `readable` and the TCP helpers are built on.
+mod support;
 use sitas::os::OsReactor;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -10,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
+    support::announce("os_readable");
     let reactor = OsReactor::new()?;
     let (reader, mut writer) = UnixStream::pair()?;
 

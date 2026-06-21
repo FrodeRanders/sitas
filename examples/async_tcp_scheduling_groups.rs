@@ -4,6 +4,7 @@
 //! handed to a handler task in the selected scheduling group, which lets network
 //! services classify accepted work without changing the listener/accept code.
 
+mod support;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,7 @@ use sitas::executor::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("async_tcp_scheduling_groups");
     let foreground_listener = TcpListener::bind("127.0.0.1:0")?;
     let foreground_address = foreground_listener.local_addr()?;
     let background_listener = TcpListener::bind("127.0.0.1:0")?;

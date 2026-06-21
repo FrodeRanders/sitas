@@ -2,10 +2,12 @@
 //!
 //! This bridges the original shard mailbox service model into async code
 //! without replacing the service with an async runtime.
+mod support;
 use sitas::executor::block_on;
 use sitas::{ShardError, ShardedKv};
 
 fn main() -> Result<(), ShardError> {
+    support::announce("async_kv");
     block_on(async {
         let kv = ShardedKv::start(4)?;
 

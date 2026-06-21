@@ -2,6 +2,7 @@
 //!
 //! The handler intentionally sleeps too long, so the timeout path proves that
 //! uncooperative connection work can be aborted instead of hanging shutdown.
+mod support;
 use sitas::executor::{executor_and_spawner, serve_tcp_until_idle_timeout, sleep};
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
@@ -9,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_tcp_idle_server_timeout");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
 

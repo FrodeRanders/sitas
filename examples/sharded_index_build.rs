@@ -7,6 +7,7 @@
 //! Unlike earlier revisions, this version uses [`ShardLocal`] for per-shard
 //! progress counters instead of a shared `Arc<Mutex<Vec<...>>>`, and uses
 //! [`ShardedExecutor::map_all`] instead of manual handle collection.
+mod support;
 use sitas::{
     CpuPlacement, RunningStatistics, ShardId, ShardLocal, ShardedExecutor, ShardedExecutorConfig,
     available_cpu_ids, current_executor_cpu_placement, current_executor_shard, executor::block_on,
@@ -35,6 +36,7 @@ const INDEX_ENTRY_SIZE: usize = 16;
 const READ_CHUNK_RECORDS: usize = 256;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("sharded_index_build");
     let config = DemoConfig::from_args(env::args())?;
     let overall_start = Instant::now();
 

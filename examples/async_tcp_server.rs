@@ -2,6 +2,7 @@
 //!
 //! A fixed accept count is a simple way to exercise handler spawning while
 //! keeping the example deterministic and self-terminating.
+mod support;
 use sitas::executor::{executor_and_spawner, read_exact_async, serve_tcp_n, write_all_async};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -11,6 +12,7 @@ use std::time::Duration;
 const CLIENT_COUNT: u8 = 3;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_tcp_server");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
 

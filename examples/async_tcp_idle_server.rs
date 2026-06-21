@@ -2,6 +2,7 @@
 //!
 //! The idle timeout is useful for demos and tests: it gives the accept loop a
 //! deterministic stopping condition without an explicit stop token.
+mod support;
 use sitas::executor::{
     executor_and_spawner, read_exact_async, serve_tcp_until_idle, write_all_async,
 };
@@ -13,6 +14,7 @@ use std::time::Duration;
 const CLIENT_COUNT: u8 = 3;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_tcp_idle_server");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
 

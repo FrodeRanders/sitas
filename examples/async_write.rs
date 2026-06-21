@@ -2,11 +2,13 @@
 //!
 //! The read side stays blocking because the lesson is only that executor
 //! write readiness can drive `write_all_async` to completion.
+mod support;
 use sitas::executor::{block_on, write_all_async};
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_write");
     let (mut reader, mut writer) = UnixStream::pair()?;
     writer.set_nonblocking(true)?;
 

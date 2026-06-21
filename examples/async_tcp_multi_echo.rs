@@ -2,6 +2,7 @@
 //!
 //! This is the basic server shape: the accept loop owns the listener, while
 //! each accepted stream moves into independent executor work.
+mod support;
 use sitas::executor::{
     Spawner, accept_async, executor_and_spawner, read_exact_async, write_all_async,
 };
@@ -13,6 +14,7 @@ use std::time::Duration;
 const CLIENT_COUNT: u8 = 3;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_tcp_multi_echo");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;

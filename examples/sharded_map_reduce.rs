@@ -2,9 +2,11 @@
 //!
 //! This is a higher-level fan-out helper over explicit shard submission: each
 //! shard computes locally, then owned outputs are reduced by the caller.
+mod support;
 use sitas::{ShardId, ShardedExecutor, current_executor_shard};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("sharded_map_reduce");
     let runtime = ShardedExecutor::start(4)?;
     let submitter = runtime.submitter();
     let task_submitter = submitter.clone();

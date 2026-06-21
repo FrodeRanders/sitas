@@ -2,9 +2,11 @@
 //!
 //! `ShardLocal` is the core shared-nothing pattern: each shard owns its value,
 //! and callers interact with it by submitting synchronous closures to the owner.
+mod support;
 use sitas::{ShardLocal, ShardedExecutor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("shard_local");
     let runtime = ShardedExecutor::start(4)?;
     let submitter = runtime.submitter();
     let local_counts = ShardLocal::new(submitter.clone(), |shard_id| shard_id.0);

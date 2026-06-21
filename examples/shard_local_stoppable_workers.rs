@@ -2,10 +2,12 @@
 //!
 //! The stop token gives each worker a normal async way to leave its loop before
 //! the owning runtime is stopped.
+mod support;
 use sitas::{ShardLocal, ShardedExecutor, executor::sleep};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("shard_local_stoppable_workers");
     let runtime = ShardedExecutor::start(4)?;
     let submitter = runtime.submitter();
     let local_counts = ShardLocal::new(submitter.clone(), |_| 0usize);

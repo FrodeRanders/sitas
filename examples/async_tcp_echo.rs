@@ -2,6 +2,7 @@
 //!
 //! The blocking client is deliberately outside the executor so the example
 //! focuses on the server-side readiness path.
+mod support;
 use sitas::executor::{accept_async, block_on, read_exact_async, write_all_async};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -9,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_tcp_echo");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;

@@ -2,9 +2,11 @@
 //!
 //! The awaiting task resumes on its original shard, which is the key affinity
 //! rule that keeps shard-local reasoning tractable.
+mod support;
 use sitas::{ShardId, ShardedExecutor, current_executor_shard};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("sharded_submit");
     let runtime = ShardedExecutor::start(2)?;
     let submitter = runtime.submitter();
     let task_submitter = submitter.clone();

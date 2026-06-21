@@ -2,11 +2,13 @@
 //!
 //! The channel is only for demonstration output; actual application state
 //! should live on the shard and be accessed through typed submissions.
+mod support;
 use sitas::{ShardId, ShardedExecutor, current_executor_shard};
 use std::sync::mpsc;
 use std::thread;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("sharded_executor");
     let runtime = ShardedExecutor::start(4)?;
     let (sender, receiver) = mpsc::sync_channel(4);
 

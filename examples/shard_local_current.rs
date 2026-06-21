@@ -2,9 +2,11 @@
 //!
 //! `with_current` avoids a round-trip through the submitter, but only works
 //! because the task is already executing on the shard that owns the value.
+mod support;
 use sitas::{ShardId, ShardLocal, ShardedExecutor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("shard_local_current");
     let runtime = ShardedExecutor::start(4)?;
     let submitter = runtime.submitter();
     let local_counts = ShardLocal::new(submitter.clone(), |_| 0usize);

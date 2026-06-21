@@ -4,6 +4,7 @@
 //! example first spawns grouped work directly from the runtime owner, then has a
 //! task on shard 0 submit grouped work to every shard through `ShardedSubmitter`.
 
+mod support;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use sitas::executor::{block_on, yield_now};
 use sitas::{ExecutorSnapshot, ShardId, ShardedExecutor, current_executor_shard, join_all_shards};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("sharded_scheduling_groups");
     let runtime = ShardedExecutor::start(3)?;
     let foreground = runtime.create_scheduling_group_on_all("foreground", 100)?;
     let background = runtime.create_scheduling_group_on_all("background", 25)?;

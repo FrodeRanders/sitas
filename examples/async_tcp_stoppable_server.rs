@@ -2,6 +2,7 @@
 //!
 //! This is closer to a service lifecycle than the fixed-count examples: work
 //! continues until another task decides the runtime should stop accepting.
+mod support;
 use sitas::executor::{
     executor_and_spawner, read_exact_async, serve_tcp_until_stopped_timeout, sleep, stop_pair,
     write_all_async,
@@ -14,6 +15,7 @@ use std::time::Duration;
 const CLIENT_COUNT: u8 = 3;
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_tcp_stoppable_server");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     let (stop_source, stop_token) = stop_pair();

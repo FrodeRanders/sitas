@@ -17,6 +17,7 @@
 //! small owned `PartitionRun` metadata through their task handles, and the
 //! coordinator reads their sorted run files during the final k-way merge.
 
+mod support;
 use sitas::{
     CpuPlacement, RouteByKey, ShardId, ShardLocal, ShardMailboxConfig, ShardedExecutor,
     ShardedExecutorConfig, WorkUnitMailboxSet, WorkUnitRouter, WorkUnitSpec, available_cpu_ids,
@@ -41,6 +42,7 @@ const SEND_BATCH_ENTRIES: usize = 128;
 const DEFAULT_MAILBOX_CAPACITY: usize = 64;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("sharded_index_mailbox");
     let config = DemoConfig::from_args(env::args())?;
     let overall_start = Instant::now();
 

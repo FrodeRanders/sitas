@@ -10,6 +10,8 @@
 //! progress and [`ShardedExecutor::map_all`] for partition work.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
+mod support;
+
 #[cfg(target_os = "linux")]
 use sitas::executor::{read_exact_at_uring, write_all_at_uring};
 #[cfg(target_os = "linux")]
@@ -44,6 +46,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("sharded_index_build_uring");
     let config = DemoConfig::from_args(env::args())?;
 
     // Probe before doing setup work. The kernel or container may not expose

@@ -2,6 +2,7 @@
 //!
 //! This proves the reactor can interleave accept, connect, read, and write
 //! futures without helper threads driving either side.
+mod support;
 use sitas::executor::{
     accept_async, connect_async, executor_and_spawner, read_exact_async, write_all_async,
 };
@@ -9,6 +10,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
 
 fn main() -> std::io::Result<()> {
+    support::announce("async_tcp_pair");
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;

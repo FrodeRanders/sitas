@@ -2,13 +2,15 @@
 //!
 //! Linux can apply affinity, while other platforms report unsupported status;
 //! the example prints both requested placement and what tasks observe.
+mod support;
 use sitas::{
     ShardId, ShardedExecutor, available_cpu_ids, current_executor_cpu_placement,
     current_executor_shard, executor::block_on,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("available CPUs: {:?}", available_cpu_ids());
+    support::announce("sharded_cpu_placement");
+    println!("Available CPUs: {:?}", available_cpu_ids());
 
     let runtime = ShardedExecutor::start_pinned_on_available_cpus()?;
 

@@ -2,6 +2,7 @@
 //!
 //! This is the lightweight alternative to a tracing UI for now: owned snapshots
 //! expose queues, waits, polls, and counters without keeping shards alive.
+mod support;
 use sitas::{
     ExecutorSnapshot, ShardedExecutor, TaskSnapshot, TaskStatus, TaskWait, current_executor_shard,
     executor::sleep,
@@ -9,6 +10,7 @@ use sitas::{
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    support::announce("sharded_observability");
     let runtime = ShardedExecutor::start(2)?;
     let observer = runtime.observer();
 
