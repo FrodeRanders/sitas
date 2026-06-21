@@ -1126,7 +1126,9 @@ impl<M> SharedMailbox<M> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::poll_fn;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     use crate::executor::{block_on, yield_now};
     use crate::{ShardedExecutor, current_executor_shard};
@@ -1632,30 +1634,40 @@ mod tests {
         let sender = mailboxes.sender_to(ShardId(1)).unwrap();
         sender.try_send(1).unwrap();
 
-        let snap_mailboxes = Arc::clone(&mailboxes);
         let receiver_mailboxes = Arc::clone(&mailboxes);
+        let (pending_sender, pending_receiver) = mpsc::channel();
 
         let send_handle = runtime
             .spawn_with_handle_on(ShardId(0), async move {
-                sender.send(2).await.unwrap();
+                let mut pending_sender = Some(pending_sender);
+                let mut send = Box::pin(sender.send(2));
+                poll_fn(|context| match send.as_mut().poll(context) {
+                    Poll::Ready(result) => Poll::Ready(result),
+                    Poll::Pending => {
+                        if let Some(pending_sender) = pending_sender.take() {
+                            pending_sender.send(()).unwrap();
+                        }
+                        Poll::Pending
+                    }
+                })
+                .await
+                .unwrap();
             })
             .unwrap();
 
+        pending_receiver.recv().unwrap();
+        let waiters_before_drain = mailboxes.snapshot(ShardId(1)).unwrap().send_waiter_count;
+
         let snap_handle = runtime
             .spawn_with_handle_on(ShardId(1), async move {
-                yield_now().await;
-                yield_now().await;
-                let snap = snap_mailboxes.snapshot(ShardId(1)).unwrap();
-                let waiters = snap.send_waiter_count;
                 let mut receiver = receiver_mailboxes.receiver_for_current_shard().unwrap();
                 receiver.recv().await.unwrap();
                 receiver.recv().await.unwrap();
-                waiters
             })
             .unwrap();
 
         block_on(send_handle).unwrap();
-        let waiters_before_drain = block_on(snap_handle).unwrap();
+        block_on(snap_handle).unwrap();
 
         assert!(waiters_before_drain >= 1);
 
