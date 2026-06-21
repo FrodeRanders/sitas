@@ -147,59 +147,91 @@ field guide for those words.
 
 \subsection{Wake path}
 
-\begin{lstlisting}[language={},caption={Wake path}]
-Future stores Waker
-    |
-external event or explicit wake
-    |
-Task waker marks task queued
-    |
-Scheduler pushes task into its scheduling group queue
-    |
-Executor polls ready work later
-\end{lstlisting}
+\begin{center}
+\begin{tikzpicture}[
+    mechbox/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=82mm, minimum height=8mm, text width=78mm,
+        align=center, font=\footnotesize\ttfamily, rounded corners=1.5pt},
+    arr/.style={->, >=stealth, thick, color=sitasAccent}
+]
+\node[mechbox] (waker) at (0, 0) {Future stores Waker};
+\node[mechbox] (event) at (0, -1.1) {external event or explicit wake};
+\node[mechbox] (queued) at (0, -2.2) {Task waker marks task queued};
+\node[mechbox] (group) at (0, -3.3) {Scheduler pushes task into its scheduling group queue};
+\node[mechbox] (poll) at (0, -4.4) {Executor polls ready work later};
+
+\draw[arr] (waker) -- (event);
+\draw[arr] (event) -- (queued);
+\draw[arr] (queued) -- (group);
+\draw[arr] (group) -- (poll);
+\end{tikzpicture}
+\end{center}
 
 \subsection{Timer path}
 
-\begin{lstlisting}[language={},caption={Timer path}]
-sleep(duration)
-    |
-register deadline and waker
-    |
-executor waits until earliest deadline or another event
-    |
-expired timer wakes task
-    |
-task is requeued and polled
-\end{lstlisting}
+\begin{center}
+\begin{tikzpicture}[
+    mechbox/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=82mm, minimum height=8mm, text width=78mm,
+        align=center, font=\footnotesize\ttfamily, rounded corners=1.5pt},
+    arr/.style={->, >=stealth, thick, color=sitasAccent}
+]
+\node[mechbox] (sleep) at (0, 0) {sleep(duration)};
+\node[mechbox] (register) at (0, -1.1) {register deadline and waker};
+\node[mechbox] (wait) at (0, -2.2) {executor waits until earliest deadline or another event};
+\node[mechbox] (expired) at (0, -3.3) {expired timer wakes task};
+\node[mechbox] (requeued) at (0, -4.4) {task is requeued and polled};
+
+\draw[arr] (sleep) -- (register);
+\draw[arr] (register) -- (wait);
+\draw[arr] (wait) -- (expired);
+\draw[arr] (expired) -- (requeued);
+\end{tikzpicture}
+\end{center}
 
 \subsection{Readiness path}
 
-\begin{lstlisting}[language={},caption={Readiness path}]
-read/write future tries non-blocking operation
-    |
-WouldBlock
-    |
-register fd interest and task waker
-    |
-reactor reports readiness
-    |
-task retries operation
-\end{lstlisting}
+\begin{center}
+\begin{tikzpicture}[
+    mechbox/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=82mm, minimum height=8mm, text width=78mm,
+        align=center, font=\footnotesize\ttfamily, rounded corners=1.5pt},
+    arr/.style={->, >=stealth, thick, color=sitasAccent}
+]
+\node[mechbox] (try) at (0, 0) {read/write future tries non-blocking operation};
+\node[mechbox] (wouldblock) at (0, -1.1) {WouldBlock};
+\node[mechbox] (interest) at (0, -2.2) {register fd interest and task waker};
+\node[mechbox] (ready) at (0, -3.3) {reactor reports readiness};
+\node[mechbox] (retry) at (0, -4.4) {task retries operation};
+
+\draw[arr] (try) -- (wouldblock);
+\draw[arr] (wouldblock) -- (interest);
+\draw[arr] (interest) -- (ready);
+\draw[arr] (ready) -- (retry);
+\end{tikzpicture}
+\end{center}
 
 \subsection{Completion path}
 
-\begin{lstlisting}[language={},caption={Completion path}]
-io_uring future submits operation with owned buffer
-    |
-dispatcher tracks operation id, buffer, and waker
-    |
-kernel completes operation
-    |
-dispatcher buffers completion or wakes task
-    |
-future takes result and buffer
-\end{lstlisting}
+\begin{center}
+\begin{tikzpicture}[
+    mechbox/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=82mm, minimum height=8mm, text width=78mm,
+        align=center, font=\footnotesize\ttfamily, rounded corners=1.5pt},
+    arr/.style={->, >=stealth, thick, color=sitasAccent}
+]
+\node[mechbox] (submit) at (0, 0) {io\_uring future submits operation with owned buffer};
+\node[mechbox] (track) at (0, -1.1) {dispatcher tracks operation id, buffer, and waker};
+\node[mechbox] (kernel) at (0, -2.2) {kernel completes operation};
+\node[mechbox] (dispatch) at (0, -3.3) {dispatcher buffers completion or wakes task};
+\node[mechbox] (take) at (0, -4.4) {future takes result and buffer};
+
+\draw[arr] (submit) -- (track);
+\draw[arr] (track) -- (kernel);
+\draw[arr] (kernel) -- (dispatch);
+\draw[arr] (dispatch) -- (take);
+\end{tikzpicture}
+\end{center}
 
 \section{Common confusions}
 
