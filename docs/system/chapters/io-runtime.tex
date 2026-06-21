@@ -108,6 +108,16 @@ submitted it has been dropped. That forces the runtime to model operation ids,
 owned buffers, late completions, and abandonment---exactly the internals this
 project wants to make visible.
 
+Host policy is part of the model. Many Linux deployments, especially
+containers and hardened hosts, restrict or disable \texttt{io\_uring} because
+it exposes a broad kernel/user boundary. Newer kernels are adding more
+fine-grained restriction mechanisms, including cBPF-style filtering of allowed
+\texttt{io\_uring} operations, so a host may allow a small opcode set rather
+than enabling every operation. This runtime does not install or manage such
+policy. It keeps the operations narrow and reports setup or submission failure
+as unavailable or as an ordinary I/O error, depending on where the host
+rejects the request.
+
 Each Linux executor run loop installs a thread-local dispatcher when the host
 allows ring setup. Executor-backed \texttt{io\_uring} futures store operation
 ids and owned buffers. When polled on a shard, they queue an operation against
