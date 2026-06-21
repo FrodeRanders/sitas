@@ -65,6 +65,31 @@ scheduling needs. The accept loop is one long-lived task. Handlers are many
 shorter-lived tasks. Keeping those roles separate makes shutdown,
 observability, and scheduling group assignment straightforward.
 
+\section{Sharded TCP socket options}
+
+\texttt{ShardedTcpServer} keeps Linux socket placement explicit. On Linux,
+\texttt{SO\_REUSEPORT} lets each shard bind its own listener so the kernel can
+distribute incoming connections across shard-local accept loops. The server can
+also opt into \texttt{SO\_INCOMING\_CPU} with
+\texttt{ShardedTcpIncomingCpu}. This option is disabled by default; callers
+must request either sequential placement over \texttt{available\_cpu\_ids()} or
+an explicit CPU list.
+
+\texttt{SO\_INCOMING\_CPU} is socket metadata, not a polling mode. It does not
+consume a kernel thread. It should not be confused with mechanisms such as
+\texttt{io\_uring} \texttt{SQPOLL}, where a kernel polling thread may be part
+of the setup. In this runtime, \texttt{SO\_INCOMING\_CPU} is only an optional
+listener \texttt{setsockopt}; the accept, read, and write path remains
+readiness-driven.
+
+Accepted sharded TCP connections expose a Linux kTLS ULP helper. That helper
+attaches the kernel \texttt{tls} upper-layer protocol to the socket. It is not
+a complete TLS implementation: the handler or a TLS stack must still complete
+the handshake and install the required kernel TX/RX crypto state. The server
+does not own certificates, handshake transcripts, traffic secrets, or TLS
+record policy, so it deliberately leaves the full kTLS handoff outside the
+generic accept loop.
+
 \begin{notabene}[Readiness lesson]
 Readiness is a notification that retrying may be useful. Completion is a
 notification that the operation has already finished. The code keeps those

@@ -101,7 +101,7 @@ Senders use an atomic refcount so intermediate clone drops do not prematurely si
 
 ### `sharded_tcp`
 
-`sharded_tcp` integrates TCP helpers with the shard-per-thread model. `ShardedTcpServer` validates its configuration, creates non-blocking listeners before returning from startup, and spawns stoppable readiness-driven accept-loop tasks. On Linux with `SO_REUSEPORT`, the kernel distributes connections across shards. Without `SO_REUSEPORT`, a single accept shard distributes connections via the `ShardedSubmitter`. Connection handlers receive the TCP stream and a submitter clone for spawning work on their shard. The server returns a stop handle, configured per-shard connection limits are enforced by shard-local handler permits, and handle snapshots expose owned counters for connection-limit drops, accept errors, and handler submit failures. Accept-loop diagnostics are emitted as typed `ShardedTcpEvent` values through an optional event sink; the built-in snapshot counters are updated from the same events.
+`sharded_tcp` integrates TCP helpers with the shard-per-thread model. `ShardedTcpServer` validates its configuration, creates non-blocking listeners before returning from startup, and spawns stoppable readiness-driven accept-loop tasks. On Linux with `SO_REUSEPORT`, the kernel distributes connections across shards. Linux listeners can also opt into explicit `SO_INCOMING_CPU` placement, either sequentially over `available_cpu_ids()` or with a caller-provided CPU list. Without `SO_REUSEPORT`, a single accept shard distributes connections via the `ShardedSubmitter`. Connection handlers receive the TCP stream and a submitter clone for spawning work on their shard. The server returns a stop handle, configured per-shard connection limits are enforced by shard-local handler permits, and handle snapshots expose owned counters for connection-limit drops, accept errors, and handler submit failures. Accept-loop diagnostics are emitted as typed `ShardedTcpEvent` values through an optional event sink; the built-in snapshot counters are updated from the same events. Accepted connections expose a Linux kTLS ULP helper, but full kTLS handoff remains a handler/TLS-stack responsibility because the server does not own handshake state or traffic keys.
 
 ### `shard_mailbox`
 
@@ -460,6 +460,10 @@ This is readiness-based, not completion-based. It is separate from the experimen
 
 Linux uses `epoll`. macOS and iOS use `kqueue`. Other non-Linux Unix targets
 currently use `poll`.
+
+The TCP server's `SO_INCOMING_CPU` and kTLS ULP hooks are Linux socket options
+on the readiness-based TCP path. They do not make TCP accept, send, or receive
+completion-based `io_uring` operations.
 
 ## 10. Linux `io_uring` model
 

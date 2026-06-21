@@ -18,6 +18,8 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::raw::c_int;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -26,7 +28,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::executor::{RaceOutput, StopSource, accept_async, race, stop_pair};
 use crate::shard::ShardId;
-use crate::sharded_executor::{ShardedSpawnError, ShardedSubmitter};
+use crate::sharded_executor::{CpuId, ShardedSpawnError, ShardedSubmitter, available_cpu_ids};
 
 // FFI declarations (same pattern as src/os.rs)
 #[allow(dead_code)]
@@ -61,6 +63,12 @@ const SO_REUSEPORT: c_int = 15;
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 const SO_REUSEPORT: c_int = 0x0200;
+#[cfg(target_os = "linux")]
+const SO_INCOMING_CPU: c_int = 49;
+#[cfg(target_os = "linux")]
+const SOL_TCP: c_int = 6;
+#[cfg(target_os = "linux")]
+const TCP_ULP: c_int = 31;
 #[allow(dead_code)]
 const F_GETFL: c_int = 3;
 #[allow(dead_code)]
@@ -164,6 +172,58 @@ pub struct ShardedTcpConnection {
     pub shard_id: ShardId,
 }
 
+impl ShardedTcpConnection {
+    /// Enables Linux kTLS TCP ULP on this accepted stream.
+    ///
+    /// This only attaches the kernel TLS upper-layer protocol to the socket.
+    /// A complete kTLS handoff also requires a TLS implementation to complete
+    /// the handshake and install TX/RX crypto state with Linux `SOL_TLS`
+    /// options. `ShardedTcpServer` intentionally leaves that protocol-specific
+    /// key material boundary to the connection handler.
+    #[cfg(target_os = "linux")]
+    pub fn enable_kernel_tls_ulp(&self) -> io::Result<()> {
+        enable_kernel_tls_ulp(self.stream.as_raw_fd())
+    }
+
+    /// Returns unsupported on non-Linux platforms.
+    #[cfg(not(target_os = "linux"))]
+    pub fn enable_kernel_tls_ulp(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Linux kTLS TCP ULP is only available on Linux",
+        ))
+    }
+}
+
+/// Policy for applying Linux `SO_INCOMING_CPU` to sharded TCP listeners.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum ShardedTcpIncomingCpu {
+    /// Do not set `SO_INCOMING_CPU`.
+    #[default]
+    Disabled,
+    /// Use the process-available CPU list, assigning shard `N` to CPU
+    /// `available_cpu_ids()[N % len]`.
+    SequentialAvailable,
+    /// Use the explicit CPU id for each shard.
+    Explicit(Vec<CpuId>),
+}
+
+impl ShardedTcpIncomingCpu {
+    fn cpu_for_shard(&self, shard_idx: usize, available_cpus: &[CpuId]) -> Option<CpuId> {
+        match self {
+            Self::Disabled => None,
+            Self::SequentialAvailable => {
+                if available_cpus.is_empty() {
+                    Some(CpuId(shard_idx))
+                } else {
+                    Some(available_cpus[shard_idx % available_cpus.len()])
+                }
+            }
+            Self::Explicit(cpus) => cpus.get(shard_idx).copied(),
+        }
+    }
+}
+
 /// Configuration for a sharded TCP server.
 #[derive(Clone)]
 pub struct ShardedTcpConfig {
@@ -171,6 +231,8 @@ pub struct ShardedTcpConfig {
     pub max_connections_per_shard: usize,
     /// Whether to use `SO_REUSEPORT` (Linux only, enables per-shard accept).
     pub reuse_port: bool,
+    /// Linux `SO_INCOMING_CPU` placement for listener sockets.
+    pub incoming_cpu: ShardedTcpIncomingCpu,
     /// Connection backlog.
     pub backlog: u32,
     /// Optional structured event sink for server-level runtime events.
@@ -182,6 +244,7 @@ impl Default for ShardedTcpConfig {
         Self {
             max_connections_per_shard: 128,
             reuse_port: true,
+            incoming_cpu: ShardedTcpIncomingCpu::Disabled,
             backlog: 128,
             event_sink: None,
         }
@@ -193,6 +256,7 @@ impl fmt::Debug for ShardedTcpConfig {
         f.debug_struct("ShardedTcpConfig")
             .field("max_connections_per_shard", &self.max_connections_per_shard)
             .field("reuse_port", &self.reuse_port)
+            .field("incoming_cpu", &self.incoming_cpu)
             .field("backlog", &self.backlog)
             .field("event_sink", &self.event_sink.as_ref().map(|_| "<sink>"))
             .finish()
@@ -214,6 +278,15 @@ impl ShardedTcpConfig {
     /// Sets whether to use `SO_REUSEPORT`.
     pub fn with_reuse_port(mut self, reuse: bool) -> Self {
         self.reuse_port = reuse;
+        self
+    }
+
+    /// Sets Linux `SO_INCOMING_CPU` placement for listener sockets.
+    ///
+    /// This option is Linux-only. On other platforms the setting remains
+    /// visible in configuration but has no socket effect.
+    pub fn with_incoming_cpu(mut self, incoming_cpu: ShardedTcpIncomingCpu) -> Self {
+        self.incoming_cpu = incoming_cpu;
         self
     }
 
@@ -461,6 +534,13 @@ impl ShardedTcpServer {
                 "max_connections_per_shard must be greater than zero",
             ));
         }
+        if let ShardedTcpIncomingCpu::Explicit(cpus) = &self.config.incoming_cpu
+            && cpus.len() < submitter.shard_count()
+        {
+            return Err(ShardedTcpStartError::InvalidConfig(
+                "incoming CPU placement must provide a CPU for every shard",
+            ));
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -499,15 +579,21 @@ impl ShardedTcpServer {
         let (stop_source, stop_token) = stop_pair();
         let mut listener_addr = self.bind_addr;
         let mut listeners = Vec::with_capacity(submitter.shard_count());
+        let available_cpus = available_cpu_ids();
 
         for shard_idx in 0..submitter.shard_count() {
             let shard_id = ShardId(shard_idx);
-            let listener = create_listener(listener_addr, backlog, true).map_err(|source| {
-                ShardedTcpStartError::Listen {
-                    shard_id: Some(shard_id),
-                    source,
-                }
-            })?;
+            let incoming_cpu = self
+                .config
+                .incoming_cpu
+                .cpu_for_shard(shard_idx, &available_cpus);
+            let listener =
+                create_listener(listener_addr, backlog, true, incoming_cpu).map_err(|source| {
+                    ShardedTcpStartError::Listen {
+                        shard_id: Some(shard_id),
+                        source,
+                    }
+                })?;
             if shard_idx == 0 && self.bind_addr.port() == 0 {
                 listener_addr =
                     listener
@@ -605,7 +691,11 @@ impl ShardedTcpServer {
         let recorder =
             ShardedTcpEventRecorder::new(Arc::clone(&stats), self.config.event_sink.clone());
         let (stop_source, stop_token) = stop_pair();
-        let listener = create_single_listener(bind_addr)?;
+        let incoming_cpu = self
+            .config
+            .incoming_cpu
+            .cpu_for_shard(0, &available_cpu_ids());
+        let listener = create_single_listener(bind_addr, self.config.backlog, incoming_cpu)?;
 
         if let Err(error) = submitter.submit_named_to(ShardId(0), "tcp-accept-0", async move {
             loop {
@@ -699,22 +789,26 @@ fn connection_counts(shard_count: usize) -> Arc<Vec<AtomicUsize>> {
     Arc::new((0..shard_count).map(|_| AtomicUsize::new(0)).collect())
 }
 
-fn create_single_listener(addr: SocketAddr) -> Result<TcpListener, ShardedTcpStartError> {
-    let listener = TcpListener::bind(addr).map_err(|source| ShardedTcpStartError::Listen {
-        shard_id: None,
-        source,
-    })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|source| ShardedTcpStartError::Listen {
+fn create_single_listener(
+    addr: SocketAddr,
+    backlog: u32,
+    incoming_cpu: Option<CpuId>,
+) -> Result<TcpListener, ShardedTcpStartError> {
+    create_listener(addr, backlog, false, incoming_cpu).map_err(|source| {
+        ShardedTcpStartError::Listen {
             shard_id: None,
             source,
-        })?;
-    Ok(listener)
+        }
+    })
 }
 
 #[allow(dead_code)]
-fn create_listener(addr: SocketAddr, backlog: u32, reuse_port: bool) -> io::Result<TcpListener> {
+fn create_listener(
+    addr: SocketAddr,
+    backlog: u32,
+    reuse_port: bool,
+    incoming_cpu: Option<CpuId>,
+) -> io::Result<TcpListener> {
     let backlog: c_int = backlog.try_into().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -800,6 +894,11 @@ fn create_listener(addr: SocketAddr, backlog: u32, reuse_port: bool) -> io::Resu
         }
     }
 
+    if let Err(error) = set_incoming_cpu(fd, incoming_cpu) {
+        close_owned_fd(fd);
+        return Err(error);
+    }
+
     let bind_addr = BindSockAddr::new(&addr);
     let (bind_ptr, bind_len) = bind_addr.as_ptr_len();
     // SAFETY: `bind` is called with the open socket fd and a pointer to a
@@ -823,6 +922,63 @@ fn create_listener(addr: SocketAddr, backlog: u32, reuse_port: bool) -> io::Resu
     // SAFETY: `fd` is a valid, bound, listening socket descriptor. Ownership
     // transfers to the `TcpListener`, which will close it on drop.
     Ok(unsafe { TcpListener::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn set_incoming_cpu(fd: c_int, incoming_cpu: Option<CpuId>) -> io::Result<()> {
+    let Some(cpu) = incoming_cpu else {
+        return Ok(());
+    };
+    let cpu: c_int = cpu.0.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SO_INCOMING_CPU value does not fit platform c_int",
+        )
+    })?;
+
+    // SAFETY: `fd` is an open socket. SO_INCOMING_CPU expects a c_int CPU id;
+    // the pointer and length describe the local `cpu` value for this call.
+    let result = unsafe {
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_INCOMING_CPU,
+            &cpu,
+            std::mem::size_of::<c_int>() as SockLen,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_incoming_cpu(_fd: c_int, _incoming_cpu: Option<CpuId>) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn enable_kernel_tls_ulp(fd: c_int) -> io::Result<()> {
+    let name = b"tls\0";
+    // SAFETY: `fd` is an open TCP stream descriptor borrowed from TcpStream.
+    // TCP_ULP expects a NUL-terminated protocol name buffer; `name` remains
+    // live for the duration of the call and the kernel copies the value.
+    let result = unsafe {
+        setsockopt(
+            fd,
+            SOL_TCP,
+            TCP_ULP,
+            name.as_ptr().cast::<c_int>(),
+            name.len() as SockLen,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 fn close_owned_fd(fd: c_int) {
@@ -966,6 +1122,32 @@ mod bind_sockaddr_tests {
     }
 
     #[test]
+    fn incoming_cpu_policy_maps_shards_to_available_cpus() {
+        let available = vec![CpuId(2), CpuId(4)];
+
+        assert_eq!(
+            ShardedTcpIncomingCpu::Disabled.cpu_for_shard(0, &available),
+            None
+        );
+        assert_eq!(
+            ShardedTcpIncomingCpu::SequentialAvailable.cpu_for_shard(0, &available),
+            Some(CpuId(2))
+        );
+        assert_eq!(
+            ShardedTcpIncomingCpu::SequentialAvailable.cpu_for_shard(2, &available),
+            Some(CpuId(2))
+        );
+        assert_eq!(
+            ShardedTcpIncomingCpu::Explicit(vec![CpuId(7)]).cpu_for_shard(0, &available),
+            Some(CpuId(7))
+        );
+        assert_eq!(
+            ShardedTcpIncomingCpu::Explicit(vec![CpuId(7)]).cpu_for_shard(1, &available),
+            None
+        );
+    }
+
+    #[test]
     fn event_recorder_updates_snapshot_and_custom_sink() {
         let stats = Arc::new(ShardedTcpServerStats::default());
         let sink = Arc::new(RecordingSink::default());
@@ -1051,6 +1233,29 @@ mod bind_sockaddr_tests {
             result,
             Err(ShardedTcpStartError::InvalidConfig(
                 "max_connections_per_shard must be greater than zero"
+            ))
+        ));
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn server_start_rejects_explicit_incoming_cpu_that_does_not_cover_shards() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+        let submitter = runtime.submitter();
+        let server = ShardedTcpServer::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            ShardedTcpConfig::new()
+                .with_reuse_port(false)
+                .with_incoming_cpu(ShardedTcpIncomingCpu::Explicit(vec![CpuId(0)])),
+        );
+
+        let result = server.start(&submitter, |_conn, _submitter| async move {});
+
+        assert!(matches!(
+            result,
+            Err(ShardedTcpStartError::InvalidConfig(
+                "incoming CPU placement must provide a CPU for every shard"
             ))
         ));
         drop(submitter);

@@ -162,8 +162,10 @@ the same shared-nothing service direction.
         \texttt{ShardMailboxSet<M>} and non-uniform logical work-unit routing
         through \texttt{WorkUnitMailboxSet<N, M>}.
     \item[\texttt{sharded\_tcp}] Network-facing sharded TCP server with
-        \texttt{SO\_REUSEPORT} on Linux and single-accept distribution on
-        other platforms.
+        \texttt{SO\_REUSEPORT} on Linux, optional Linux
+        \texttt{SO\_INCOMING\_CPU} listener placement, an explicit kTLS ULP
+        hook for accepted connections, and single-accept distribution on other
+        platforms.
     \item[\texttt{metrics}] Thread-safe atomic-counter metrics collector with
         owned \texttt{MetricsSnapshot} for observability.
 \end{description}
