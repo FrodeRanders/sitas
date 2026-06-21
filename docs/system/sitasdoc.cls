@@ -165,11 +165,11 @@
 
 \titlespacing{\chapter}{0mm}{*0}{*1}
 
-\titlecontents{chapter}[0pt]{\addvspace{4mm}\rmfamily\bfseries\Large}
+\titlecontents{chapter}[0pt]{\addvspace{1mm}\rmfamily\large}
 {\thecontentslabel\quad}{}{\titlerule*[5pt]{.}\contentspage}
 
-\titlecontents{section}[4mm]{\addvspace{2pt}\rmfamily\bfseries\large}
+\titlecontents{section}[4mm]{\addvspace{0pt}\rmfamily\normalsize}
 {\thecontentslabel\quad}{}{\titlerule*[5pt]{.}\contentspage}
 
-\titlecontents{subsection}[9mm]{\addvspace{2pt}\rmfamily}
+\titlecontents{subsection}[9mm]{\addvspace{0pt}\rmfamily}
 {\thecontentslabel\quad}{}{\titlerule*[5pt]{.}\contentspage}

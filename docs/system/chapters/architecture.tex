@@ -64,8 +64,8 @@ that answer in the program structure.
 
 \section{Boundaries and lifetimes}
 
-Most runtime bugs are boundary bugs. A value crosses to another thread without being owned. A reference to local state escapes a
-closure. A future keeps a borrowed value across \texttt{.await}. A completion
+Most runtime bugs are boundary bugs: a value crosses to another thread without being owned,
+a reference to local state escapes a closure, a future keeps a borrowed value across \texttt{.await}, or a completion
 operation drops a buffer before the kernel has finished with it.
 
 \texttt{sitas} tries to make those boundaries visible:
@@ -83,7 +83,7 @@ operation drops a buffer before the kernel has finished with it.
         until abandoned operation cleanup proves they can be discarded.
 \end{description}
 
-\section{Why owned snapshots}
+\section{Why owned snapshots?}
 
 Observability could expose references into executor internals, but that would
 make a diagnostic API participate in the same lifetime and locking problems as
@@ -100,21 +100,34 @@ task, timer, or shard-local internals.
 
 The current runtime can be read as a layered system:
 
-\begin{lstlisting}[language={},caption={Conceptual layers}]
-Application service APIs
-    |
-Typed command/reply and submitter APIs
-    |
-Placement and shard routing
-    |
-Shard-local service state / ShardLocal<T>
-    |
-Shard executor or std shard thread
-    |
-Mailbox, task queue, timers, readiness, wakeups
-    |
-OS primitives: pipe/poll/epoll/io_uring/affinity
-\end{lstlisting}
+\begin{center}
+\begin{tikzpicture}[
+    layer/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=105mm, minimum height=8mm, font=\footnotesize\ttfamily,
+        rounded corners=1.5pt},
+    arr/.style={->, >=stealth, thick, color=sitasAccent},
+    note/.style={font=\tiny\itshape, color=sitasMuted}
+]
+\node[layer] (api) at (0, 0) {Application service APIs};
+\node[layer] (typed) at (0, -1.1) {Typed command/reply and submitter APIs};
+\node[layer] (routing) at (0, -2.2) {Placement and shard routing};
+\node[layer] (state) at (0, -3.3) {Shard-local service state / ShardLocal<T>};
+\node[layer] (executor) at (0, -4.4) {Shard executor or std shard thread};
+\node[layer] (runtime) at (0, -5.5) {Mailbox, task queue, timers, readiness, wakeups};
+\node[layer] (os) at (0, -6.6) {OS primitives: pipe/poll/epoll/io\_uring/affinity};
+
+\draw[arr] (api) -- (typed);
+\draw[arr] (typed) -- (routing);
+\draw[arr] (routing) -- (state);
+\draw[arr] (state) -- (executor);
+\draw[arr] (executor) -- (runtime);
+\draw[arr] (runtime) -- (os);
+
+\node[note] at (10mm, -1.65) {owned boundaries};
+\node[note] at (10mm, -3.85) {local ownership};
+\node[note] at (10mm, -6.05) {runtime mechanics};
+\end{tikzpicture}
+\end{center}
 
 The standard-library baseline exercises the upper part of the model. The
 custom executor and OS runtime layers fill in the lower layers while preserving

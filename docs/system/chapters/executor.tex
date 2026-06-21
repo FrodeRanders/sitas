@@ -127,6 +127,46 @@ built-in default queue in any executor. The same idea appears in the sharded
 runtime as a \texttt{ShardedSchedulingGroup}, which is one executor-local group
 per shard plus a runtime identity check.
 
+\subsection{Scheduling group API shape}
+
+\texttt{Spawner::create\_scheduling\_group} creates an executor-local group
+with a name and a positive share count. The normal spawn methods remain the
+shorthand for the default group. The group-aware variants classify work before
+it enters the ready queues:
+
+\begin{lstlisting}[language={},caption={Local group-aware spawn methods}]
+spawn_in_group
+spawn_named_in_group
+spawn_with_handle_in_group
+spawn_with_handle_named_in_group
+\end{lstlisting}
+
+\begin{lstlisting}[language={},caption={Classifying local tasks}]
+let foreground = spawner.create_scheduling_group("foreground", 200)?;
+let background = spawner.create_scheduling_group("background", 25)?;
+
+spawner.spawn_named_in_group(&foreground, "request", request_future)?;
+spawner.spawn_named_in_group(&background, "maintenance", maintenance_future)?;
+\end{lstlisting}
+
+\texttt{TaskScope} has matching group-aware spawn methods, so lifetime ownership
+and scheduling classification can be combined. In the sharded runtime, the
+matching creation helper builds one local group per shard:
+
+\begin{lstlisting}[language={},caption={Sharded group creation}]
+create_scheduling_group_on_all
+\end{lstlisting}
+
+The returned \texttt{ShardedSchedulingGroup} can be used with sharded spawn and
+submitter methods that accept an explicit group.
+
+\begin{notabene}[Shares are cooperative]
+Shares affect which ready group is selected after tasks return control to the
+executor. They do not interrupt a long poll. CPU-bound futures still need to
+call \texttt{yield\_now}, await timers or I/O, or split work into bounded
+chunks.
+\end{notabene}
+
 \section{Structured child tasks}
 
 \texttt{TaskScope} groups child tasks under one owner. Dropping the scope
