@@ -123,10 +123,9 @@ run files and summaries rather than borrowing another shard's working set.
 
 \subsection{Mailbox-transfer index build}
 
-\filepath{sharded\_index\_mailbox.rs} keeps the existing index demo intact and
-shows a different assembly path. Scan tasks still run on executor shards, but
-they send owned \texttt{IndexMessage} batches through mailbox senders instead
-of using intermediate run files as the cross-shard exchange medium.
+\filepath{sharded\_index\_mailbox.rs} shows a different assembly path than \filepath{sharded\_index\_build.rs} . 
+Scan tasks still run on executor shards, but they send owned \texttt{IndexMessage} batches through 
+mailbox senders instead of using intermediate run files as the cross-shard exchange medium.
 
 The demo separates logical ownership from physical shard placement:
 

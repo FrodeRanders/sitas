@@ -10,10 +10,10 @@ for submitting work to one shard, all shards, or a map/reduce over shards.
 Work does not migrate implicitly. A future runs on its assigned shard until
 code deliberately submits work elsewhere.
 
-This mirrors the most important Seastar idea without copying its C++ API:
-parallelism comes from many independent shards, not from many threads mutating
-the same service object. Each shard has its own executor, task queues, timers,
-readiness registrations, and shard-local values.
+This mirrors the most important Seastar idea: parallelism comes from many
+independent shards, not from many threads mutating the same service object.
+Each shard has its own executor, task queues, timers, readiness registrations,
+and shard-local values.
 
 Cache locality and ownership clarity drive this shape. Each shard owns its
 state and works on its own queue, so no global lock is needed. Cross-shard
@@ -56,15 +56,15 @@ The result crosses the boundary as an owned value.
 \begin{center}
 \begin{tikzpicture}[
     sbox/.style={draw=sitasMuted, fill=sitasCodeBackground,
-        minimum width=38mm, minimum height=8mm, font=\footnotesize\ttfamily,
+        minimum width=55mm, minimum height=8mm, font=\footnotesize\ttfamily,
         rounded corners=1.5pt},
     arr/.style={->, >=stealth, thick, color=sitasAccent},
     lbl/.style={font=\tiny\itshape, color=sitasMuted}
 ]
-\node[sbox] (s0a) at (0, 0) {Shard 0: submit future};
+\node[sbox] (s0a) at (-1, 0) {Shard 0: submit future};
 \node[sbox] (s1)  at (6, 0) {Shard 1: poll future};
 \node[sbox] (s1r) at (6, -1.4) {Shard 1: owned result};
-\node[sbox] (s0b) at (0, -1.4) {Shard 0: receive result};
+\node[sbox] (s0b) at (-1, -1.4) {Shard 0: receive result};
 
 \draw[arr] (s0a) -- node[above, lbl] {Send + 'static} (s1);
 \draw[arr] (s1) -- (s1r);
@@ -92,7 +92,7 @@ There are two routing modes.
 \begin{description}
     \item[Uniform shard routing] A key maps directly to a physical
           \texttt{ShardId}. The target is one inbound mailbox per shard:
-          \texttt{ShardMailboxSet<M>}. This is the original shard-key model.
+          \texttt{ShardMailboxSet<M>}.
     \item[Non-uniform work-unit routing] A key maps to a logical work-unit
           name. A placement table maps that name to the shard that owns its
           receiver: \texttt{WorkUnitMailboxSet<N, M>}. Multiple work units can
@@ -100,13 +100,33 @@ There are two routing modes.
           for a particular protocol.
 \end{description}
 
-\begin{lstlisting}[language={},caption={Uniform and non-uniform routing}]
-Uniform:
-    key -> ShardId -> ShardMailboxSet<M>
+\begin{center}
+\begin{tikzpicture}[
+    routebox/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=34mm, minimum height=8mm, text width=32mm,
+        align=center, font=\scriptsize\ttfamily, rounded corners=1.5pt},
+    label/.style={font=\footnotesize\bfseries, color=sitasMuted},
+    arr/.style={->, >=stealth, thick, color=sitasAccent}
+]
+\node[label] (uniform-label) at (-4, 0.7) {Uniform};
+\node[routebox] (uniform-key) at (-2.6, 0) {key};
+\node[routebox] (uniform-shard) at (1.2, 0) {ShardId};
+\node[routebox] (uniform-set) at (5.0, 0) {ShardMailboxSet\\<M>};
 
-Non-uniform:
-    key -> WorkUnitName -> WorkUnitMailboxSet<N, M> -> assigned ShardId
-\end{lstlisting}
+\node[label] (nonuniform-label) at (-3.6, -0.9) {Non-uniform};
+\node[routebox] (nonuniform-key) at (-2.6, -1.6) {key};
+\node[routebox] (work-unit) at (1.2, -1.6) {WorkUnitName};
+\node[routebox] (work-set) at (5.0, -1.6) {WorkUnitMailboxSet\\<N, M>};
+\node[routebox] (assigned) at (8.8, -1.6) {assigned ShardId};
+
+\draw[arr] (uniform-key) -- (uniform-shard);
+\draw[arr] (uniform-shard) -- (uniform-set);
+
+\draw[arr] (nonuniform-key) -- (work-unit);
+\draw[arr] (work-unit) -- (work-set);
+\draw[arr] (work-set) -- (assigned);
+\end{tikzpicture}
+\end{center}
 
 \texttt{UniformShardRouter} makes the first path explicit. It routes a
 hashable key to a \texttt{ShardId}. \texttt{WorkUnitRouter<N>} makes the

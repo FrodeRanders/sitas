@@ -42,6 +42,12 @@ while pending.
 A connection handler owns a stream and calls helpers against it in sequence.
 The reactor is the waiting mechanism, not the connection owner.
 
+\begin{notabene}[Readiness lesson]
+Readiness is a notification that retrying may be useful. Completion is a
+notification that the operation has already finished. The code keeps those
+concepts separate because the ownership and cancellation rules are different.
+\end{notabene}
+
 \section{TCP helpers}
 
 The TCP helpers are built on top of readiness futures rather than hiding a
@@ -75,26 +81,13 @@ also opt into \texttt{SO\_INCOMING\_CPU} with
 must request either sequential placement over \texttt{available\_cpu\_ids()} or
 an explicit CPU list.
 
-\texttt{SO\_INCOMING\_CPU} is socket metadata, not a polling mode. It does not
-consume a kernel thread. It should not be confused with mechanisms such as
-\texttt{io\_uring} \texttt{SQPOLL}, where a kernel polling thread may be part
-of the setup. In this runtime, \texttt{SO\_INCOMING\_CPU} is only an optional
-listener \texttt{setsockopt}; the accept, read, and write path remains
-readiness-driven.
-
-Accepted sharded TCP connections expose a Linux kTLS ULP helper. That helper
+Accepted sharded TCP connections expose a Linux \texttt{kTLS ULP} helper. That helper
 attaches the kernel \texttt{tls} upper-layer protocol to the socket. It is not
 a complete TLS implementation: the handler or a TLS stack must still complete
 the handshake and install the required kernel TX/RX crypto state. The server
 does not own certificates, handshake transcripts, traffic secrets, or TLS
 record policy, so it deliberately leaves the full kTLS handoff outside the
 generic accept loop.
-
-\begin{notabene}[Readiness lesson]
-Readiness is a notification that retrying may be useful. Completion is a
-notification that the operation has already finished. The code keeps those
-concepts separate because the ownership and cancellation rules are different.
-\end{notabene}
 
 \section{\texttt{io\_uring}}
 
@@ -185,23 +178,29 @@ answered.
 
 Timers, readiness waits, and \texttt{io\_uring} completions now share one
 executor idle wait shape on Linux. This is still a staged integration rather
-than a production event loop. Completion dispatch has a fixed internal
-per-tick budget that is exposed in executor snapshots. Those snapshots also
-count non-empty completion dispatch batches, dispatched completions, and
-completion budget exhaustion events. They also expose an executor-owned
-\texttt{io\_uring} lifecycle status, so callers can distinguish not-started,
-unavailable, installed, and shutdown states. Strict availability requests via
-\texttt{SITAS\_REQUIRE\_IO\_URING=1} fail executor setup instead of silently
-falling back to unavailable. Executor teardown makes a bounded attempt to drain
-abandoned completion work before discarding the thread-local dispatcher when no
-live task wakers remain registered. The final dispatcher snapshot records
-whether that drain completed, timed out, or was skipped because live wakers
-remained. When a root \texttt{run\_until} future completes with spawned
-\texttt{io\_uring} work still pending, the dispatcher remains installed for
-that executor on the current thread so later executor calls can continue the
-same operations. The runtime still does not expose a portable completion
-source, tunable completion policy, or a deeper shutdown policy for mixed
-readiness and completion workloads.
+than a production event loop. 
+
+Completion dispatch has a fixed internal per-tick budget that is exposed in 
+executor snapshots. Those snapshots also count non-empty completion dispatch 
+batches, dispatched completions, and completion budget exhaustion events. 
+
+They also expose an executor-owned \texttt{io\_uring} lifecycle status, so 
+callers can distinguish not-started, unavailable, installed, and shutdown states. 
+
+Strict availability requests via \texttt{SITAS\_REQUIRE\_IO\_URING=1} fail executor 
+setup instead of silently falling back to unavailable. 
+
+Executor teardown makes a bounded attempt to drain abandoned completion work 
+before discarding the thread-local dispatcher when no live task wakers remain 
+registered. The final dispatcher snapshot records whether that drain completed, t
+imed out, or was skipped because live wakers remained. 
+
+When a root \texttt{run\_until} future completes with spawned \texttt{io\_uring} work 
+still pending, the dispatcher remains installed for that executor on the current thread 
+so later executor calls can continue the same operations. 
+
+The runtime still does not expose a portable completion source, tunable completion 
+policy, or a deeper shutdown policy for mixed readiness and completion workloads.
 
 \section{Running statistics}
 

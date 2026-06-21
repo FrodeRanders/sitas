@@ -4,11 +4,11 @@
 \section{Role}
 
 The executor is a minimal single-threaded async kernel. It deliberately avoids
-Tokio or another third-party runtime to keep the internals visible: wakers,
+Tokio or similar third-party runtimes to keep the internals visible: wakers,
 task queues, timers, readiness registration, cancellation, and completion
 dispatch all live in this code base.
 
-\section{Why a custom executor}
+\section{Why a custom executor?}
 
 The custom executor exists because the project needs to control the meaning of
 ``where work runs.'' In a shard-per-core runtime, a future is not just an async
@@ -17,7 +17,7 @@ to say that this task belongs to this shard, this scheduling group, this ready
 queue, and this local reactor state.
 
 A third-party runtime would solve many engineering problems but would hide the
-scheduler internals. The small executor makes it possible to inspect how a
+scheduler internals. The custom executor makes it possible to inspect how a
 waker requeues a task, how a dropped timeout removes timer state, how a TCP
 future records fd interest, and how a completion future keeps buffers alive.
 
@@ -49,16 +49,40 @@ describing whether it is queued, polling, waiting, completed, or cancelled.
 
 The lifecycle is explicit:
 
-\begin{lstlisting}[language={},caption={Simplified task lifecycle}]
-spawn
-  -> create Task with pinned Future
-  -> queue Task in a scheduling group
-  -> poll Future
-       Ready(())  -> completed
-       Pending    -> waiting until waker fires
-  -> wake
-  -> queue Task again
-\end{lstlisting}
+\begin{center}
+\begin{tikzpicture}[
+    state/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=50mm, minimum height=8mm, text width=36mm,
+        align=center, font=\footnotesize\ttfamily, rounded corners=1.5pt},
+    branch/.style={draw=sitasMuted, fill=white,
+        minimum width=50mm, minimum height=8mm, text width=30mm,
+        align=center, font=\footnotesize\ttfamily, rounded corners=1.5pt},
+    arr/.style={->, >=stealth, thick, color=sitasAccent},
+    lbl/.style={font=\tiny\itshape, color=sitasMuted}
+]
+\node[state] (spawn) at (0, 0) {spawn};
+\node[state] (create) at (0, -1.15) {create Task with pinned Future};
+\node[state] (queue) at (0, -2.3) {queue Task in scheduling group};
+\node[state] (poll) at (0, -3.45) {poll Future};
+
+\node[branch] (ready) at (-3.8, -4.85) {Ready};
+\node[state] (completed) at (-3.8, -6.0) {completed};
+
+\node[branch] (pending) at (3.8, -4.85) {Pending};
+\node[state] (waiting) at (3.8, -6.0) {waiting until waker fires};
+\node[state] (wake) at (3.8, -7.15) {wake};
+
+\draw[arr] (spawn) -- (create);
+\draw[arr] (create) -- (queue);
+\draw[arr] (queue) -- (poll);
+\draw[arr] (poll) -- node[pos=0.50,  left, lbl] {returns} (ready);
+\draw[arr] (ready) -- (completed);
+\draw[arr] (poll) -- node[pos=0.50,  right, lbl] {returns} (pending);
+\draw[arr] (pending) -- (waiting);
+\draw[arr] (waiting) -- (wake);
+\draw[arr] (wake.east) -- ++(+5mm, 0) |- node[pos=0.25, right, lbl] {requeue} (queue.east);
+\end{tikzpicture}
+\end{center}
 
 A repeated wake does not create repeated queue entries. The task records that
 it is already queued, so repeated wakeups coalesce. A chatty future does not
@@ -116,7 +140,7 @@ for each poll:
     group.virtual_runtime += duration * default_shares / group.shares
 \end{lstlisting}
 
-This is not preemption. A long poll still blocks the executor thread until the
+This is not preemption, though. A long poll still blocks the executor thread until the
 future returns \texttt{Poll::Pending} or \texttt{Poll::Ready}. The mechanism is
 cooperative: futures must yield, await I/O, await timers, or otherwise return
 control to the executor.
