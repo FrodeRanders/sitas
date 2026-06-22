@@ -4,7 +4,7 @@
 
 This repository explores a Rust-native, Seastar-inspired shard-per-core runtime and service model. The project is not a line-by-line Seastar clone. It asks what a shared-nothing runtime should look like when designed around Rust ownership, type boundaries, explicit message passing, and isolated unsafe code.
 
-The original baseline is a dependency-free, standard-library sharded service kernel. The active exploration adds a custom executor, Unix OS primitives, readiness-based I/O, TCP helpers, sharded executors, shard-local state, observability snapshots, CPU placement, and experimental Linux `io_uring` support.
+The original baseline is a dependency-free, standard-library sharded service kernel. The active exploration adds a custom executor, Unix OS primitives, readiness-based I/O, TCP helpers, sharded executors, shard-local state, observability snapshots, CPU placement, and Linux `io_uring` support.
 
 Before changing runtime, executor, sharding, I/O, lifecycle, or service-state code, read `docs/architecture.md`.
 
@@ -53,7 +53,7 @@ The exploration branch contains:
 - `ShardLocal<T>` for one owned value per executor shard;
 - snapshot-based observability for tasks, shards, and runtime state;
 - Linux CPU affinity experiments;
-- experimental Linux `io_uring` primitives and dispatcher lifecycle tracking.
+- Linux `io_uring` primitives, owned-buffer read/write futures, dispatcher lifecycle tracking, and a per-shard executor integration.
 
 ## Coding rules
 
@@ -123,7 +123,7 @@ Do not implement these unless explicitly requested by the current task:
 
 - persistence;
 - procedural macro service generation;
-- production-grade `io_uring` integration with the sharded executor;
+- a single unified `io_uring`/timer/readiness event source for the sharded executor (the per-shard `io_uring` integration is supported, but one combined production wait primitive is still future work);
 - portable `kqueue` support;
 - general load balancing;
 - scheduling/resource classes;

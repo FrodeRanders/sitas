@@ -16,6 +16,7 @@ use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
@@ -745,9 +746,13 @@ impl IoUring {
     }
 
     fn prepare_sqe(&mut self) -> io::Result<*mut u8> {
-        let tail = read_u32(self.sq_tail);
-        let head = read_u32(self.sq_head);
-        let mask = read_u32(self.sq_ring_mask);
+        // We own the SQ tail, so a relaxed load reads our own last write. The
+        // SQ head is advanced by the kernel as it consumes SQEs, so it must be
+        // loaded with acquire ordering to observe freed slots. The ring mask is
+        // constant after setup.
+        let tail = load_relaxed(self.sq_tail);
+        let head = load_acquire(self.sq_head);
+        let mask = load_relaxed(self.sq_ring_mask);
         if tail.wrapping_sub(head) > mask {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -758,8 +763,10 @@ impl IoUring {
         let index = tail & mask;
         let sqe = unsafe { self.sqes.as_u8_ptr().add(index as usize * SQE_SIZE) };
         clear_sqe(sqe);
-        write_u32(unsafe { self.sq_array.add(index as usize) }, index);
-        write_u32(self.sq_tail, tail.wrapping_add(1));
+        store_relaxed(unsafe { self.sq_array.add(index as usize) }, index);
+        // Release the tail so the kernel's matching acquire load observes the
+        // SQE payload and sq_array slot written above before the new tail.
+        store_release(self.sq_tail, tail.wrapping_add(1));
         Ok(sqe)
     }
 
@@ -887,16 +894,21 @@ impl IoUring {
     }
 
     fn pop_ring_completion(&mut self) -> Option<IoUringCompletion> {
-        let head = read_u32(self.cq_head);
-        let tail = read_u32(self.cq_tail);
+        // We own the CQ head, so a relaxed load reads our own last write. The
+        // CQ tail is advanced by the kernel as it posts completions, so it must
+        // be loaded with acquire ordering before reading the CQE it publishes.
+        let head = load_relaxed(self.cq_head);
+        let tail = load_acquire(self.cq_tail);
         if head == tail {
             return None;
         }
 
-        let mask = read_u32(self.cq_ring_mask);
+        let mask = load_relaxed(self.cq_ring_mask);
         let index = head & mask;
         let cqe = read_cqe(unsafe { self.cqes.add(index as usize) });
-        write_u32(self.cq_head, head.wrapping_add(1));
+        // Release the head so the kernel observes the CQE slot as consumed
+        // before it reuses the slot for a later completion.
+        store_release(self.cq_head, head.wrapping_add(1));
 
         Some(IoUringCompletion {
             user_data: cqe.user_data,
@@ -924,6 +936,7 @@ pub struct IoUringDispatcher {
     completions: HashMap<IoUringOperationId, IoUringOperationCompletion>,
     abandoned_operations: HashMap<IoUringOperationId, IoUringOperationKind>,
     deferred_buffers: HashMap<IoUringOperationId, Vec<u8>>,
+    last_shutdown_drain: Option<IoUringShutdownDrainSnapshot>,
     total_dispatched_operations: usize,
     total_buffered_operations: usize,
     total_woken_operations: usize,
@@ -943,6 +956,7 @@ impl IoUringDispatcher {
             completions: HashMap::new(),
             abandoned_operations: HashMap::new(),
             deferred_buffers: HashMap::new(),
+            last_shutdown_drain: None,
             total_dispatched_operations: 0,
             total_buffered_operations: 0,
             total_woken_operations: 0,
@@ -1135,6 +1149,87 @@ impl IoUringDispatcher {
         ))
     }
 
+    /// Performs the observable teardown drain for this dispatcher.
+    ///
+    /// This is the single drain-or-leak routine used by explicit shutdown,
+    /// the executor integration, and `Drop`:
+    ///
+    /// - if task wakers are still registered the drain is skipped, because
+    ///   those operations' owned buffers belong to live futures that will
+    ///   release them when dropped;
+    /// - otherwise it makes a bounded attempt to drive remaining operations to
+    ///   completion so their buffers are freed normally;
+    /// - if the bounded attempt cannot confirm completion, the owned buffers
+    ///   backing operations the kernel may still touch are leaked rather than
+    ///   freed. Leaking memory is recoverable; a kernel write to freed memory
+    ///   is not. The leak count is reported in the returned snapshot.
+    ///
+    /// The outcome is also recorded so it appears in later
+    /// [`IoUringDispatcher::snapshot`] results.
+    pub fn shutdown_drain(&mut self, max_waits: usize) -> IoUringShutdownDrainSnapshot {
+        if !self.waiters.is_empty() {
+            let outcome = IoUringShutdownDrainSnapshot {
+                status: IoUringShutdownDrainStatus::SkippedLiveWakers,
+                max_waits,
+                dispatched: 0,
+                leaked_buffers: 0,
+            };
+            self.last_shutdown_drain = Some(outcome);
+            return outcome;
+        }
+
+        let mut dispatched = self.dispatch_available();
+        let mut waits = 0;
+        while !self.is_idle() && waits < max_waits {
+            let snapshot = self.snapshot();
+            if snapshot.ring.pending_submissions == 0
+                && snapshot.ring.pending_completions == 0
+                && snapshot.ring.tracked_operations == 0
+            {
+                break;
+            }
+            match self.wait_and_dispatch(1) {
+                Ok(count) => dispatched += count,
+                Err(_) => break,
+            }
+            waits += 1;
+        }
+
+        let (status, leaked_buffers) = if self.is_idle() {
+            (IoUringShutdownDrainStatus::Completed, 0)
+        } else {
+            // The kernel may still read from or write to the buffers backing
+            // operations it has not completed. Leak those buffers; freeing them
+            // before the ring is torn down would be a use-after-free.
+            let leaked = if self.ring.tracked_operations() > 0 {
+                self.leak_deferred_buffers()
+            } else {
+                0
+            };
+            (IoUringShutdownDrainStatus::TimedOut, leaked)
+        };
+
+        let outcome = IoUringShutdownDrainSnapshot {
+            status,
+            max_waits,
+            dispatched,
+            leaked_buffers,
+        };
+        self.last_shutdown_drain = Some(outcome);
+        outcome
+    }
+
+    /// Leaks every still-deferred owned buffer and returns how many were
+    /// leaked. Used only as the soundness fallback in [`shutdown_drain`].
+    fn leak_deferred_buffers(&mut self) -> usize {
+        let mut leaked = 0;
+        for (_operation, buffer) in self.deferred_buffers.drain() {
+            std::mem::forget(buffer);
+            leaked += 1;
+        }
+        leaked
+    }
+
     /// Returns a local dispatcher snapshot.
     pub fn snapshot(&self) -> IoUringDispatcherSnapshot {
         let mut completed_operation_kinds = IoUringOperationKindCounts::default();
@@ -1163,7 +1258,36 @@ impl IoUringDispatcher {
             total_buffered_operation_kinds: self.total_buffered_operation_kinds,
             total_woken_operation_kinds: self.total_woken_operation_kinds,
             total_discarded_operation_kinds: self.total_discarded_operation_kinds,
-            shutdown_drain: None,
+            shutdown_drain: self.last_shutdown_drain,
+        }
+    }
+}
+
+/// Bounded number of completion waits attempted when an [`IoUringDispatcher`]
+/// is dropped with operations still in flight. The bound guarantees `Drop`
+/// cannot block forever even if the kernel never reports a completion.
+const DROP_DRAIN_MAX_WAITS: usize = 1024;
+
+impl Drop for IoUringDispatcher {
+    fn drop(&mut self) {
+        // The dispatcher and its ring are being torn down, so no registered
+        // waker can ever be driven again. Clearing them ensures `shutdown_drain`
+        // takes the drain-or-leak path instead of skipping on stale wakers.
+        self.waiters.clear();
+
+        // Bounded best effort to complete in-flight operations and free their
+        // buffers; anything still in flight is leaked rather than freed so the
+        // kernel cannot write to freed memory after the ring is torn down.
+        let outcome = self.shutdown_drain(DROP_DRAIN_MAX_WAITS);
+
+        if cfg!(debug_assertions) && outcome.leaked_buffers > 0 {
+            eprintln!(
+                "io_uring dispatcher dropped with operations still in flight; \
+                 leaked {} owned buffer(s) to avoid a use-after-free \
+                 (tracked operations remaining: {})",
+                outcome.leaked_buffers,
+                self.ring.tracked_operations(),
+            );
         }
     }
 }
@@ -1587,6 +1711,10 @@ pub struct IoUringShutdownDrainSnapshot {
     pub max_waits: usize,
     /// Number of tracked completions dispatched while draining.
     pub dispatched: usize,
+    /// Number of owned buffers leaked because their operations could not be
+    /// confirmed complete before teardown. Non-zero only with a `TimedOut`
+    /// status; leaking is the sound fallback that prevents a use-after-free.
+    pub leaked_buffers: usize,
 }
 
 /// Final status of a bounded executor-owned `io_uring` shutdown drain.
@@ -1842,13 +1970,37 @@ fn clear_sqe(sqe: *mut u8) {
     unsafe { ptr::write_bytes(sqe, 0, SQE_SIZE) };
 }
 
-fn read_u32(ptr: *mut u32) -> u32 {
-    // SAFETY: ring offset pointers point into live kernel-provided mappings.
-    unsafe { ptr.read_volatile() }
+fn load_acquire(ptr: *mut u32) -> u32 {
+    // SAFETY: ring index pointers point into live, u32-aligned kernel-shared
+    // mappings. The shared SQ/CQ head and tail indices are only ever accessed
+    // through atomic operations on both the kernel and user side, so an
+    // acquire load is well defined and pairs with the kernel's release store.
+    unsafe { AtomicU32::from_ptr(ptr).load(Ordering::Acquire) }
+}
+
+fn load_relaxed(ptr: *mut u32) -> u32 {
+    // SAFETY: see `load_acquire`. Relaxed is used for the index this side owns
+    // (our own producer/consumer cursor) and for the constant ring mask.
+    unsafe { AtomicU32::from_ptr(ptr).load(Ordering::Relaxed) }
+}
+
+fn store_relaxed(ptr: *mut u32, value: u32) {
+    // SAFETY: see `load_acquire`. The sq_array slot write is ordered before the
+    // sq_tail release store below, which publishes it to the kernel.
+    unsafe { AtomicU32::from_ptr(ptr).store(value, Ordering::Relaxed) };
+}
+
+fn store_release(ptr: *mut u32, value: u32) {
+    // SAFETY: see `load_acquire`. A release store publishes every prior write
+    // (the SQE payload and sq_array slot, or the consumed CQE) to the kernel's
+    // matching acquire load of the same shared index.
+    unsafe { AtomicU32::from_ptr(ptr).store(value, Ordering::Release) };
 }
 
 fn write_u32(ptr: *mut u32, value: u32) {
-    // SAFETY: ring offset pointers point into live kernel-provided mappings.
+    // SAFETY: `ptr` points to an aligned u32 field inside an SQE payload (not a
+    // shared ring index). The write is published to the kernel by the
+    // release store of the SQ tail in `prepare_sqe`.
     unsafe { ptr.write_volatile(value) };
 }
 
@@ -2576,6 +2728,77 @@ mod tests {
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
         assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
         assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
+    }
+
+    #[test]
+    fn shutdown_drain_completes_and_records_outcome() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let (read_fd, write_fd) = super::super::create_pipe().unwrap();
+        write_bytes(write_fd.raw(), b"uring");
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(wake_count);
+        let mut context = Context::from_waker(&waker);
+
+        {
+            let mut future = IoUringReadFuture::queue(
+                Rc::clone(&dispatcher),
+                read_fd.raw(),
+                vec![0; 5],
+                u64::MAX,
+            )
+            .unwrap();
+            assert!(matches!(
+                Pin::new(&mut future).poll(&mut context),
+                Poll::Pending
+            ));
+        }
+        assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 1);
+
+        let outcome = dispatcher.borrow_mut().shutdown_drain(8);
+        assert_eq!(outcome.status, super::IoUringShutdownDrainStatus::Completed);
+        assert_eq!(outcome.leaked_buffers, 0);
+
+        let snapshot = dispatcher.borrow().snapshot();
+        assert!(snapshot.is_idle());
+        assert_eq!(snapshot.deferred_buffers, 0);
+        assert_eq!(
+            snapshot.shutdown_drain.expect("outcome recorded").status,
+            super::IoUringShutdownDrainStatus::Completed
+        );
+    }
+
+    #[test]
+    fn shutdown_drain_skips_while_wakers_are_registered() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let dispatcher = IoUringDispatcher::new(ring).into_shared();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = counting_waker(wake_count);
+        let mut context = Context::from_waker(&waker);
+
+        let mut future =
+            IoUringOperationFuture::queue_timeout(Rc::clone(&dispatcher), Duration::from_secs(30))
+                .unwrap();
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(dispatcher.borrow().snapshot().registered_wakers, 1);
+
+        let outcome = dispatcher.borrow_mut().shutdown_drain(8);
+        assert_eq!(
+            outcome.status,
+            super::IoUringShutdownDrainStatus::SkippedLiveWakers
+        );
+        assert_eq!(outcome.dispatched, 0);
+        assert_eq!(outcome.leaked_buffers, 0);
+
+        drop(future);
+        dispatcher.borrow_mut().drain_until_idle(8).unwrap();
     }
 
     #[test]

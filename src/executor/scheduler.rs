@@ -5,6 +5,7 @@
 //! point between ready-task polling, timer expiry, I/O readiness wakeups,
 //! and Linux `io_uring` completion dispatch.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use std::time::{Duration, Instant};
@@ -34,6 +35,7 @@ use super::{ExecutorSnapshot, SchedulingGroupId, SpawnError, TaskId, TaskWait};
 pub(super) struct Scheduler {
     id: ExecutorId,
     state: Mutex<SchedulerState>,
+    stopping: AtomicBool,
     #[cfg(unix)]
     waker: OsWaker,
 }
@@ -66,6 +68,7 @@ impl Scheduler {
                 io_uring_status: IoUringExecutorStatus::NotStarted,
                 counters: SchedulerCounters::default(),
             }),
+            stopping: AtomicBool::new(false),
             #[cfg(unix)]
             waker,
         }
@@ -73,6 +76,21 @@ impl Scheduler {
 
     pub(super) fn id(&self) -> ExecutorId {
         self.id
+    }
+
+    /// Requests that the executor run loop stop as soon as possible, even if
+    /// runnable or pending tasks remain. The reactor is woken so a blocked idle
+    /// wait returns promptly. Remaining task futures are dropped when the
+    /// executor is dropped (or [`Scheduler::close`] runs). Used by forced
+    /// shutdown paths.
+    pub(super) fn request_stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.wake_reactor();
+    }
+
+    /// Returns whether a stop has been requested.
+    pub(super) fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
     }
 
     pub(super) fn allocate_task_id(&self) -> TaskId {

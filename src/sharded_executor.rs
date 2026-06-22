@@ -10,6 +10,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::error::ShardError;
 use crate::executor::{
@@ -29,6 +30,10 @@ pub use join::{
 };
 
 static NEXT_RUNTIME_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Polling interval used while waiting for shard threads to finish during a
+/// bounded shutdown. Kept small so shutdown stays responsive.
+const SHUTDOWN_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShardedExecutorId(usize);
@@ -285,6 +290,29 @@ struct AsyncShard {
     thread_name: String,
     cpu_placement: CpuPlacementStatus,
     spawner: Option<Spawner>,
+    observer: ExecutorObserver,
+}
+
+/// Outcome of a bounded [`ShardedExecutor::shutdown_timeout`] or
+/// [`ShardedExecutor::stop_timeout`].
+#[must_use]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShardedShutdownOutcome {
+    forced_shards: Vec<ShardId>,
+}
+
+impl ShardedShutdownOutcome {
+    /// Returns whether any shard had to be forcibly stopped because it did not
+    /// drain within the timeout.
+    pub fn was_forced(&self) -> bool {
+        !self.forced_shards.is_empty()
+    }
+
+    /// Returns the shards that were forcibly stopped at the deadline, in shard
+    /// order.
+    pub fn forced_shards(&self) -> &[ShardId] {
+        &self.forced_shards
+    }
 }
 
 impl ShardedExecutor {
@@ -334,6 +362,7 @@ impl ShardedExecutor {
                 .cpu_placement
                 .cpu_for_shard(shard_idx, &available_cpus);
             let (executor, spawner) = executor_and_spawner();
+            let observer = executor.observer();
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
 
             let join = match thread::Builder::new()
@@ -378,6 +407,7 @@ impl ShardedExecutor {
                 thread_name,
                 cpu_placement,
                 spawner: Some(spawner),
+                observer,
             });
             joins.push(join);
         }
@@ -898,6 +928,53 @@ impl ShardedExecutor {
         }
 
         join_all(self.joins.drain(..).collect())
+    }
+
+    /// Stops all owned shard executors, waiting up to `timeout` for them to
+    /// drain gracefully before forcing any that have not finished.
+    ///
+    /// Like [`ShardedExecutor::shutdown`], this drops the owned spawners so
+    /// idle shards drain and exit. It then waits up to `timeout` for every
+    /// shard thread to finish. Any shard still running when the deadline
+    /// elapses is forcibly stopped: its run loop is signaled to exit and its
+    /// remaining task futures are dropped. This bounds shutdown even when a
+    /// spawned task never yields or never completes.
+    ///
+    /// Drop any [`ShardedSubmitter`] handles before calling this; outstanding
+    /// submitters keep submission open and can keep shards busy. The returned
+    /// [`ShardedShutdownOutcome`] reports which shards, if any, had to be
+    /// forced.
+    pub fn shutdown_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ShardedShutdownOutcome, ShardError> {
+        for shard in &mut self.shards {
+            shard.spawner.take();
+        }
+
+        let deadline = Instant::now() + timeout;
+        while !self.joins.iter().all(thread::JoinHandle::is_finished) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            thread::sleep(SHUTDOWN_TIMEOUT_POLL_INTERVAL.min(remaining));
+        }
+
+        let mut forced_shards = Vec::new();
+        for (shard, join) in self.shards.iter().zip(self.joins.iter()) {
+            if !join.is_finished() && shard.observer.request_stop() {
+                forced_shards.push(shard.shard_id);
+            }
+        }
+
+        join_all(self.joins.drain(..).collect())?;
+        Ok(ShardedShutdownOutcome { forced_shards })
+    }
+
+    /// Consuming variant of [`ShardedExecutor::shutdown_timeout`].
+    pub fn stop_timeout(mut self, timeout: Duration) -> Result<ShardedShutdownOutcome, ShardError> {
+        self.shutdown_timeout(timeout)
     }
 
     fn spawner_for(&self, shard_id: ShardId) -> Result<&Spawner, ShardedSpawnError> {
@@ -1569,6 +1646,37 @@ mod tests {
             ShardedExecutor::start(0).unwrap_err().to_string(),
             "shard count must be greater than zero"
         );
+    }
+
+    #[test]
+    fn shutdown_timeout_forces_uncooperative_shard() {
+        let mut runtime = ShardedExecutor::start(2).unwrap();
+        // A task that is polled once, returns Pending, and never registers a
+        // waker: it can never complete, so a plain shutdown would hang.
+        runtime
+            .spawn_on(ShardId(0), std::future::pending::<()>())
+            .unwrap();
+
+        let started = Instant::now();
+        let outcome = runtime.shutdown_timeout(Duration::from_millis(50)).unwrap();
+
+        // Shutdown must be bounded, not hang on the uncooperative task.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown_timeout did not return promptly"
+        );
+        assert!(outcome.was_forced());
+        assert!(outcome.forced_shards().contains(&ShardId(0)));
+    }
+
+    #[test]
+    fn stop_timeout_completes_without_forcing_idle_shards() {
+        let runtime = ShardedExecutor::start(2).unwrap();
+
+        let outcome = runtime.stop_timeout(Duration::from_secs(5)).unwrap();
+
+        assert!(!outcome.was_forced());
+        assert!(outcome.forced_shards().is_empty());
     }
 
     #[test]

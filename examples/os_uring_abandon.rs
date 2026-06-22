@@ -11,7 +11,6 @@ fn main() -> std::io::Result<()> {
     use std::future::Future;
     use std::pin::Pin;
     use std::rc::Rc;
-    use std::sync::Arc;
     use std::task::Context;
     use std::time::Duration;
 
@@ -25,8 +24,7 @@ fn main() -> std::io::Result<()> {
     let mut future =
         IoUringOperationFuture::queue_timeout(Rc::clone(&dispatcher), Duration::from_secs(30))?;
     let operation = future.operation();
-    let waker: std::task::Waker = Arc::new(NoopWake).into();
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(std::task::Waker::noop());
 
     assert!(Pin::new(&mut future).poll(&mut context).is_pending());
     drop(future);
@@ -69,14 +67,6 @@ fn main() -> std::io::Result<()> {
     assert_eq!(drained.total_discarded_operation_kinds.cancellations, 1);
 
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-struct NoopWake;
-
-#[cfg(target_os = "linux")]
-impl std::task::Wake for NoopWake {
-    fn wake(self: std::sync::Arc<Self>) {}
 }
 
 #[cfg(not(target_os = "linux"))]

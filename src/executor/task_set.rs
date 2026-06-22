@@ -16,6 +16,10 @@ use super::types::{
 };
 use super::{SpawnError, TaskId};
 
+/// Compact the weak-task list only once it has grown to at least this many
+/// entries. Below this it is cheaper to leave dead references in place.
+const TASK_SET_COMPACTION_MIN: usize = 64;
+
 #[derive(Debug)]
 pub(super) struct SchedulerTaskSet {
     groups: Vec<SchedulerGroup>,
@@ -113,6 +117,7 @@ impl SchedulerTaskSet {
         };
 
         self.task_count += 1;
+        self.maybe_compact_tasks();
         self.tasks.push(Arc::downgrade(&task));
         self.groups[group_idx].queue.push_back(task);
         Ok(())
@@ -183,6 +188,17 @@ impl SchedulerTaskSet {
     pub(super) fn finish_task(&mut self) -> bool {
         self.task_count = self.task_count.saturating_sub(1);
         self.is_drained()
+    }
+
+    /// Drops dead weak task references once they meaningfully outnumber live
+    /// tasks. This keeps `tasks` bounded by the live task count for a
+    /// long-running executor that churns short-lived tasks, instead of growing
+    /// without bound until [`SchedulerTaskSet::close`]. The check is cheap and
+    /// the retain is amortized O(1) per spawn.
+    fn maybe_compact_tasks(&mut self) {
+        if self.tasks.len() >= TASK_SET_COMPACTION_MIN && self.tasks.len() > self.task_count * 2 {
+            self.tasks.retain(|task| task.strong_count() > 0);
+        }
     }
 
     pub(super) fn snapshot(&self) -> SchedulerTaskSnapshot {
@@ -331,6 +347,27 @@ mod tests {
 
         assert!(tasks.schedule_new(Arc::clone(&task)).is_err());
         assert!(task.mark_queued());
+    }
+
+    #[test]
+    fn dead_task_weak_references_are_compacted() {
+        let mut tasks = SchedulerTaskSet::new();
+
+        for id in 0..10_000 {
+            let task = task(id);
+            tasks.schedule_new(Arc::clone(&task)).unwrap();
+            let queued = tasks.next_task().expect("task is queued");
+            drop(queued);
+            drop(task);
+            tasks.finish_task();
+        }
+
+        // Without compaction this vector would hold ~10_000 dead weak refs.
+        assert!(
+            tasks.snapshot().tasks.len() <= TASK_SET_COMPACTION_MIN,
+            "weak task references were not compacted: {}",
+            tasks.snapshot().tasks.len()
+        );
     }
 
     #[test]

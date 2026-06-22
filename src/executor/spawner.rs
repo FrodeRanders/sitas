@@ -39,6 +39,22 @@ impl ExecutorObserver {
             .upgrade()
             .map(|scheduler| scheduler.snapshot())
     }
+
+    /// Requests that the observed executor stop its run loop as soon as
+    /// possible, even if tasks are still pending.
+    ///
+    /// Returns `true` if the executor was still alive and the stop was
+    /// signaled, or `false` if it has already shut down. This is used by forced
+    /// shutdown paths to unblock an executor whose tasks are not cooperating.
+    pub fn request_stop(&self) -> bool {
+        match self.scheduler.upgrade() {
+            Some(scheduler) => {
+                scheduler.request_stop();
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Error returned when a task cannot be submitted to an executor.

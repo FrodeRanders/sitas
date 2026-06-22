@@ -12,7 +12,7 @@
 - small safe APIs over isolated unsafe/OS-specific mechanisms;
 - dependency-light runtime experimentation.
 
-The project started with a standard-library-only sharded key-value store. That baseline remains the semantic reference. Newer branches extend it with a custom executor, Unix readiness primitives, TCP helpers, sharded async execution, shard-local values, observability snapshots, CPU placement, and experimental Linux `io_uring` support.
+The project started with a standard-library-only sharded key-value store. That baseline remains the semantic reference. Newer branches extend it with a custom executor, Unix readiness primitives, TCP helpers, sharded async execution, shard-local values, observability snapshots, CPU placement, and Linux `io_uring` support.
 
 ## 2. Architectural invariants
 
@@ -154,7 +154,7 @@ Current responsibilities:
 - fallback non-Linux Unix `poll` readiness waiting;
 - cloneable `OsWaker`;
 - blocking `OsReactor::wait` that can be woken by the pipe;
-- experimental Linux `io_uring` operations and dispatcher support.
+- Linux `io_uring` operations, owned-buffer futures, and dispatcher support.
 
 This layer is smaller than a full production reactor. It establishes the FFI boundary and wake/readiness mechanisms before deeper `io_uring` integration.
 
@@ -433,13 +433,15 @@ Snapshots support simple progress views without a logging framework, Tokio conso
 
 ### Executor tasks
 
-Executor shutdown tracks spawned tasks, clears timer/readiness registrations, and drops pending task futures. Dropping futures is the normal cancellation path, so timer and readiness cleanup must be implemented through `Drop` where necessary.
+Executor shutdown tracks spawned tasks, clears timer/readiness registrations, and drops pending task futures. Dropping futures is the normal cancellation path, so timer and readiness cleanup must be implemented through `Drop` where necessary. The scheduler keeps every spawned task in a weak-reference list for observability; it opportunistically compacts dead entries from that list so a long-running executor that churns short-lived tasks keeps the list bounded by the live task count rather than growing without bound until teardown.
 
 `TaskScope` provides cooperative shutdown for grouped children. If bounded shutdown times out, still-owned children may be aborted.
 
 ### Sharded executor
 
 Stopping the sharded executor requires dropping owned spawners/submitters and joining shard executor threads. Submitters are explicit lifetime capabilities and can keep the runtime alive if retained.
+
+`shutdown`/`stop` drain cooperatively and will wait indefinitely for a task that never completes. `shutdown_timeout(duration)` and its consuming variant `stop_timeout(duration)` bound this: they drop the owned spawners, wait up to `duration` for shards to drain, then forcibly stop any shard still running by signaling its executor run loop to exit (via a scheduler stop flag plus a reactor wake) and dropping its remaining task futures. The returned `ShardedShutdownOutcome` reports which shards, if any, were forced, so an uncooperative task cannot hang teardown.
 
 ## 9. I/O readiness model
 
@@ -456,7 +458,7 @@ The readiness path is small:
 - readiness wakes the interested task;
 - the operation retries.
 
-This is readiness-based, not completion-based. It is separate from the experimental `io_uring` path.
+This is readiness-based, not completion-based. It is separate from the `io_uring` completion path.
 
 Linux uses `epoll`. macOS and iOS use `kqueue`. Other non-Linux Unix targets
 currently use `poll`.
@@ -467,11 +469,12 @@ completion-based `io_uring` operations.
 
 ## 10. Linux `io_uring` model
 
-The Linux `io_uring` backend is experimental. It now has a narrow executor
-integration for owned-buffer `read_at`, `read_exact_at`, and `write_at` style
-file I/O. This is enough for shard tasks to await completion-based file
-operations without using the separate `block_on_io_uring` bridge. It is still
-not the production I/O engine for all sharded executor work.
+The Linux `io_uring` backend is a supported part of the runtime. It has a
+narrow executor integration for owned-buffer `read_at`, `read_exact_at`, and
+`write_at` style file I/O. This is enough for shard tasks to await
+completion-based file operations without using the separate `block_on_io_uring`
+bridge. It is not yet the single unified I/O engine for all sharded executor
+work; readiness, timers, and `io_uring` remain distinct wait sources.
 
 Each Linux executor run loop installs a thread-local `IoUringDispatcher` when
 the host allows `io_uring_setup`. Executor-backed `io_uring` futures store only
@@ -568,6 +571,10 @@ dispatch_available()
 
 The dispatcher keeps abandoned owned read/write buffers alive until the matching kernel completion is dispatched. This is the safety boundary for owned-buffer futures: dropping the future must not free memory that the kernel may still read from or write to.
 
+Dropping the dispatcher itself preserves the same boundary. A single `IoUringDispatcher::shutdown_drain` routine implements the teardown policy and is shared by explicit shutdown, the executor integration, and `Drop`. It first makes a bounded attempt to drive remaining operations to completion so their buffers are freed normally. If the bounded attempt cannot confirm completion, the deferred buffers backing operations the kernel may still touch are leaked rather than freed, because the ring descriptor and mmaps are torn down immediately afterward. The rule is drain-or-leak, never free while an operation is in flight: leaking an allocation is recoverable, a kernel write to freed memory is not. Confirmed-idle teardown frees everything normally and leaks nothing. When live task wakers are still registered the drain is skipped entirely, because those buffers belong to live futures that release them on drop. The outcome, including a `leaked_buffers` count, is recorded and exposed through the dispatcher snapshot, so a leak is observable rather than silent; `Drop` additionally logs a warning in debug builds when it has to leak.
+
+Shared SQ/CQ ring indices are accessed as atomics: the submitter releases the SQ tail and the consumer acquires the CQ tail, pairing with the kernel's matching acquire/release so SQE payloads and posted CQEs are observed in order on weakly-ordered targets, not only on x86.
+
 ### Snapshot semantics
 
 Raw ring snapshot fields represent live ring state:
@@ -583,8 +590,10 @@ Dispatcher snapshot fields represent async-facing live and historical state:
 - completed operations buffered for futures;
 - abandoned operations;
 - deferred buffers;
-- optional executor shutdown drain outcome, including status, wait budget, and
-  completions dispatched during the drain;
+- optional executor shutdown drain outcome, including status, wait budget,
+  completions dispatched during the drain, and the number of owned buffers
+  leaked (non-zero only when the drain timed out with operations still in
+  flight);
 - total dispatched operations;
 - total buffered operations;
 - total woken operations;
@@ -600,8 +609,9 @@ The current architecture does not yet aim to provide:
 - persistence;
 - distributed clustering;
 - procedural macro service generation;
-- production-grade unified `io_uring`/timer/readiness integration for the
-  sharded executor (experimental integration exists but is staged, not unified);
+- a single unified `io_uring`/timer/readiness event source for the
+  sharded executor (the per-shard `io_uring` integration is supported, but one
+  combined production wait primitive is still future work);
 - generic load balancing;
 - production-grade Seastar-like scheduling/resource classes;
 - a stable public runtime API;
@@ -610,6 +620,7 @@ The current architecture does not yet aim to provide:
 CPU placement exists as an experimental Linux-supported runtime request. Portable production CPU placement and richer scheduling policy remain future work.
 
 Removed from non-goals (now implemented):
+- per-shard Linux `io_uring` integration (owned-buffer read/write futures, dispatcher lifecycle tracking, atomic SQ/CQ ordering, and drain-or-leak teardown safety; a single unified event source remains future work);
 - broader BSD `kqueue` support beyond macOS/iOS (NetBSD/FreeBSD/OpenBSD `kqueue` now supported);
 - generic `Sharded<T>` abstraction (evaluated and provided as opt-in generic infrastructure);
 - streaming/chunked responses (stream reply channels available);

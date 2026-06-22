@@ -118,7 +118,7 @@ impl Executor {
         loop {
             self.drive_ready_work();
 
-            if self.scheduler.is_drained() {
+            if self.scheduler.is_drained() || self.scheduler.is_stopping() {
                 break;
             }
 

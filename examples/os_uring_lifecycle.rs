@@ -12,7 +12,6 @@ fn main() -> std::io::Result<()> {
     use std::future::Future;
     use std::pin::Pin;
     use std::rc::Rc;
-    use std::sync::Arc;
     use std::task::Context;
     use std::time::Duration;
 
@@ -23,8 +22,7 @@ fn main() -> std::io::Result<()> {
     };
 
     let dispatcher = IoUringDispatcher::new(ring).into_shared();
-    let waker: std::task::Waker = Arc::new(NoopWake).into();
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(std::task::Waker::noop());
 
     let mut normal = IoUringOperationFuture::queue_nop(Rc::clone(&dispatcher))?;
     let normal_operation = normal.operation();
@@ -85,14 +83,6 @@ fn print_snapshot(label: &str, snapshot: &sitas::os::IoUringDispatcherSnapshot) 
         snapshot.total_woken_operations,
         snapshot.total_discarded_operations
     );
-}
-
-#[cfg(target_os = "linux")]
-struct NoopWake;
-
-#[cfg(target_os = "linux")]
-impl std::task::Wake for NoopWake {
-    fn wake(self: std::sync::Arc<Self>) {}
 }
 
 #[cfg(not(target_os = "linux"))]

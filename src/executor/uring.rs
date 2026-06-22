@@ -386,6 +386,7 @@ pub(super) fn shutdown_current(
                     status: IoUringShutdownDrainStatus::SkippedLiveWakers,
                     max_waits: EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS,
                     dispatched: 0,
+                    leaked_buffers: 0,
                 });
                 return (IoUringExecutorStatus::Installed, Some(snapshot));
             }
@@ -424,55 +425,12 @@ fn shutdown_current_if_idle() {
 }
 
 fn shutdown_dispatcher(dispatcher: &mut IoUringDispatcher) -> IoUringDispatcherSnapshot {
-    let mut dispatched = 0;
-    let status = if dispatcher.snapshot().registered_wakers > 0 {
-        IoUringShutdownDrainStatus::SkippedLiveWakers
-    } else {
-        dispatched += dispatcher.dispatch_available();
-        if dispatcher.is_idle() {
-            IoUringShutdownDrainStatus::Completed
-        } else {
-            drain_shutdown_dispatcher(dispatcher, &mut dispatched)
-        }
-    };
-
-    let mut snapshot = dispatcher.snapshot();
-    snapshot.shutdown_drain = Some(IoUringShutdownDrainSnapshot {
-        status,
-        max_waits: EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS,
-        dispatched,
-    });
-    snapshot
-}
-
-fn drain_shutdown_dispatcher(
-    dispatcher: &mut IoUringDispatcher,
-    dispatched: &mut usize,
-) -> IoUringShutdownDrainStatus {
-    for _ in 0..EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS {
-        let snapshot = dispatcher.snapshot();
-        if snapshot.ring.pending_submissions == 0
-            && snapshot.ring.pending_completions == 0
-            && snapshot.ring.tracked_operations == 0
-        {
-            break;
-        }
-
-        match dispatcher.wait_and_dispatch(1) {
-            Ok(count) => *dispatched += count,
-            Err(_) => return IoUringShutdownDrainStatus::TimedOut,
-        }
-
-        if dispatcher.is_idle() {
-            return IoUringShutdownDrainStatus::Completed;
-        }
-    }
-
-    if dispatcher.is_idle() {
-        IoUringShutdownDrainStatus::Completed
-    } else {
-        IoUringShutdownDrainStatus::TimedOut
-    }
+    // Delegate to the dispatcher's single drain-or-leak routine. The outcome
+    // (including any leaked-buffer count) is recorded into the dispatcher and
+    // surfaced through its snapshot, so executor teardown, explicit shutdown,
+    // and `Drop` all share one implementation.
+    let _ = dispatcher.shutdown_drain(EXECUTOR_IO_URING_SHUTDOWN_DRAIN_WAITS);
+    dispatcher.snapshot()
 }
 
 pub(super) fn dispatch_available() -> usize {

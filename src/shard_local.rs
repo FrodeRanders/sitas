@@ -5,7 +5,7 @@
 //! is being polled on that shard, and no reference to `T` can escape the
 //! closure.
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -55,13 +55,16 @@ impl<T> Clone for ShardLocalSlot<T> {
 
 struct ShardLocalCell<T> {
     owner: ShardId,
+    borrowed: Cell<bool>,
     value: UnsafeCell<T>,
 }
 
 // Safety: `ShardLocalCell` only exposes access through `with_mut`, which checks
-// that the current executor shard is the owner. The public `ShardLocal` API
-// schedules every access closure onto that owner shard and does not let
-// references to `T` escape the closure.
+// that the current executor shard is the owner and uses a `borrowed` flag to
+// reject re-entrant access that would otherwise alias `&mut T`. The public
+// `ShardLocal` API schedules every access closure onto that owner shard and
+// does not let references to `T` escape the closure, so the `value` cell and
+// the `borrowed` flag are only ever touched from the single owner shard thread.
 unsafe impl<T: Send> Send for ShardLocalCell<T> {}
 unsafe impl<T: Send> Sync for ShardLocalCell<T> {}
 
@@ -81,6 +84,7 @@ where
                     shard_id,
                     cell: Arc::new(ShardLocalCell {
                         owner: shard_id,
+                        borrowed: Cell::new(false),
                         value: UnsafeCell::new(make_value(shard_id)),
                     }),
                 }
@@ -685,9 +689,36 @@ impl<T> ShardLocalCell<T> {
             "shard-local value accessed from the wrong executor shard"
         );
 
-        // Safety: access is routed to the owner shard by ShardLocal. The
+        // Reject re-entrant access on the same shard. Without this check a
+        // closure that accessed the same shard-local value again (for example
+        // by calling `with_current` inside another `with_current` closure)
+        // would obtain a second `&mut T` while the first is still live, which
+        // is undefined behavior. The flag is reset by `BorrowGuard::drop`, so a
+        // panic that unwinds through `operation` (and is later caught by the
+        // executor task) leaves the cell usable rather than permanently locked.
+        assert!(
+            !self.borrowed.replace(true),
+            "shard-local value accessed re-entrantly on the same shard"
+        );
+        let _guard = BorrowGuard {
+            borrowed: &self.borrowed,
+        };
+
+        // Safety: access is routed to the owner shard by ShardLocal, the
+        // owner-shard assertion confirms single-thread access, and the
+        // `borrowed` flag guarantees there is no other live `&mut T`. The
         // closure is synchronous, so `&mut T` cannot be held across an await.
         operation(unsafe { &mut *self.value.get() })
+    }
+}
+
+struct BorrowGuard<'a> {
+    borrowed: &'a Cell<bool>,
+}
+
+impl Drop for BorrowGuard<'_> {
+    fn drop(&mut self) {
+        self.borrowed.set(false);
     }
 }
 
@@ -800,6 +831,36 @@ mod tests {
 
         let values = block_on(local.map_all(|_shard_id, value| *value)).unwrap();
         assert_eq!(values, vec![(ShardId(0), 5), (ShardId(1), 5)]);
+
+        drop(local);
+        drop(submitter);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn reentrant_shard_local_access_panics_without_aliasing() {
+        let runtime = ShardedExecutor::start(1).unwrap();
+        let submitter = runtime.submitter();
+        let local = ShardLocal::new(submitter.clone(), |_| 0usize);
+        let task_local = local.clone();
+
+        let handle = submitter
+            .submit_with_handle_to(ShardId(0), async move {
+                task_local.with_current(|_, _outer| {
+                    // Re-entering the same shard-local value would alias
+                    // `&mut T`; the borrow guard must reject it.
+                    let _ = task_local.with_current(|_, _inner| {});
+                })
+            })
+            .unwrap();
+
+        let error = block_on(handle).expect_err("re-entrant access must fail");
+        assert!(error.is_panic(), "expected a panic, got {error:?}");
+
+        // The runtime must still be usable: the borrow guard resets the flag on
+        // unwind so later access on the same value succeeds.
+        let values = block_on(local.map_all(|_shard_id, value| *value)).unwrap();
+        assert_eq!(values, vec![(ShardId(0), 0)]);
 
         drop(local);
         drop(submitter);
