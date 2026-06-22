@@ -107,6 +107,23 @@ Senders use an atomic refcount so intermediate clone drops do not prematurely si
 
 `shard_mailbox` provides typed owned-message transfer between executor shards. A `ShardMailboxSet<M>` owns one bounded inbound mailbox per shard. Cloneable `ShardSender<M>` handles may enqueue owned `M: Send + 'static` values for a target shard, while a single `ShardReceiver<M>` drains that target shard's queue. `ShardSender` provides non-blocking `try_send` (returning `Full(M)` or `Closed(M)` on failure with the original owned message) and awaitable `send` (parking until capacity is available or the receiver closes). For non-uniform work assignment, `WorkUnitMailboxSet<N, M>` maps logical work-unit names to independently assigned shard-local receivers; multiple work units may run on one shard and some shards may have no work unit for a given protocol. `UniformShardRouter` keeps the original key-to-`ShardId` route explicit, while `WorkUnitRouter<N>` routes keys to logical names before placement resolves those names to shards. The mailbox is a transport boundary, not shared application state: producers transfer ownership and only receiver tasks running on the owning shard should mutate the state associated with received messages. Mailbox snapshots are owned values that expose queue length, capacity, close state, sender count, send waiter count, and send/receive/rejection counters without exposing message references or queue internals.
 
+#### Cache behavior of cross-shard movement
+
+Shard-local ownership improves cache behavior by keeping each service's mutable working set hot on the core that owns it. Cross-shard messaging does not eliminate hardware movement; it makes that movement explicit. When shard A constructs an owned message and sends it to shard B, the cache lines containing the message payload are likely hot on A. When B receives and reads the message, those cache lines must be fetched into B's cache hierarchy, possibly by cache-coherence transfer from A or by refetch from memory.
+
+Mailbox queues also contain shared runtime metadata. Producer and consumer positions, readiness flags, waiter state, counters, and close state may be touched by different cores. If those fields share cache lines or are updated at high frequency, the cache line can bounce between cores even though application state itself remains shard-local. Multiple producers targeting one inbound queue can make the producer-side metadata especially hot.
+
+The architectural rule is therefore not "messages are free". It is: application state does not suffer uncontrolled cache-line contention because only the owning shard mutates it. Mailbox transfer still pays for payload cache-line migration, synchronization on queue metadata, possible allocator effects, and memory bandwidth. Large owned payloads should usually be batched, partitioned by route, or represented by compact commands plus owned buffers when that reduces repeated cross-core traffic.
+
+Practical guidance:
+
+- keep high-frequency mutation in shard-local state;
+- prefer compact typed commands for hot paths;
+- batch small messages when latency requirements allow it;
+- avoid polling observability snapshots at a rate that turns counters into cache traffic;
+- keep frequently written per-shard or per-queue metadata separated enough to avoid false sharing;
+- treat one heavily targeted inbound mailbox as a possible coherence bottleneck.
+
 #### Performance comparison: mailbox transfer vs file-backed exchange
 
 The `sharded_index_mailbox` and `sharded_index_build` examples build the same sorted secondary index over a fixed-record data file, differing only in how intermediate data crosses shard boundaries. The build example writes per-shard sorted run files and performs multi-round pairwise merge I/O. The mailbox example routes entries by key through owned mailbox messages to logical assembler work units, which sort and write pre-partitioned files before a single k-way merge.

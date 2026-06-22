@@ -146,6 +146,182 @@ router targets or the work-unit placement table, then observing the new
 behavior through owned snapshots and example output.
 \end{notabene}
 
+\section{Cache behavior of shard movement}
+
+The shared-nothing model is often described as a way to improve cache locality.
+That is true, but it is important to be precise about what improves and what
+still costs real hardware traffic.
+
+A shard owns its mutable application state. If a key-value shard repeatedly
+updates its local map, the working set for that map tends to stay in the cache
+hierarchy of the core running that shard. Other shards do not acquire a mutex
+around the map, read its buckets, or update its counters. This avoids a common
+source of coherence traffic: several cores repeatedly invalidating the same
+cache lines while trying to mutate one logical service object.
+
+Cross-shard communication is different. Sending a message transfers ownership
+at the Rust and runtime boundary, but the bytes still move through the machine.
+Suppose shard 0 builds an owned message and sends it to shard 1:
+
+\begin{enumerate}
+    \item Shard 0 writes the message payload and queue slot.
+    \item Shard 0 updates producer-side queue metadata.
+    \item Shard 1 observes that the queue is no longer empty.
+    \item Shard 1 reads the message payload and mutates its own local state.
+\end{enumerate}
+
+The first and fourth steps touch the payload. The cache lines holding the
+payload are likely warm on shard 0 after construction. When shard 1 reads the
+message, those cache lines must become available to shard 1. On a coherent
+processor this can mean transferring a modified line from another core's cache,
+invalidating an old copy, or refetching data through lower cache levels or main
+memory. The type system proves that shard 0 no longer has a borrowed reference
+into the message after transfer, but it does not make the physical cache-line
+movement disappear.
+
+The second and third steps touch mailbox metadata. A bounded mailbox typically
+has queue slots plus small pieces of coordination state: producer and consumer
+positions, capacity accounting, closed flags, waiter lists or wakers, rejection
+counters, and snapshot counters. Those fields are runtime synchronization, not
+shared application state, but they can still be written by different cores. A
+single hot metadata cache line can bounce between cores even when every message
+payload is an owned value.
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={draw=sitasMuted, fill=sitasCodeBackground,
+        minimum width=40mm, minimum height=8mm, font=\footnotesize\ttfamily,
+        rounded corners=1.5pt},
+    metabox/.style={draw=sitasAccent, fill=sitasCodeBackground,
+        minimum width=40mm, minimum height=8mm, font=\footnotesize\ttfamily,
+        rounded corners=1.5pt},
+    arr/.style={->, >=stealth, thick, color=sitasAccent},
+    lbl/.style={font=\tiny\itshape, color=sitasMuted}
+]
+\node[box] (s0) at (-5.5, 0) {Shard 0 cache};
+\node[metabox] (q) at (0, 0) {mailbox metadata};
+\node[box] (s1) at (5.5, 0) {Shard 1 cache};
+\node[box] (payload0) at (-5.5, -1.4) {owned payload};
+\node[box] (payload1) at (5.5, -1.4) {owned payload};
+
+\draw[arr] (s0) -- node[above, lbl] {enqueue / wake} (q);
+\draw[arr] (q) -- node[above, lbl] {dequeue} (s1);
+\draw[arr] (payload0) -- node[below, lbl] {cache-line transfer} (payload1);
+\end{tikzpicture}
+\end{center}
+
+This is the distinction the architecture relies on:
+
+\begin{description}
+    \item[Application state] remains local and is mutated only by the owning
+          shard. This is where the model avoids uncontrolled shared-cache-line
+          contention.
+    \item[Transport state] is allowed to synchronize. Mailboxes, reply handles,
+          wakers, lifecycle flags, and counters may use atomics or locks
+          internally. Their cache behavior matters, but it is confined to the
+          runtime boundary.
+    \item[Transferred values] are owned and type-safe, but they still occupy
+          cache lines and memory bandwidth when consumed on another shard.
+\end{description}
+
+\subsection{Payload size and batching}
+
+Small commands are usually cheap to move, but they can create high metadata
+traffic if sent at very high rates. Large messages reduce per-message overhead
+but can evict useful local data from the receiver's caches. The right shape is
+workload-dependent.
+
+For hot paths, prefer commands that describe the operation compactly and let
+the destination shard perform the mutation locally. When many tiny records
+share the same route, batching them into a \texttt{Vec<T>} can amortize queue
+metadata updates and wakeups. Batching should still preserve ownership: the
+batch is an owned value, and after receipt only the destination shard mutates
+the state associated with it.
+
+Large buffers need a different tradeoff. Sending an owned buffer is semantically
+clean, but the receiving shard will pull the buffer's cache lines into its own
+cache hierarchy. If the producing shard also needs the same data again, the
+program may be better served by routing the work to the shard that already owns
+or will next use the data, rather than bouncing a large working set across
+cores.
+
+\subsection{False sharing}
+
+False sharing occurs when independent fields used by different cores reside on
+the same cache line. For example, a producer-updated counter and a
+consumer-updated counter may be logically separate but physically adjacent. If
+they share a cache line, updates by one core can invalidate the other core's
+copy of the line.
+
+This can affect:
+
+\begin{itemize}
+    \item mailbox producer and consumer indices;
+    \item per-shard progress counters;
+    \item wake flags and closed flags;
+    \item high-frequency observability counters;
+    \item arrays of per-shard statistics where adjacent shards update adjacent
+          entries.
+\end{itemize}
+
+Padding or cache-line alignment is sometimes justified for fields that are
+known to be hot and written by different cores. It should be applied
+selectively: padding every structure makes memory use worse and can reduce
+cache density for data that is mostly read or only touched by one shard.
+
+\subsection{Many producers and one receiver}
+
+An inbound mailbox per shard is clear and predictable, but it can still become
+a coherence hotspot. If many shards send to one target at high frequency, the
+target's inbound queue metadata becomes shared by many producers. The
+application state behind the receiver is still protected by the ownership
+model, but the transport path may limit throughput.
+
+The usual remedies are architectural, not magical queue tricks:
+
+\begin{itemize}
+    \item route data so work is more evenly partitioned;
+    \item combine small messages before sending;
+    \item use logical work units to split one protocol across multiple
+          receivers when the state model allows it;
+    \item avoid request patterns where every shard repeatedly asks one shard to
+          perform tiny mutations;
+    \item return owned summaries rather than repeatedly querying remote state.
+\end{itemize}
+
+\subsection{NUMA and placement}
+
+On multi-socket systems, cache and memory movement may cross a NUMA boundary.
+The cost of sending a message between two cores on the same socket can differ
+from sending between sockets. CPU placement does not by itself solve NUMA
+placement, but it makes the question visible: which shard runs where, and what
+data does it mostly touch?
+
+The project's current CPU placement support is experimental and Linux-focused.
+It can request where shard threads run, but it does not yet provide a complete
+memory-placement policy. The conservative assumption is that cross-shard
+messages have nonzero cost even when placement succeeds, and that cross-socket
+movement may be materially more expensive.
+
+\subsection{What the model buys}
+
+The model does not promise zero-copy communication between arbitrary shards and
+does not make a mailbox free. Its promise is narrower and stronger:
+
+\begin{itemize}
+    \item application state has one mutating owner;
+    \item cross-shard movement is explicit in the API;
+    \item values crossing the boundary are owned;
+    \item runtime synchronization is localized to queues, replies, wakeups, and
+          lifecycle bookkeeping;
+    \item cache-coherence costs are easier to find because they occur at named
+          transfer points rather than hidden shared-state access.
+\end{itemize}
+
+That is why the project treats mailboxes as a transport boundary. They are a
+necessary shared runtime mechanism, but they do not weaken the rule that
+application service state belongs to the receiving shard.
+
 \section{Shard-local values}
 
 \texttt{ShardLocal<T>} owns one value per executor shard. Access is routed to
