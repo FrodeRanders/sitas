@@ -315,6 +315,8 @@ Memory placement is an explicit opt-in runtime request. The default is no memory
 
 This is thread default memory policy, not complete allocator control. It affects future allocations on the shard thread according to kernel policy. The runtime does not yet expose `mbind` for existing address ranges, page migration, or allocator-specific arenas. Those remain future extension points once the basic shard-level policy is observable and testable.
 
+See [`docs/numa-memory-placement.md`](numa-memory-placement.md) for the design analysis connecting NUMA first-touch behavior, Rust owned memory, shard-local initialization, and mailbox payload movement.
+
 Not yet load balancing or scheduling classes. It establishes the shared-nothing async shape: work is owned by a shard thread and moves only through explicit submission.
 
 The `sharded_index_build` example demonstrates this shape on a fixed-record file: each shard scans and sorts one data-file partition into a materialized local index run file, then merge rounds submitted back onto shards stream those run files into new materialized runs before the final sorted offset index is written. Its command-line options can vary record count, shard count, seed, and cleanup behavior, while progress output reports per-shard phase, records, task count, and file bytes read/written.
