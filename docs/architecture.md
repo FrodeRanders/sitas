@@ -288,6 +288,7 @@ Current responsibilities:
 - `start_on_available_cpus` starts one shard per CPU in `available_cpu_ids`;
 - `start_pinned_on_available_cpus` and `start_required_pinned_on_available_cpus` combine one-shard-per-available-CPU sizing with sequential CPU placement;
 - `start_with_config` accepts shard count, thread-name prefix, CPU placement policy, and optional required CPU placement;
+- `start_with_config` also accepts an optional memory placement policy for future shard-thread allocations, with advisory or required startup behavior;
 - shard threads are named predictably, for example `sitas-shard-N`;
 - `spawn_on` places a future on an explicit `ShardId`;
 - `spawn_named_on` gives observable task names;
@@ -300,14 +301,19 @@ Current responsibilities:
   implicit load balancing; grouped helpers are available in both named and
   unnamed forms;
 - `current_executor_shard` exposes the current shard identity from code running on a shard;
-- `current_executor_cpu_placement` exposes that shard thread's observed CPU placement status from code running on a shard;
+- `current_executor_cpu_placement` exposes that shard thread's observed CPU placement status from code running on a shard, including the Linux NUMA node for the pinned CPU when sysfs exposes it;
+- `current_executor_memory_placement` exposes that shard thread's observed memory placement status from code running on a shard;
 - `available_cpu_ids` reports the CPU ids used by sequential placement;
 - `snapshot` returns owned per-shard executor snapshots;
 - `observer` creates a weak monitoring handle;
 - `submitter` creates cloneable cross-shard submission capability;
 - runtime shutdown drops owned spawners and joins executor threads.
 
-CPU placement is an explicit runtime request. Linux applies hard affinity with `sched_setaffinity` and observes container cpuset restrictions through `sched_getaffinity`. Explicit CPU lists are preflighted against `available_cpu_ids` before shard threads start. Non-Linux platforms report unsupported. By default, placement failures are recorded in shard snapshots and startup succeeds. `require_cpu_placement` turns that into fail-fast behavior.
+CPU placement is an explicit runtime request. Linux applies hard affinity with `sched_setaffinity` and observes container cpuset restrictions through `sched_getaffinity`. Explicit CPU lists are preflighted against `available_cpu_ids` before shard threads start. When Linux sysfs exposes CPU-to-node topology, applied placement snapshots also report the NUMA node for the pinned CPU. Non-Linux platforms report unsupported. By default, placement failures are recorded in shard snapshots and startup succeeds. `require_cpu_placement` turns that into fail-fast behavior.
+
+Memory placement is an explicit opt-in runtime request. The default is no memory policy change. On Linux, `MemoryPlacement::Bind`, `Preferred`, `Interleave`, and `LocalToCpu` apply a thread default policy with `set_mempolicy` after CPU placement and before the shard executor runs. `LocalToCpu` resolves to the NUMA node observed for the pinned CPU, so it requires CPU placement to expose a node. Non-Linux platforms report unsupported. By default, memory-placement failures are recorded in shard snapshots and startup succeeds. `require_memory_placement` turns that into fail-fast behavior.
+
+This is thread default memory policy, not complete allocator control. It affects future allocations on the shard thread according to kernel policy. The runtime does not yet expose `mbind` for existing address ranges, page migration, or allocator-specific arenas. Those remain future extension points once the basic shard-level policy is observable and testable.
 
 Not yet load balancing or scheduling classes. It establishes the shared-nothing async shape: work is owned by a shard thread and moves only through explicit submission.
 
@@ -421,7 +427,8 @@ Executor snapshots expose:
   abandoned buffers, cumulative operation-kind counters, and final executor
   shutdown drain outcome when teardown has recorded one;
 - shard thread names;
-- CPU placement status;
+- CPU placement status, including observed NUMA node for applied Linux CPU placement when available;
+- memory placement status;
 - named task states.
 
 `TaskSnapshot` exposes:

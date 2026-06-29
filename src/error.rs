@@ -19,6 +19,10 @@ pub enum ShardError {
     InvalidCpuPlacement(String),
     /// Required CPU placement could not be applied.
     CpuPlacementFailed(String),
+    /// A sharded executor memory placement policy is invalid.
+    InvalidMemoryPlacement(String),
+    /// Required memory placement could not be applied.
+    MemoryPlacementFailed(String),
     /// A non-blocking send found the target shard mailbox full.
     MailboxFull,
     /// Sending a command to a shard mailbox failed.
@@ -46,6 +50,12 @@ impl fmt::Display for ShardError {
             }
             ShardError::CpuPlacementFailed(reason) => {
                 write!(f, "required CPU placement failed: {reason}")
+            }
+            ShardError::InvalidMemoryPlacement(reason) => {
+                write!(f, "invalid memory placement: {reason}")
+            }
+            ShardError::MemoryPlacementFailed(reason) => {
+                write!(f, "required memory placement failed: {reason}")
             }
             ShardError::MailboxFull => write!(f, "shard mailbox is full"),
             ShardError::SendFailed => write!(f, "failed to send command to shard"),

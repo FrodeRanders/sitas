@@ -13,6 +13,11 @@ use std::thread;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CpuId(pub usize);
 
+/// Linux NUMA node identifier observed for a CPU.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NumaNodeId(pub usize);
+
 /// CPU placement policy for sharded executor threads.
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +84,38 @@ impl CpuPlacement {
     }
 }
 
+/// Memory placement policy for future shard-thread allocations.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryPlacement {
+    /// Do not request a memory placement policy.
+    Default,
+    /// Bind future allocations to the NUMA node local to the shard's pinned
+    /// CPU. This requires CPU placement to have reported a NUMA node.
+    LocalToCpu,
+    /// Bind future allocations to a specific NUMA node.
+    Bind(NumaNodeId),
+    /// Prefer a specific NUMA node while allowing kernel fallback.
+    Preferred(NumaNodeId),
+    /// Interleave future allocations across the provided NUMA nodes.
+    Interleave(Vec<NumaNodeId>),
+}
+
+impl MemoryPlacement {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        match self {
+            MemoryPlacement::Interleave(nodes) if nodes.is_empty() => Err(String::from(
+                "interleave placement requires at least one NUMA node",
+            )),
+            MemoryPlacement::Default
+            | MemoryPlacement::LocalToCpu
+            | MemoryPlacement::Bind(_)
+            | MemoryPlacement::Preferred(_)
+            | MemoryPlacement::Interleave(_) => Ok(()),
+        }
+    }
+}
+
 /// Result of applying CPU placement to one shard thread.
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +123,12 @@ pub enum CpuPlacementStatus {
     /// No CPU placement was requested.
     Unpinned,
     /// The shard thread was pinned to the requested CPU.
-    Applied(CpuId),
+    Applied {
+        /// CPU accepted by the OS affinity call.
+        cpu: CpuId,
+        /// NUMA node observed for `cpu`, when the platform exposes it.
+        numa_node: Option<NumaNodeId>,
+    },
     /// This platform does not provide Linux-style hard CPU affinity.
     Unsupported {
         /// CPU requested by the placement policy, if any.
@@ -108,7 +150,7 @@ impl CpuPlacementStatus {
     pub fn requested_cpu(&self) -> Option<CpuId> {
         match self {
             CpuPlacementStatus::Unpinned => None,
-            CpuPlacementStatus::Applied(cpu) => Some(*cpu),
+            CpuPlacementStatus::Applied { cpu, .. } => Some(*cpu),
             CpuPlacementStatus::Unsupported { requested, .. } => *requested,
             CpuPlacementStatus::Failed { requested, .. } => Some(*requested),
         }
@@ -116,7 +158,59 @@ impl CpuPlacementStatus {
 
     /// Returns whether the OS accepted the requested placement.
     pub fn is_applied(&self) -> bool {
-        matches!(self, CpuPlacementStatus::Applied(_))
+        matches!(self, CpuPlacementStatus::Applied { .. })
+    }
+}
+
+/// Result of applying memory placement to one shard thread.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryPlacementStatus {
+    /// No memory placement was requested.
+    Default,
+    /// The OS accepted the requested memory placement.
+    Applied {
+        /// Resolved policy applied to the shard thread.
+        policy: MemoryPlacement,
+    },
+    /// This platform does not provide Linux NUMA memory policy calls.
+    Unsupported {
+        /// Requested memory placement policy.
+        requested: MemoryPlacement,
+        /// Human-readable reason reported by the runtime.
+        reason: String,
+    },
+    /// The runtime attempted placement, but the OS rejected it or the policy
+    /// could not be resolved for this shard.
+    Failed {
+        /// Requested memory placement policy.
+        requested: MemoryPlacement,
+        /// Human-readable OS or runtime error.
+        error: String,
+    },
+}
+
+impl MemoryPlacementStatus {
+    /// Returns whether the OS accepted the requested placement.
+    pub fn is_applied(&self) -> bool {
+        matches!(self, MemoryPlacementStatus::Applied { .. })
+    }
+}
+
+impl fmt::Display for MemoryPlacementStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MemoryPlacementStatus::Default => write!(f, "default memory placement"),
+            MemoryPlacementStatus::Applied { policy } => {
+                write!(f, "memory placement applied: {policy:?}")
+            }
+            MemoryPlacementStatus::Unsupported { requested, reason } => {
+                write!(f, "memory placement {requested:?} unsupported: {reason}")
+            }
+            MemoryPlacementStatus::Failed { requested, error } => {
+                write!(f, "memory placement {requested:?} failed: {error}")
+            }
+        }
     }
 }
 
@@ -124,7 +218,13 @@ impl fmt::Display for CpuPlacementStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CpuPlacementStatus::Unpinned => write!(f, "unpinned"),
-            CpuPlacementStatus::Applied(cpu) => write!(f, "pinned to CPU {}", cpu.0),
+            CpuPlacementStatus::Applied { cpu, numa_node } => {
+                if let Some(node) = numa_node {
+                    write!(f, "pinned to CPU {} on NUMA node {}", cpu.0, node.0)
+                } else {
+                    write!(f, "pinned to CPU {}", cpu.0)
+                }
+            }
             CpuPlacementStatus::Unsupported { requested, reason } => {
                 if let Some(cpu) = requested {
                     write!(f, "CPU {} requested but unsupported: {reason}", cpu.0)
@@ -151,6 +251,11 @@ pub fn available_cpu_ids() -> Vec<CpuId> {
     })
 }
 
+/// Returns the NUMA node observed for `cpu`, when the platform exposes it.
+pub fn numa_node_for_cpu(cpu: CpuId) -> Option<NumaNodeId> {
+    platform::numa_node_for_cpu(cpu)
+}
+
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn current_thread_cpu_ids() -> Option<Vec<CpuId>> {
     platform::available_cpu_ids()
@@ -164,20 +269,74 @@ pub(crate) fn apply_to_current_thread(requested: Option<CpuId>) -> CpuPlacementS
     platform::apply_to_current_thread(cpu)
 }
 
+pub(crate) fn apply_memory_to_current_thread(
+    placement: &MemoryPlacement,
+    cpu_placement: &CpuPlacementStatus,
+) -> MemoryPlacementStatus {
+    let resolved = match placement {
+        MemoryPlacement::Default => return MemoryPlacementStatus::Default,
+        MemoryPlacement::LocalToCpu => {
+            let Some(node) = cpu_placement.numa_node() else {
+                return MemoryPlacementStatus::Failed {
+                    requested: placement.clone(),
+                    error: String::from("pinned CPU NUMA node is unavailable"),
+                };
+            };
+            MemoryPlacement::Bind(node)
+        }
+        MemoryPlacement::Bind(node) => MemoryPlacement::Bind(*node),
+        MemoryPlacement::Preferred(node) => MemoryPlacement::Preferred(*node),
+        MemoryPlacement::Interleave(nodes) => MemoryPlacement::Interleave(nodes.clone()),
+    };
+
+    platform::apply_memory_to_current_thread(placement, resolved)
+}
+
+impl CpuPlacementStatus {
+    fn numa_node(&self) -> Option<NumaNodeId> {
+        match self {
+            CpuPlacementStatus::Applied { numa_node, .. } => *numa_node,
+            CpuPlacementStatus::Unpinned
+            | CpuPlacementStatus::Unsupported { .. }
+            | CpuPlacementStatus::Failed { .. } => None,
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{CpuId, CpuPlacementStatus};
+    use super::{CpuId, CpuPlacementStatus, MemoryPlacement, MemoryPlacementStatus, NumaNodeId};
+    use std::fs;
     use std::io;
     use std::mem;
-    use std::os::raw::{c_int, c_ulong, c_void};
+    use std::os::raw::{c_int, c_long, c_ulong, c_void};
+    use std::path::PathBuf;
 
     const CPU_SETSIZE: usize = 1024;
     const CPU_BITS: usize = usize::BITS as usize;
     const CPU_SET_WORDS: usize = CPU_SETSIZE / CPU_BITS;
+    const NODE_SETSIZE: usize = 1024;
+    const NODE_BITS: usize = c_ulong::BITS as usize;
+    const NODE_SET_WORDS: usize = NODE_SETSIZE / NODE_BITS;
+    const MPOL_DEFAULT: c_int = 0;
+    const MPOL_PREFERRED: c_int = 1;
+    const MPOL_BIND: c_int = 2;
+    const MPOL_INTERLEAVE: c_int = 3;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_SET_MEMPOLICY: c_long = 238;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_SET_MEMPOLICY: c_long = 237;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    const SYS_SET_MEMPOLICY: c_long = -1;
 
     #[repr(C)]
     struct CpuSet {
         bits: [usize; CPU_SET_WORDS],
+    }
+
+    #[repr(C)]
+    struct NodeSet {
+        bits: [c_ulong; NODE_SET_WORDS],
     }
 
     impl CpuSet {
@@ -209,9 +368,30 @@ mod platform {
         }
     }
 
+    impl NodeSet {
+        fn empty() -> Self {
+            Self {
+                bits: [0; NODE_SET_WORDS],
+            }
+        }
+
+        fn set(&mut self, node: NumaNodeId) -> bool {
+            let word_idx = node.0 / NODE_BITS;
+            let bit_idx = node.0 % NODE_BITS;
+
+            if word_idx >= self.bits.len() {
+                return false;
+            }
+
+            self.bits[word_idx] |= (1 as c_ulong) << bit_idx;
+            true
+        }
+    }
+
     unsafe extern "C" {
         fn sched_getaffinity(pid: c_int, cpusetsize: c_ulong, mask: *mut c_void) -> c_int;
         fn sched_setaffinity(pid: c_int, cpusetsize: c_ulong, mask: *const c_void) -> c_int;
+        fn syscall(number: c_long, ...) -> c_long;
     }
 
     pub(super) fn available_cpu_ids() -> Option<Vec<CpuId>> {
@@ -266,10 +446,80 @@ mod platform {
         };
 
         if result == 0 {
-            CpuPlacementStatus::Applied(cpu)
+            CpuPlacementStatus::Applied {
+                cpu,
+                numa_node: numa_node_for_cpu(cpu),
+            }
         } else {
             CpuPlacementStatus::Failed {
                 requested: cpu,
+                error: io::Error::last_os_error().to_string(),
+            }
+        }
+    }
+
+    pub(super) fn numa_node_for_cpu(cpu: CpuId) -> Option<NumaNodeId> {
+        let cpu_dir = PathBuf::from(format!("/sys/devices/system/cpu/cpu{}", cpu.0));
+        let entries = fs::read_dir(cpu_dir).ok()?;
+
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|name| name.strip_prefix("node").map(str::to_owned))
+            .filter_map(|node| node.parse::<usize>().ok())
+            .min()
+            .map(NumaNodeId)
+    }
+
+    pub(super) fn apply_memory_to_current_thread(
+        requested: &MemoryPlacement,
+        resolved: MemoryPlacement,
+    ) -> MemoryPlacementStatus {
+        if SYS_SET_MEMPOLICY < 0 {
+            return MemoryPlacementStatus::Unsupported {
+                requested: requested.clone(),
+                reason: String::from(
+                    "set_mempolicy syscall number is unknown on this Linux architecture",
+                ),
+            };
+        }
+
+        let (mode, nodes): (c_int, Vec<NumaNodeId>) = match &resolved {
+            MemoryPlacement::Default => (MPOL_DEFAULT, Vec::new()),
+            MemoryPlacement::LocalToCpu => unreachable!("LocalToCpu must be resolved first"),
+            MemoryPlacement::Bind(node) => (MPOL_BIND, vec![*node]),
+            MemoryPlacement::Preferred(node) => (MPOL_PREFERRED, vec![*node]),
+            MemoryPlacement::Interleave(nodes) => (MPOL_INTERLEAVE, nodes.clone()),
+        };
+
+        let mut set = NodeSet::empty();
+        for node in nodes {
+            if !set.set(node) {
+                return MemoryPlacementStatus::Failed {
+                    requested: requested.clone(),
+                    error: format!("NUMA node index exceeds supported NODE_SETSIZE {NODE_SETSIZE}"),
+                };
+            }
+        }
+
+        let nodemask = if matches!(resolved, MemoryPlacement::Default) {
+            std::ptr::null()
+        } else {
+            set.bits.as_ptr()
+        };
+
+        // SAFETY: `set_mempolicy` updates the calling thread's default memory
+        // policy through the raw Linux syscall. `nodemask` either points to
+        // the initialized `NodeSet` storage above for the duration of the call
+        // or is null for MPOL_DEFAULT. `NODE_SETSIZE` is the number of node
+        // bits represented by the mask.
+        let result = unsafe { syscall(SYS_SET_MEMPOLICY, mode, nodemask, NODE_SETSIZE as c_ulong) };
+
+        if result == 0 {
+            MemoryPlacementStatus::Applied { policy: resolved }
+        } else {
+            MemoryPlacementStatus::Failed {
+                requested: requested.clone(),
                 error: io::Error::last_os_error().to_string(),
             }
         }
@@ -278,7 +528,7 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
-    use super::{CpuId, CpuPlacementStatus};
+    use super::{CpuId, CpuPlacementStatus, MemoryPlacement, MemoryPlacementStatus, NumaNodeId};
 
     pub(super) fn available_cpu_ids() -> Option<Vec<CpuId>> {
         None
@@ -288,6 +538,20 @@ mod platform {
         CpuPlacementStatus::Unsupported {
             requested: Some(cpu),
             reason: String::from("hard CPU affinity is only implemented on Linux"),
+        }
+    }
+
+    pub(super) fn numa_node_for_cpu(_cpu: CpuId) -> Option<NumaNodeId> {
+        None
+    }
+
+    pub(super) fn apply_memory_to_current_thread(
+        requested: &MemoryPlacement,
+        _resolved: MemoryPlacement,
+    ) -> MemoryPlacementStatus {
+        MemoryPlacementStatus::Unsupported {
+            requested: requested.clone(),
+            reason: String::from("NUMA memory placement is only implemented on Linux"),
         }
     }
 }

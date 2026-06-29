@@ -106,12 +106,13 @@ pub use shard_mailbox::{
 };
 pub use sharded::{ShardService, Sharded, ShardedConfig};
 pub use sharded_executor::{
-    CpuId, CpuPlacement, CpuPlacementStatus, ShardedExecutor, ShardedExecutorConfig,
-    ShardedExecutorObserver, ShardedExecutorShardSnapshot, ShardedExecutorSnapshot,
-    ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
-    ShardedSchedulingGroup, ShardedSchedulingGroupError, ShardedShutdownOutcome, ShardedSpawnError,
-    ShardedSubmitter, available_cpu_ids, available_parallelism, current_executor_cpu_placement,
-    current_executor_shard, join_all_shards, join_all_shards_timeout,
+    CpuId, CpuPlacement, CpuPlacementStatus, MemoryPlacement, MemoryPlacementStatus, NumaNodeId,
+    ShardedExecutor, ShardedExecutorConfig, ShardedExecutorObserver, ShardedExecutorShardSnapshot,
+    ShardedExecutorSnapshot, ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError,
+    ShardedOperationError, ShardedSchedulingGroup, ShardedSchedulingGroupError,
+    ShardedShutdownOutcome, ShardedSpawnError, ShardedSubmitter, available_cpu_ids,
+    available_parallelism, current_executor_cpu_placement, current_executor_memory_placement,
+    current_executor_shard, join_all_shards, join_all_shards_timeout, numa_node_for_cpu,
 };
 #[cfg(unix)]
 pub use sharded_tcp::{

@@ -299,9 +299,20 @@ data does it mostly touch?
 
 The project's current CPU placement support is experimental and Linux-focused.
 It can request where shard threads run, but it does not yet provide a complete
-memory-placement policy. The conservative assumption is that cross-shard
-messages have nonzero cost even when placement succeeds, and that cross-socket
-movement may be materially more expensive.
+memory-placement policy by default. On Linux, applied CPU placement also
+records the NUMA node for the pinned CPU when sysfs exposes that topology.
+Callers that want a memory policy can opt in explicitly. The runtime can apply
+a shard-thread default policy with \texttt{set\_mempolicy}: bind to a specific
+node, prefer a node, interleave across nodes, or bind to the node local to the
+pinned CPU. Required memory placement turns failure into startup failure;
+otherwise the result is recorded in snapshots. The conservative assumption is
+that cross-shard messages have nonzero cost even when placement succeeds, and
+that cross-socket movement may be materially more expensive.
+
+This is not complete allocator control. The policy affects future allocations
+made by the shard thread according to kernel rules. The runtime does not yet
+expose \texttt{mbind} for existing address ranges, page migration, or
+allocator-specific arenas.
 
 \subsection{What the model buys}
 
@@ -392,4 +403,13 @@ reports unsupported rather than pretending that pinning happened.
 The feature is useful even in experimental form because it forces the runtime
 to separate desired placement from observed placement. A shard can report which
 CPU it asked for, which CPU set the host allowed, and whether startup treated
-failure as advisory or fatal.
+failure as advisory or fatal. On Linux, a successfully pinned shard can also
+report the NUMA node associated with its CPU when the host exposes
+\texttt{/sys/devices/system/cpu/cpuN/node*}. That makes CPU and memory-locality
+questions visible to callers choosing an explicit memory-placement policy.
+
+Memory placement follows the same explicit-request model. The default is no
+memory policy change. When requested, Linux applies a thread default memory
+policy after CPU placement and before the shard executor runs. Snapshot fields
+separate CPU placement from memory placement so callers can see whether each
+request was applied, unsupported, or rejected.

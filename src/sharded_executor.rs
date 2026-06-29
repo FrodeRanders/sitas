@@ -23,7 +23,10 @@ use crate::shard::ShardId;
 mod affinity;
 mod join;
 
-pub use affinity::{CpuId, CpuPlacement, CpuPlacementStatus, available_cpu_ids};
+pub use affinity::{
+    CpuId, CpuPlacement, CpuPlacementStatus, MemoryPlacement, MemoryPlacementStatus, NumaNodeId,
+    available_cpu_ids, numa_node_for_cpu,
+};
 pub use join::{
     ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
     ShardedSpawnError, join_all_shards, join_all_shards_timeout,
@@ -125,6 +128,7 @@ impl std::error::Error for ShardedSchedulingGroupError {
 thread_local! {
     static CURRENT_EXECUTOR_SHARD: std::cell::Cell<Option<ShardId>> = const { std::cell::Cell::new(None) };
     static CURRENT_EXECUTOR_CPU_PLACEMENT: std::cell::RefCell<Option<CpuPlacementStatus>> = const { std::cell::RefCell::new(None) };
+    static CURRENT_EXECUTOR_MEMORY_PLACEMENT: std::cell::RefCell<Option<MemoryPlacementStatus>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Returns the shard currently polling this task, if the caller is running on a
@@ -141,6 +145,14 @@ pub fn current_executor_cpu_placement() -> Option<CpuPlacementStatus> {
     CURRENT_EXECUTOR_CPU_PLACEMENT.with(|placement| placement.borrow().clone())
 }
 
+/// Returns the memory placement status observed when the current
+/// [`ShardedExecutor`] shard thread started.
+///
+/// This returns `None` outside sharded executor threads.
+pub fn current_executor_memory_placement() -> Option<MemoryPlacementStatus> {
+    CURRENT_EXECUTOR_MEMORY_PLACEMENT.with(|placement| placement.borrow().clone())
+}
+
 /// Configuration for starting a [`ShardedExecutor`].
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +161,8 @@ pub struct ShardedExecutorConfig {
     thread_name_prefix: String,
     cpu_placement: CpuPlacement,
     require_cpu_placement: bool,
+    memory_placement: MemoryPlacement,
+    require_memory_placement: bool,
 }
 
 impl ShardedExecutorConfig {
@@ -159,6 +173,8 @@ impl ShardedExecutorConfig {
             thread_name_prefix: String::from("sitas-shard"),
             cpu_placement: CpuPlacement::Unpinned,
             require_cpu_placement: false,
+            memory_placement: MemoryPlacement::Default,
+            require_memory_placement: false,
         }
     }
 
@@ -224,6 +240,25 @@ impl ShardedExecutorConfig {
         self
     }
 
+    /// Sets the memory placement policy for future shard-thread allocations.
+    ///
+    /// Linux applies this with `set_mempolicy` after CPU placement and before
+    /// running the shard executor. Other platforms keep the request observable
+    /// but report it as unsupported in shard snapshots.
+    pub fn with_memory_placement(mut self, placement: MemoryPlacement) -> Self {
+        self.memory_placement = placement;
+        self
+    }
+
+    /// Requires requested memory placement to be applied successfully.
+    ///
+    /// Without this, failed or unsupported memory placement is reported in
+    /// shard snapshots but does not prevent the runtime from starting.
+    pub fn require_memory_placement(mut self) -> Self {
+        self.require_memory_placement = true;
+        self
+    }
+
     /// Returns the configured number of executor shards.
     pub fn shard_count(&self) -> usize {
         self.shard_count
@@ -244,6 +279,16 @@ impl ShardedExecutorConfig {
         self.require_cpu_placement
     }
 
+    /// Returns the configured memory placement policy.
+    pub fn memory_placement(&self) -> &MemoryPlacement {
+        &self.memory_placement
+    }
+
+    /// Returns whether requested memory placement must be applied successfully.
+    pub fn is_memory_placement_required(&self) -> bool {
+        self.require_memory_placement
+    }
+
     fn validate(&self) -> Result<(), ShardError> {
         if self.shard_count == 0 {
             return Err(ShardError::InvalidShardCount);
@@ -255,6 +300,10 @@ impl ShardedExecutorConfig {
                 self.shard_count
             )));
         }
+
+        self.memory_placement
+            .validate()
+            .map_err(ShardError::InvalidMemoryPlacement)?;
 
         Ok(())
     }
@@ -289,8 +338,15 @@ struct AsyncShard {
     shard_id: ShardId,
     thread_name: String,
     cpu_placement: CpuPlacementStatus,
+    memory_placement: MemoryPlacementStatus,
     spawner: Option<Spawner>,
     observer: ExecutorObserver,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShardStartStatus {
+    cpu_placement: CpuPlacementStatus,
+    memory_placement: MemoryPlacementStatus,
 }
 
 /// Outcome of a bounded [`ShardedExecutor::shutdown_timeout`] or
@@ -361,6 +417,7 @@ impl ShardedExecutor {
             let requested_cpu = config
                 .cpu_placement
                 .cpu_for_shard(shard_idx, &available_cpus);
+            let memory_placement_request = config.memory_placement.clone();
             let (executor, spawner) = executor_and_spawner();
             let observer = executor.observer();
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
@@ -369,10 +426,19 @@ impl ShardedExecutor {
                 .name(thread_name.clone())
                 .spawn(move || {
                     let cpu_placement = affinity::apply_to_current_thread(requested_cpu);
+                    let memory_placement = affinity::apply_memory_to_current_thread(
+                        &memory_placement_request,
+                        &cpu_placement,
+                    );
                     CURRENT_EXECUTOR_SHARD.set(Some(shard_id));
                     CURRENT_EXECUTOR_CPU_PLACEMENT.replace(Some(cpu_placement.clone()));
-                    let _ = started_sender.send(cpu_placement);
+                    CURRENT_EXECUTOR_MEMORY_PLACEMENT.replace(Some(memory_placement.clone()));
+                    let _ = started_sender.send(ShardStartStatus {
+                        cpu_placement,
+                        memory_placement,
+                    });
                     executor.run();
+                    CURRENT_EXECUTOR_MEMORY_PLACEMENT.replace(None);
                     CURRENT_EXECUTOR_CPU_PLACEMENT.replace(None);
                     CURRENT_EXECUTOR_SHARD.set(None);
                 }) {
@@ -383,8 +449,8 @@ impl ShardedExecutor {
                 }
             };
 
-            let cpu_placement = match started_receiver.recv() {
-                Ok(cpu_placement) => cpu_placement,
+            let start_status = match started_receiver.recv() {
+                Ok(start_status) => start_status,
                 Err(_) => {
                     joins.push(join);
                     Self::cleanup_started_shards(&mut shards, &mut joins);
@@ -394,18 +460,33 @@ impl ShardedExecutor {
 
             if config.require_cpu_placement
                 && requested_cpu.is_some()
-                && !cpu_placement.is_applied()
+                && !start_status.cpu_placement.is_applied()
             {
                 drop(spawner);
                 joins.push(join);
                 Self::cleanup_started_shards(&mut shards, &mut joins);
-                return Err(ShardError::CpuPlacementFailed(cpu_placement.to_string()));
+                return Err(ShardError::CpuPlacementFailed(
+                    start_status.cpu_placement.to_string(),
+                ));
+            }
+
+            if config.require_memory_placement
+                && config.memory_placement != MemoryPlacement::Default
+                && !start_status.memory_placement.is_applied()
+            {
+                drop(spawner);
+                joins.push(join);
+                Self::cleanup_started_shards(&mut shards, &mut joins);
+                return Err(ShardError::MemoryPlacementFailed(
+                    start_status.memory_placement.to_string(),
+                ));
             }
 
             shards.push(AsyncShard {
                 shard_id,
                 thread_name,
-                cpu_placement,
+                cpu_placement: start_status.cpu_placement,
+                memory_placement: start_status.memory_placement,
                 spawner: Some(spawner),
                 observer,
             });
@@ -889,6 +970,7 @@ impl ShardedExecutor {
                     shard_id: shard.shard_id,
                     thread_name: shard.thread_name.clone(),
                     cpu_placement: shard.cpu_placement.clone(),
+                    memory_placement: shard.memory_placement.clone(),
                     executor: shard.spawner.as_ref().map(Spawner::snapshot),
                 })
                 .collect(),
@@ -909,6 +991,7 @@ impl ShardedExecutor {
                     shard_id: shard.shard_id,
                     thread_name: shard.thread_name.clone(),
                     cpu_placement: shard.cpu_placement.clone(),
+                    memory_placement: shard.memory_placement.clone(),
                     executor: shard.spawner.as_ref().map(Spawner::observer),
                 })
                 .collect(),
@@ -1548,6 +1631,7 @@ struct ShardedExecutorShardObserver {
     shard_id: ShardId,
     thread_name: String,
     cpu_placement: CpuPlacementStatus,
+    memory_placement: MemoryPlacementStatus,
     executor: Option<ExecutorObserver>,
 }
 
@@ -1567,6 +1651,7 @@ impl ShardedExecutorObserver {
                     shard_id: shard.shard_id,
                     thread_name: shard.thread_name.clone(),
                     cpu_placement: shard.cpu_placement.clone(),
+                    memory_placement: shard.memory_placement.clone(),
                     executor,
                 }
             })
@@ -1602,6 +1687,8 @@ pub struct ShardedExecutorShardSnapshot {
     pub thread_name: String,
     /// CPU placement status observed when the shard thread started.
     pub cpu_placement: CpuPlacementStatus,
+    /// Memory placement status observed when the shard thread started.
+    pub memory_placement: MemoryPlacementStatus,
     /// Executor snapshot, or `None` if the shard has already stopped.
     pub executor: Option<ExecutorSnapshot>,
 }
@@ -1624,9 +1711,10 @@ impl Drop for ShardedExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        CpuId, CpuPlacement, CpuPlacementStatus, ShardedExecutor, ShardedExecutorConfig,
-        ShardedSpawnError, available_cpu_ids, available_parallelism,
-        current_executor_cpu_placement, current_executor_shard,
+        CpuId, CpuPlacement, CpuPlacementStatus, MemoryPlacement, MemoryPlacementStatus,
+        NumaNodeId, ShardedExecutor, ShardedExecutorConfig, ShardedSpawnError, available_cpu_ids,
+        available_parallelism, current_executor_cpu_placement, current_executor_memory_placement,
+        current_executor_shard,
     };
     use crate::ShardId;
     use crate::error::ShardError;
@@ -1693,6 +1781,8 @@ mod tests {
             &CpuPlacement::Explicit(vec![CpuId(1), CpuId(2), CpuId(3)])
         );
         assert!(config.is_cpu_placement_required());
+        assert_eq!(config.memory_placement(), &MemoryPlacement::Default);
+        assert!(!config.is_memory_placement_required());
     }
 
     #[test]
@@ -1725,6 +1815,31 @@ mod tests {
     }
 
     #[test]
+    fn config_reports_memory_placement() {
+        let config = ShardedExecutorConfig::new(1)
+            .with_memory_placement(MemoryPlacement::Preferred(NumaNodeId(0)))
+            .require_memory_placement();
+
+        assert_eq!(
+            config.memory_placement(),
+            &MemoryPlacement::Preferred(NumaNodeId(0))
+        );
+        assert!(config.is_memory_placement_required());
+    }
+
+    #[test]
+    fn config_rejects_empty_interleaved_memory_placement() {
+        let error = ShardedExecutor::start_with_config(
+            ShardedExecutorConfig::new(1)
+                .with_memory_placement(MemoryPlacement::Interleave(Vec::new())),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ShardError::InvalidMemoryPlacement(_)));
+        assert!(error.to_string().contains("interleave"));
+    }
+
+    #[test]
     fn available_parallelism_config_uses_reported_parallelism() {
         let reported = thread::available_parallelism().map_or(1, usize::from);
         let config = ShardedExecutorConfig::for_available_parallelism();
@@ -1745,6 +1860,28 @@ mod tests {
 
         assert_eq!(config.shard_count(), available_cpu_ids().len());
         assert!(config.shard_count() >= 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_numa_node_lookup_reports_sysfs_cpu_node_when_available() {
+        let Some(cpu) = available_cpu_ids().into_iter().next() else {
+            return;
+        };
+
+        let observed = super::affinity::numa_node_for_cpu(cpu);
+        let cpu_dir = std::path::PathBuf::from(format!("/sys/devices/system/cpu/cpu{}", cpu.0));
+        let expected = std::fs::read_dir(cpu_dir).ok().and_then(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter_map(|name| name.strip_prefix("node").map(str::to_owned))
+                .filter_map(|node| node.parse::<usize>().ok())
+                .min()
+                .map(super::affinity::NumaNodeId)
+        });
+
+        assert_eq!(observed, expected);
     }
 
     #[test]
@@ -1799,6 +1936,7 @@ mod tests {
     #[test]
     fn current_executor_cpu_placement_reports_shard_thread_status() {
         assert_eq!(current_executor_cpu_placement(), None);
+        assert_eq!(current_executor_memory_placement(), None);
 
         let runtime = ShardedExecutor::start_with_config(
             ShardedExecutorConfig::new(2).with_cpu_placement(CpuPlacement::Sequential),
@@ -1815,6 +1953,7 @@ mod tests {
                             ShardId(shard_idx),
                             current_executor_shard(),
                             current_executor_cpu_placement(),
+                            current_executor_memory_placement(),
                         ))
                         .unwrap();
                 })
@@ -1825,18 +1964,23 @@ mod tests {
 
         let snapshot = runtime.snapshot();
         let mut observed = receiver.into_iter().collect::<Vec<_>>();
-        observed.sort_by_key(|(shard_id, _, _)| shard_id.0);
+        observed.sort_by_key(|(shard_id, _, _, _)| shard_id.0);
 
-        for (shard_id, current_shard, cpu_placement) in observed {
+        for (shard_id, current_shard, cpu_placement, memory_placement) in observed {
             assert_eq!(current_shard, Some(shard_id));
             assert_eq!(
                 cpu_placement,
                 Some(snapshot.shards[shard_id.0].cpu_placement.clone())
             );
+            assert_eq!(
+                memory_placement,
+                Some(snapshot.shards[shard_id.0].memory_placement.clone())
+            );
         }
 
         runtime.stop().unwrap();
         assert_eq!(current_executor_cpu_placement(), None);
+        assert_eq!(current_executor_memory_placement(), None);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1857,7 +2001,7 @@ mod tests {
         for shard in &runtime.snapshot().shards {
             assert!(matches!(
                 shard.cpu_placement,
-                CpuPlacementStatus::Applied(_)
+                CpuPlacementStatus::Applied { .. }
             ));
         }
 
@@ -1930,6 +2074,20 @@ mod tests {
         assert!(error.to_string().contains("unsupported"));
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn required_memory_placement_rejects_unsupported_platforms() {
+        let error = ShardedExecutor::start_with_config(
+            ShardedExecutorConfig::new(1)
+                .with_memory_placement(MemoryPlacement::Preferred(NumaNodeId(0)))
+                .require_memory_placement(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ShardError::MemoryPlacementFailed(_)));
+        assert!(error.to_string().contains("unsupported"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_cpu_placement_pins_shard_thread_affinity_masks() {
@@ -1973,7 +2131,10 @@ mod tests {
             assert_eq!(cpus, Some(vec![expected_cpu]));
             assert_eq!(
                 runtime.snapshot().shards[shard_id.0].cpu_placement,
-                CpuPlacementStatus::Applied(expected_cpu)
+                CpuPlacementStatus::Applied {
+                    cpu: expected_cpu,
+                    numa_node: super::affinity::numa_node_for_cpu(expected_cpu),
+                }
             );
         }
 
@@ -1987,6 +2148,10 @@ mod tests {
         assert_eq!(
             runtime.snapshot().shards[0].cpu_placement,
             CpuPlacementStatus::Unpinned
+        );
+        assert_eq!(
+            runtime.snapshot().shards[0].memory_placement,
+            MemoryPlacementStatus::Default
         );
 
         runtime.stop().unwrap();
