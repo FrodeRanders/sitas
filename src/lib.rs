@@ -53,6 +53,8 @@ pub mod metrics;
 pub mod os;
 /// Key-to-shard placement helpers.
 pub mod placement;
+/// OS backend contract for the executor reactor (Option A spike).
+pub mod reactor_backend;
 /// Standard-library shard runtime primitives.
 pub mod runtime;
 /// Shard identifiers and shard-level types.
