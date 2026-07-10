@@ -11,7 +11,9 @@
 use std::os::unix::io::RawFd;
 
 #[cfg(unix)]
-use crate::os::{OsEvent, OsReactor};
+use crate::os::OsEvent;
+#[cfg(unix)]
+use crate::reactor_backend::{ReactorBackend, ReactorEvent};
 
 use super::scheduler::Scheduler;
 #[cfg(target_os = "linux")]
@@ -46,6 +48,27 @@ impl From<OsEvent> for DriverEvent {
     }
 }
 
+#[cfg(unix)]
+impl DriverEvent {
+    /// Builds a driver event from any [`ReactorEvent`] whose interests are Unix
+    /// file descriptors. This is how a generic [`ReactorBackend`] event becomes
+    /// the executor's internal event without depending on the concrete backend
+    /// type.
+    fn from_reactor_event<E>(event: &E) -> Self
+    where
+        E: ReactorEvent<Handle = std::os::unix::io::RawFd>,
+    {
+        Self {
+            readiness: Some(ReadinessEvent {
+                readable: event.readable().to_vec(),
+                writable: event.writable().to_vec(),
+            }),
+            #[cfg(target_os = "linux")]
+            completion: false,
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn dispatch_available(scheduler: &Scheduler) {
     let dispatched = uring::dispatch_available();
@@ -60,11 +83,14 @@ pub(super) fn dispatch_available(scheduler: &Scheduler) {
 pub(super) fn dispatch_available(_scheduler: &Scheduler) {}
 
 #[cfg(unix)]
-pub(super) fn wait_for_event(
+pub(super) fn wait_for_event<R>(
     scheduler: &Scheduler,
-    reactor: &OsReactor,
+    reactor: &R,
     context: &str,
-) -> Option<DriverEvent> {
+) -> Option<DriverEvent>
+where
+    R: ReactorBackend<Handle = std::os::unix::io::RawFd>,
+{
     Some(wait_for_reactor_event(scheduler, reactor, context))
 }
 
@@ -103,11 +129,10 @@ pub(super) fn apply_event(scheduler: &Scheduler, event: Option<DriverEvent>) {
 }
 
 #[cfg(unix)]
-fn wait_for_reactor_event(
-    scheduler: &Scheduler,
-    reactor: &OsReactor,
-    context: &str,
-) -> DriverEvent {
+fn wait_for_reactor_event<R>(scheduler: &Scheduler, reactor: &R, context: &str) -> DriverEvent
+where
+    R: ReactorBackend<Handle = std::os::unix::io::RawFd>,
+{
     #[cfg(target_os = "linux")]
     prepare_io_uring_for_reactor_wait(scheduler, context);
 
@@ -129,10 +154,10 @@ fn wait_for_reactor_event(
     }
 
     let timeout = scheduler.time_until_next_timer();
-    let event: DriverEvent = reactor
-        .wait_io(&read_fds, &write_fds, timeout)
-        .unwrap_or_else(|error| panic!("OS reactor wait failed while {context}: {error}"))
-        .into();
+    let reactor_event = reactor
+        .wait(&read_fds, &write_fds, timeout)
+        .unwrap_or_else(|error| panic!("OS reactor wait failed while {context}: {error}"));
+    let event: DriverEvent = DriverEvent::from_reactor_event(&reactor_event);
 
     #[cfg(target_os = "linux")]
     let mut event = event;

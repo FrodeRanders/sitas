@@ -64,6 +64,25 @@ pub trait ReactorWaker: Clone + Send + Sync {
     fn wake(&self) -> io::Result<()>;
 }
 
+/// Object-safe wake capability stored by the scheduler.
+///
+/// The scheduler only ever needs to *wake* its reactor; it never needs the
+/// concrete waker type. Erasing the waker to this object-safe trait keeps the
+/// [`Scheduler`](crate::executor) non-generic while still routing wakes through
+/// whatever [`ReactorWaker`] the active [`ReactorBackend`] provides. Any
+/// `ReactorWaker` that is also `Debug` is automatically a `SchedulerWake`.
+pub trait SchedulerWake: std::fmt::Debug + Send + Sync {
+    /// Wakes the reactor; errors are the backend's concern and are ignored by
+    /// the scheduler wake path.
+    fn wake(&self);
+}
+
+impl<W: ReactorWaker + std::fmt::Debug> SchedulerWake for W {
+    fn wake(&self) {
+        let _ = ReactorWaker::wake(self);
+    }
+}
+
 /// The result of a single [`ReactorBackend::wait`] call.
 ///
 /// It reports whether the reactor itself was woken and which registered

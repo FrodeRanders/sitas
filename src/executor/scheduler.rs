@@ -16,7 +16,7 @@ use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use crate::os::IoUringDispatcherSnapshot;
 #[cfg(unix)]
-use crate::os::OsWaker;
+use crate::reactor_backend::SchedulerWake;
 
 #[cfg(target_os = "linux")]
 use super::IoUringExecutorStatus;
@@ -37,7 +37,7 @@ pub(super) struct Scheduler {
     state: Mutex<SchedulerState>,
     stopping: AtomicBool,
     #[cfg(unix)]
-    waker: OsWaker,
+    waker: Box<dyn SchedulerWake>,
 }
 
 #[derive(Debug)]
@@ -54,7 +54,7 @@ struct SchedulerState {
 }
 
 impl Scheduler {
-    pub(super) fn new(#[cfg(unix)] waker: OsWaker) -> Self {
+    pub(super) fn new(#[cfg(unix)] waker: impl SchedulerWake + 'static) -> Self {
         Self {
             id: ExecutorId::allocate(),
             state: Mutex::new(SchedulerState {
@@ -70,7 +70,7 @@ impl Scheduler {
             }),
             stopping: AtomicBool::new(false),
             #[cfg(unix)]
-            waker,
+            waker: Box::new(waker),
         }
     }
 
@@ -411,6 +411,6 @@ impl Scheduler {
 
     pub(super) fn wake_reactor(&self) {
         #[cfg(unix)]
-        let _ = self.waker.wake();
+        self.waker.wake();
     }
 }

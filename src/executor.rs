@@ -15,6 +15,8 @@ use std::task::{Context, Poll, Waker};
 
 #[cfg(unix)]
 use crate::os::OsReactor;
+#[cfg(unix)]
+use crate::reactor_backend::ReactorBackend;
 
 mod backpressure;
 mod counters;
@@ -91,14 +93,34 @@ type PanicHandler = Box<dyn FnOnce(PanicPayload) + Send + 'static>;
 const READY_POLL_BUDGET: usize = 64;
 
 /// Single-threaded executor that polls tasks from a ready queue.
+///
+/// On Unix the executor is generic over the [`ReactorBackend`] it sleeps on and
+/// defaults to the OS reactor ([`OsReactor`]). The default keeps existing
+/// callers writing `Executor` unchanged, while a foreign backend can be
+/// substituted by naming the type parameter.
+///
+/// The backend's interest [`Handle`](ReactorBackend::Handle) is currently
+/// constrained to a Unix `RawFd` because the readiness-tracking layer
+/// (`io_interest`, `unix_io`, and the `io_uring` completion fd) still identifies
+/// interests by file descriptor. Generalising that to an arbitrary handle type
+/// (for example a completion-capability id) is the next abstraction step; see
+/// the design note.
 #[derive(Debug)]
-pub struct Executor {
+#[cfg(unix)]
+pub struct Executor<R: ReactorBackend<Handle = std::os::unix::io::RawFd> = OsReactor> {
     scheduler: Arc<Scheduler>,
-    #[cfg(unix)]
-    reactor: OsReactor,
+    reactor: R,
 }
 
-impl Executor {
+/// Single-threaded executor that polls tasks from a ready queue.
+#[derive(Debug)]
+#[cfg(not(unix))]
+pub struct Executor {
+    scheduler: Arc<Scheduler>,
+}
+
+#[cfg(unix)]
+impl<R: ReactorBackend<Handle = std::os::unix::io::RawFd>> Executor<R> {
     /// Returns an owned snapshot of this executor's scheduler and tasks.
     pub fn snapshot(&self) -> ExecutorSnapshot {
         self.scheduler.snapshot()
@@ -207,11 +229,7 @@ impl Executor {
     }
 
     fn wait_for_driver_event(&self, context: &str) -> Option<driver::DriverEvent> {
-        #[cfg(unix)]
-        return driver::wait_for_event(&self.scheduler, &self.reactor, context);
-
-        #[cfg(not(unix))]
-        return driver::wait_for_event(&self.scheduler, context);
+        driver::wait_for_event(&self.scheduler, &self.reactor, context)
     }
 
     fn refresh_io_uring_snapshot(&self) {
@@ -229,7 +247,8 @@ impl Executor {
     }
 }
 
-impl Drop for Executor {
+#[cfg(unix)]
+impl<R: ReactorBackend<Handle = std::os::unix::io::RawFd>> Drop for Executor<R> {
     fn drop(&mut self) {
         self.scheduler.close();
         self.shutdown_io_uring();
