@@ -38,6 +38,9 @@
 
 /// Async-std service bridge adapters.
 pub mod async_service;
+/// Reference model of the CharlotteOS async-syscall / completion-capability ABI
+/// (Option C validation).
+pub mod charlotte_abi;
 /// Sharded counter service implementation.
 pub mod counter;
 /// Error types returned by shard operations.
