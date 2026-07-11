@@ -1,11 +1,17 @@
-[package]
-name = "sitas"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.95"
-description = "A small Rust library for shard-local ownership and typed message passing."
-repository = "https://github.com/FrodeRanders/sitas"
-readme = "README.md"
-license = "Apache-2.0"
+[workspace]
+members = ["crates/*"]
+resolver = "3"
 
-[dependencies]
+[profile.dev]
+debug = "full"
+debug-assertions = true
+panic = "abort"
+lto = true
+opt-level = 3
+
+[profile.release]
+debug = "none"
+debug-assertions = false
+panic = "abort"
+lto = true
+opt-level = 3

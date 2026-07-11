@@ -1,0 +1,10 @@
+[package]
+name = "sitas-charlotte"
+version = "0.1.0"
+edition = "2024"
+description = "sitas CharlotteOS backend (kernel syscall ABI)"
+license = "MIT"
+repository = "https://github.com/FrodeRanders/sitas"
+
+[dependencies]
+sitas-core = { path = "../sitas-core" }
