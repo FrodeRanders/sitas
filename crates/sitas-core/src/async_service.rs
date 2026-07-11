@@ -1,30 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
-//! Async-service bridge for the shard-per-thread model.
-//!
-//! This module provides adapters that wrap std-layer sharded services
-//! ([`ShardedKv`](crate::ShardedKv), [`ShardedCounter`](crate::ShardedCounter))
-//! for use inside async tasks running on a [`ShardedExecutor`](crate::ShardedExecutor).
-//!
-//! The key insight is that [`Reply::wait_async`](crate::runtime::Reply::wait_async) already
-//! integrates with the custom executor's waker. This module provides ergonomic
-//! async wrappers that call `submit_*` and then `wait_async().await` in a single
-//! async method.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use sitas::{ShardedKv, AsyncShardedKv};
-//!
-//! let kv = ShardedKv::start(4).unwrap();
-//! let async_kv = AsyncShardedKv::new(&kv);
-//!
-//! // Inside an async task on a ShardedExecutor:
-//! let value = async_kv.get("my-key").await.unwrap();
-//! ```
-
-use crate::ShardError;
+use alloc::boxed::Box;;
 use crate::kv::ShardedKv;
 
 /// Async wrapper around a [`ShardedKv`] reference.

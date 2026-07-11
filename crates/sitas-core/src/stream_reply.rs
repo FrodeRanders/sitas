@@ -1,21 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
-//! Streaming reply channels for sharded services.
-//!
-//! A [`StreamReply<T>`] bridges between a shard producing multiple values and a
-//! consumer that receives them. Unlike a one-shot [`Reply<T>`](crate::runtime::Reply),
-//! a stream reply delivers a sequence of owned values followed by a terminal
-//! completion signal. Blocking consumers use [`StreamReply::recv`],
-//! [`StreamReply::recv_batch`], [`StreamReply::collect`], or
-//! [`StreamReply::fold`]. Async consumers call [`StreamReply::next_batch`]
-//! which returns a [`StreamBatch`] future for waker-integrated polling.
-
-use core::fmt;
-use core::future::Future;
-use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use alloc::boxed::Box;;
 use core::task::{Context, Poll, Waker};
 
 /// Error returned when a streaming reply is dropped before completion.
