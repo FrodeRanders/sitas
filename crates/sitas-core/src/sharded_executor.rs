@@ -11,7 +11,6 @@ use alloc::boxed::Box;
 use core::fmt;
 use core::future::Future;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
 use crate::shard_runtime::ShardJoinHandle;
 use core::time::{Duration, Instant};
 
@@ -128,7 +127,11 @@ impl core::error::Error for ShardedSchedulingGroupError {
     }
 }
 
-thread_local! {
+// thread_local! replacement: use per-LP statics
+use spin::LazyLock;
+static CURRENT_SHARD: LazyLock<spin::Mutex<Option<ShardId>>> = LazyLock::new(|| spin::Mutex::new(None));
+static CURRENT_CPU: LazyLock<spin::Mutex<Option<crate::placement::CpuPlacementStatus>>> = LazyLock::new(|| spin::Mutex::new(None));
+static CURRENT_MEM: LazyLock<spin::Mutex<Option<crate::placement::MemoryPlacementStatus>>> = LazyLock::new(|| spin::Mutex::new(None));
     static CURRENT_EXECUTOR_SHARD: core::cell::Cell<Option<ShardId>> = const { core::cell::Cell::new(None) };
     static CURRENT_EXECUTOR_CPU_PLACEMENT: core::cell::RefCell<Option<CpuPlacementStatus>> = const { core::cell::RefCell::new(None) };
     static CURRENT_EXECUTOR_MEMORY_PLACEMENT: core::cell::RefCell<Option<MemoryPlacementStatus>> = const { core::cell::RefCell::new(None) };
@@ -137,7 +140,7 @@ thread_local! {
 /// Returns the shard currently polling this task, if the caller is running on a
 /// [`ShardedExecutor`] shard thread.
 pub fn current_executor_shard() -> Option<ShardId> {
-    CURRENT_EXECUTOR_SHARD.with(core::cell::Cell::get)
+    CURRENT_SHARD.lock().clone()
 }
 
 /// Returns the CPU placement status observed when the current
@@ -333,7 +336,7 @@ impl ShardedExecutorConfig {
 pub struct ShardedExecutor {
     runtime_id: ShardedExecutorId,
     shards: Vec<AsyncShard>,
-    joins: Vec<thread::JoinHandle<()>>,
+    joins: Vec<crate::shard_runtime::ShardJoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -433,17 +436,17 @@ impl ShardedExecutor {
                         &memory_placement_request,
                         &cpu_placement,
                     );
-                    CURRENT_EXECUTOR_SHARD.set(Some(shard_id));
-                    CURRENT_EXECUTOR_CPU_PLACEMENT.replace(Some(cpu_placement.clone()));
-                    CURRENT_EXECUTOR_MEMORY_PLACEMENT.replace(Some(memory_placement.clone()));
+                    CURRENT_SHARD.lock().replace(Some(shard_id));
+                    CURRENT_CPU.lock().replace(Some(cpu_placement.clone()));
+                    CURRENT_MEM.lock().replace(Some(memory_placement.clone()));
                     let _ = started_sender.send(ShardStartStatus {
                         cpu_placement,
                         memory_placement,
                     });
                     executor.run();
-                    CURRENT_EXECUTOR_MEMORY_PLACEMENT.replace(None);
-                    CURRENT_EXECUTOR_CPU_PLACEMENT.replace(None);
-                    CURRENT_EXECUTOR_SHARD.set(None);
+                    CURRENT_MEM.lock().replace(None);
+                    CURRENT_CPU.lock().replace(None);
+                    CURRENT_SHARD.lock().replace(None);
                 }) {
                 Ok(join) => join,
                 Err(_) => {
@@ -503,7 +506,7 @@ impl ShardedExecutor {
         })
     }
 
-    fn cleanup_started_shards(shards: &mut [AsyncShard], joins: &mut Vec<thread::JoinHandle<()>>) {
+    fn cleanup_started_shards(shards: &mut [AsyncShard], joins: &mut Vec<crate::shard_runtime::ShardJoinHandle<()>>) {
         for shard in shards {
             shard.spawner.take();
         }
@@ -1039,12 +1042,12 @@ impl ShardedExecutor {
         }
 
         let deadline = Instant::now() + timeout;
-        while !self.joins.iter().all(thread::JoinHandle::is_finished) {
+        while !self.joins.iter().all(crate::shard_runtime::ShardJoinHandle::is_finished) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            thread::sleep(SHUTDOWN_TIMEOUT_POLL_INTERVAL.min(remaining));
+            crate::shard_runtime::ShardRuntime::sleep(SHUTDOWN_TIMEOUT_POLL_INTERVAL.min(remaining));
         }
 
         let mut forced_shards = Vec::new();
@@ -1079,7 +1082,7 @@ impl ShardedExecutor {
 
 /// Returns the host's reported available parallelism, falling back to one.
 pub fn available_parallelism() -> usize {
-    thread::available_parallelism().map_or(1, usize::from)
+    crate::placement::default_shard_count().map_or(1, usize::from)
 }
 
 /// Cloneable handle for submitting work to a [`ShardedExecutor`].
@@ -1844,7 +1847,7 @@ mod tests {
 
     #[test]
     fn available_parallelism_config_uses_reported_parallelism() {
-        let reported = thread::available_parallelism().map_or(1, usize::from);
+        let reported = crate::placement::default_shard_count().map_or(1, usize::from);
         let config = ShardedExecutorConfig::for_available_parallelism();
 
         assert_eq!(available_parallelism(), reported);
@@ -2290,7 +2293,7 @@ mod tests {
                 Instant::now() < deadline,
                 "unnamed grouped task was not observable"
             );
-            thread::sleep(Duration::from_millis(1));
+            crate::shard_runtime::ShardRuntime::sleep(Duration::from_millis(1));
         }
 
         assert_eq!(block_on(handle).unwrap(), ShardId(1));
@@ -2374,7 +2377,7 @@ mod tests {
 
         assert!(error.is_timed_out());
         assert_eq!(error.shard_id(), ShardId(0));
-        thread::sleep(Duration::from_millis(150));
+        crate::shard_runtime::ShardRuntime::sleep(Duration::from_millis(150));
         assert!(!second_completed.load(Ordering::SeqCst));
 
         runtime.stop().unwrap();
@@ -2631,7 +2634,7 @@ mod tests {
                 Instant::now() < deadline,
                 "slow-worker did not enter timer wait state: {task:?}"
             );
-            thread::sleep(Duration::from_millis(1));
+            crate::shard_runtime::ShardRuntime::sleep(Duration::from_millis(1));
         };
 
         let executor = shard.executor.as_ref().unwrap();
@@ -2965,7 +2968,7 @@ mod tests {
                 Instant::now() < deadline,
                 "tasks were not observable: expected {expected:?}, observed {task_names:?}"
             );
-            thread::sleep(Duration::from_millis(1));
+            crate::shard_runtime::ShardRuntime::sleep(Duration::from_millis(1));
         }
     }
 
