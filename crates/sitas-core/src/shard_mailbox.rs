@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::boxed::Box;;
+use alloc::boxed::Box;
 pub struct ShardSend<'a, M> {
     sender: &'a ShardSender<M>,
     message: Option<M>,

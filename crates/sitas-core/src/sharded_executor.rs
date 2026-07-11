@@ -148,7 +148,7 @@ pub fn current_executor_shard() -> Option<ShardId> {
 ///
 /// This returns `None` outside sharded executor threads.
 pub fn current_executor_cpu_placement() -> Option<CpuPlacementStatus> {
-    CURRENT_EXECUTOR_CPU_PLACEMENT.with(|placement| placement.borrow().clone())
+    CURRENT_CPU.lock().clone()
 }
 
 /// Returns the memory placement status observed when the current
@@ -156,7 +156,7 @@ pub fn current_executor_cpu_placement() -> Option<CpuPlacementStatus> {
 ///
 /// This returns `None` outside sharded executor threads.
 pub fn current_executor_memory_placement() -> Option<MemoryPlacementStatus> {
-    CURRENT_EXECUTOR_MEMORY_PLACEMENT.with(|placement| placement.borrow().clone())
+    CURRENT_MEM.lock().clone()
 }
 
 /// Configuration for starting a [`ShardedExecutor`].
