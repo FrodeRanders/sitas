@@ -332,11 +332,16 @@ impl ShardedExecutorConfig {
 /// [`ShardedExecutor::spawn_with_handle_on`]. Dropping or stopping the runtime
 /// drops the last owned spawners, allowing idle executor threads to drain and
 /// exit.
+///
+/// `R` is the [`ShardRuntime`](crate::shard_runtime::ShardRuntime) backend
+/// that abstracts thread spawning. On Unix this is `std::thread::Builder`; on
+/// CharlotteOS it is the kernel's `SPAWN_THREAD` syscall.
 #[must_use = "dropping the sharded executor stops all owned shard threads"]
-pub struct ShardedExecutor {
+pub struct ShardedExecutor<R: crate::shard_runtime::ShardRuntime + 'static> {
     runtime_id: ShardedExecutorId,
     shards: Vec<AsyncShard>,
-    joins: Vec<crate::shard_runtime::ShardJoinHandle<()>>,
+    joins: Vec<R::JoinHandle<()>>,
+    _runtime: core::marker::PhantomData<R>,
 }
 
 #[derive(Debug)]
@@ -377,7 +382,7 @@ impl ShardedShutdownOutcome {
     }
 }
 
-impl ShardedExecutor {
+impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
     /// Starts `shard_count` async executor shards.
     pub fn start(shard_count: usize) -> Result<Self, ShardError> {
         Self::start_with_config(ShardedExecutorConfig::new(shard_count))
@@ -406,8 +411,44 @@ impl ShardedExecutor {
         Self::start_with_config(ShardedExecutorConfig::for_required_pinned_available_cpus())
     }
 
-    /// Starts async executor shards using `config`.
-    pub fn start_with_config(config: ShardedExecutorConfig) -> Result<Self, ShardError> {
+    /// Starts async executor shards using `config` and the given `runtime`
+    /// backend. This is the CharlotteOS / no_std entry point: thread spawn is
+    /// delegated to [`ShardRuntime::spawn_shard`](crate::shard_runtime::ShardRuntime::spawn_shard)
+    /// instead of `std::thread::Builder`.
+    pub fn start_with_runtime(
+        config: ShardedExecutorConfig,
+        runtime: &R,
+    ) -> Result<Self, ShardError> {
+        config.validate()?;
+        let runtime_id = ShardedExecutorId::allocate();
+        let mut shards = Vec::with_capacity(config.shard_count);
+        let mut joins = Vec::with_capacity(config.shard_count);
+
+        for shard_idx in 0..config.shard_count {
+            let shard_id = ShardId(shard_idx);
+            let (executor, spawner) = executor_and_spawner();
+
+            let join = runtime.spawn_shard(
+                shard_id,
+                crate::placement::Placement::Sequential,
+                alloc::boxed::Box::new(move || {
+                    CURRENT_SHARD.lock().replace(Some(shard_id));
+                    executor.run();
+                    CURRENT_SHARD.lock().replace(None);
+                }),
+            );
+
+            joins.push(join);
+            shards.push(AsyncShard { shard_id, spawner: Some(spawner) });
+        }
+
+        Ok(ShardedExecutor {
+            runtime_id,
+            shards,
+            joins,
+            _runtime: core::marker::PhantomData,
+        })
+    }
         config.validate()?;
 
         let available_cpus = available_cpu_ids();
@@ -1011,7 +1052,7 @@ impl ShardedExecutor {
 
     /// Stops all owned shard executors while keeping the runtime handle
     /// inspectable.
-    pub fn shutdown(&mut self) -> Result<(), ShardError> {
+    pub fn shutdown(&mut self) where R: crate::shard_runtime::ShardRuntime + 'static -> Result<(), ShardError> {
         for shard in &mut self.shards {
             shard.spawner.take();
         }
@@ -1708,7 +1749,7 @@ impl fmt::Debug for ShardedExecutor {
     }
 }
 
-impl Drop for ShardedExecutor {
+impl<R: crate::shard_runtime::ShardRuntime + 'static> Drop for ShardedExecutor<R> {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
