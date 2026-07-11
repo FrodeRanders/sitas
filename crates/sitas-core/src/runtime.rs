@@ -426,9 +426,6 @@ pub(crate) fn bounded_mailbox_runtime<C: Send + 'static>(capacity: usize) -> (Sh
     let receiver = ShardReceiver { queue: q };
     (sender, receiver)
 }
-    let (sender, receiver) = mpsc::sync_channel(capacity);
-    (ShardMailbox::new(sender), receiver)
-}
 
 pub(crate) trait HasShardId {
     fn shard_id(&self) -> ShardId;
