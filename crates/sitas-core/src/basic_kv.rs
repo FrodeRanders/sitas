@@ -1,34 +1,37 @@
-//! basic_kv test for CharlotteOS — runs in a single shard without threads.
+//! basic_kv on CharlotteOS — exercises sitas ShardedKv via ShardRuntime.
 //!
-//! This is a simplified version of the sitas `examples/basic_kv.rs` that works
-//! in no_std environments. It creates a single shard using the CharlotteReactor
-//! runtime and exercises basic set/get operations, writing results to the
-//! result page.
+//! Creates a single-shard KV using the given runtime, sets three keys, reads
+//! one back, and writes the result count to the result page.
 
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::ptr;
 
-use crate::kv::ShardedKv;
-use crate::sharded_executor::{ShardedExecutor, ShardedExecutorConfig};
+use crate::kv::{ShardedKv, ShardedKvConfig};
 use crate::shard_runtime::ShardRuntime;
+use crate::ShardError;
 
-/// Runs basic_kv operations using the given runtime and writes a success
-/// sentinel (0xCAFE) to `result_page` on success, or 0xDEAD on failure.
-pub fn basic_kv_test<R: ShardRuntime + 'static>(
-    runtime: &R,
-    result_page: *mut u32,
-) {
-    // Single shard, sequential placement.
-    let config = ShardedExecutorConfig::new(1);
-    let _executor = match ShardedExecutor::start_with_runtime(config, runtime) {
-        Ok(e) => e,
+pub fn basic_kv_test<R: ShardRuntime + ?Sized>(runtime: &R, result_page: *mut u32) {
+    let config = ShardedKvConfig::new(1);
+    let kv = match ShardedKv::start_with_runtime(config, runtime) {
+        Ok(kv) => kv,
         Err(_) => { unsafe { ptr::write_volatile(result_page, 0xDEAD) }; return; }
     };
 
-    // Do basic set/get on the KV. The shard runs in the spawned thread.
-    // For now, since the thread runs asynchronously, we trust the runtime
-    // and write the success sentinel. A more complete test would use the
-    // reply channel to wait for results.
-    unsafe { ptr::write_volatile(result_page, 0xCAFE) };
+    // Basic set operations.
+    if kv.put("alpha", "one").is_err()
+        || kv.put("beta", "two").is_err()
+        || kv.put("gamma", "three").is_err()
+    {
+        unsafe { ptr::write_volatile(result_page, 0xDEAD) };
+        return;
+    }
+
+    // Read back: get("alpha") should return "one".
+    match kv.get("alpha") {
+        Ok(Some(value)) if value == "one" => {
+            let total = kv.total_len().unwrap_or(0);
+            unsafe { ptr::write_volatile(result_page, total as u32) };
+        }
+        _ => { unsafe { ptr::write_volatile(result_page, 0xDEAD) }; }
+    }
 }

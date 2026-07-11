@@ -89,20 +89,24 @@ pub trait ShardService: Sized {
 /// and receive replies.
 pub struct ShardHandle<C> {
     id: ShardId,
-    mailbox: ShardMailbox<C>,
+    send_fn: alloc::boxed::Box<dyn Fn(C) -> Result<(), ShardError> + Send + Sync>,
 }
 
-impl<C> ShardHandle<C> {
-    fn new(id: ShardId, mailbox: ShardMailbox<C>) -> Self {
-        Self { id, mailbox }
+impl<C: 'static> ShardHandle<C> {
+    fn from_mailbox(id: ShardId, mailbox: ShardMailbox<C>) -> Self {
+        Self { id, send_fn: alloc::boxed::Box::new(move |cmd| mailbox.send(cmd)) }
+    }
+
+    fn from_sender(id: ShardId, sender: crate::shard_runtime::ShardSender<C>) -> Self {
+        Self { id, send_fn: alloc::boxed::Box::new(move |cmd| sender.try_send(cmd).map_err(|_| ShardError::SendFailed)) }
     }
 
     fn send(&self, command: C) -> Result<(), ShardError> {
-        self.mailbox.send(command)
+        (self.send_fn)(command)
     }
 
     fn try_send(&self, command: C) -> Result<(), ShardError> {
-        self.mailbox.try_send(command)
+        self.send(command)
     }
 
     fn request<T, F>(&self, build: F) -> Result<Reply<T>, ShardError>
@@ -173,7 +177,7 @@ where
         let shards = ShardSet::start(
             config.shard_count,
             config.mailbox_capacity,
-            |shard_idx, mailbox| ShardHandle::new(ShardId(shard_idx), mailbox),
+            |shard_idx, mailbox| ShardHandle::from_mailbox(ShardId(shard_idx), mailbox),
             run_shard::<S>,
         );
 
@@ -182,6 +186,27 @@ where
             placement,
             stopped: false,
         })
+    }
+
+    /// Starts a sharded service using the given runtime for thread spawning
+    /// (the CharlotteOS / no\_std path).
+    pub fn start_with_runtime<R: crate::shard_runtime::ShardRuntime + ?Sized>(
+        config: ShardedConfig,
+        placement: P,
+        runtime: &R,
+    ) -> Result<Self, ShardError> {
+        let config = config.runtime_config()?;
+        use crate::shard_runtime::ShardSender;
+
+        let shards = ShardSet::start_with_runtime(
+            config.shard_count,
+            config.mailbox_capacity,
+            |shard_idx, sender: ShardSender<S::Command>| ShardHandle::from_sender(ShardId(shard_idx), sender),
+            run_shard_runtime::<S>,
+            runtime,
+        );
+
+        Ok(Self { shards, placement, stopped: false })
     }
 
     /// Returns the number of shards in this service.
@@ -350,6 +375,22 @@ fn run_shard<S: ShardService>(shard_id: crate::ShardId, receiver: mpsc::Receiver
     while let Ok(command) = receiver.recv() {
         if !S::process(&mut state, command) {
             break;
+        }
+    }
+}
+
+/// Runtime-path shard loop: polls a ringbuf-based `ShardReceiver` rather than
+/// a `mpsc::Receiver`. Otherwise identical to [`run_shard`].
+fn run_shard_runtime<S: ShardService>(shard_id: crate::ShardId, receiver: crate::runtime::ShardReceiver<S::Command>) {
+    let mut state = S::initial_state(shard_id);
+    loop {
+        match receiver.recv() {
+            Ok(cmd) => {
+                if !S::process(&mut state, cmd) {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
 }

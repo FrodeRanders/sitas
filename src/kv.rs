@@ -336,12 +336,29 @@ impl ShardedKv<HashPlacement> {
     pub fn start_with_config(config: ShardedKvConfig) -> Result<Self, ShardError> {
         Self::start_with_placement(config, HashPlacement)
     }
+
+    /// Starts a sharded KV using the given runtime for thread spawning
+    /// (the CharlotteOS / no\_std path).
+    pub fn start_with_runtime<R: crate::shard_runtime::ShardRuntime + ?Sized>(
+        config: ShardedKvConfig,
+        runtime: &R,
+    ) -> Result<Self, ShardError> {
+        Self::start_with_placement_runtime(config, HashPlacement, runtime)
+    }
 }
 
 impl<P> ShardedKv<P>
 where
     P: Placement<str>,
 {
+    pub fn start_with_placement_runtime<R: crate::shard_runtime::ShardRuntime + ?Sized>(
+        config: ShardedKvConfig,
+        placement: P,
+        runtime: &R,
+    ) -> Result<Self, ShardError> {
+        let shards = Sharded::start_with_runtime(config, placement, runtime)?;
+        Ok(Self { shards, placement, stopped: false })
+    }
     /// Starts a sharded key-value store from an explicit configuration and
     /// placement strategy.
     ///

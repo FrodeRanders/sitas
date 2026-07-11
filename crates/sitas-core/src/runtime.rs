@@ -315,6 +315,47 @@ impl<C> ShardMailbox<C> {
         Self { sender }
     }
 
+    /// Construct a mailbox that wraps a `ShardSender` (ringbuf-based,
+    /// used on the runtime / no\_std path).
+    pub(crate) fn from_shard_sender(sender: ShardSender<C>) -> Self
+    where
+        C: Send + 'static,
+    {
+        // Store the raw boxed sender; we call it via the trait method below.
+        // Since ShardMailbox is generic over C and we need type erasure, we
+        // box the sender and cast via an unsafe pointer transmute. This is
+        // safe because the type C is known to the caller and the boxing
+        // preserves the vtable.
+        let raw: *mut ShardSender<C> = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(sender));
+        // We reuse the `sender` field as a raw pointer. The mpsc::SyncSender
+        // has the same size as a pointer.
+        let ptr = raw as usize as i64;
+        Self { sender: unsafe { core::mem::transmute::<i64, mpsc::SyncSender<C>>(ptr) } }
+    }
+
+    fn as_shard_sender_ptr(&self) -> *mut ShardSender<C> {
+        let val: i64 = unsafe { core::mem::transmute_copy(&self.sender) };
+        val as usize as *mut ShardSender<C>
+    }
+
+    pub(crate) fn send_runtime(&self, command: C) -> Result<(), ShardError>
+    where
+        C: Send + 'static,
+    {
+        let ptr = self.as_shard_sender_ptr();
+        if ptr.is_null() {
+            return Err(ShardError::SendFailed);
+        }
+        unsafe { &*ptr }.try_send(command).map_err(|_| ShardError::SendFailed)
+    }
+
+    pub(crate) fn try_send_runtime(&self, command: C) -> Result<(), ShardError>
+    where
+        C: Send + 'static,
+    {
+        self.send_runtime(command)
+    }
+
     pub(crate) fn send(&self, command: C) -> Result<(), ShardError> {
         self.sender
             .send(command)
@@ -359,7 +400,32 @@ impl<C> ShardMailbox<C> {
     }
 }
 
-pub(crate) fn bounded_mailbox<C>(capacity: usize) -> (ShardMailbox<C>, mpsc::Receiver<C>) {
+/// A ringbuf-based command receiver for the runtime / no\_std path.
+/// Mirrors the API of `mpsc::Receiver` enough for `run_shard` to work.
+pub(crate) struct ShardReceiver<C> {
+    queue: alloc::sync::Arc<crate::ringbuf::RingBuffer<C>>,
+}
+
+impl<C> ShardReceiver<C> {
+    pub(crate) fn recv(&self) -> Result<C, ShardError> {
+        loop {
+            if let Some(cmd) = self.queue.pop() {
+                return Ok(cmd);
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Runtime-path mailbox using `ShardSender` from shard_runtime, wrapping it
+/// for the existing `ShardMailbox<C>` API.
+pub(crate) fn bounded_mailbox_runtime<C: Send + 'static>(capacity: usize) -> (ShardSender<C>, ShardReceiver<C>) {
+    use crate::shard_runtime::ShardSender;
+    let q = alloc::sync::Arc::new(crate::ringbuf::RingBuffer::bounded(capacity));
+    let sender = ShardSender { queue: alloc::sync::Arc::clone(&q) };
+    let receiver = ShardReceiver { queue: q };
+    (sender, receiver)
+}
     let (sender, receiver) = mpsc::sync_channel(capacity);
     (ShardMailbox::new(sender), receiver)
 }
@@ -370,8 +436,44 @@ pub(crate) trait HasShardId {
 
 pub(crate) struct ShardSet<H> {
     handles: Vec<H>,
-    joins: Vec<thread::JoinHandle<()>>,
+    /// Join handles for std threads. `None` when the runtime spawn path was
+    /// used (threads are self-managed).
+    joins: Option<Vec<thread::JoinHandle<()>>>,
     mailbox_capacity: usize,
+}
+
+impl<H: 'static> ShardSet<H> {
+    /// Starts a shard set using the given [`ShardRuntime`] for thread spawning
+    /// (the CharlotteOS / no\_std path). Threads are spawned via
+    /// `runtime.spawn_shard()` instead of `std::thread::spawn()`.
+    pub(crate) fn start_with_runtime<C, BuildHandle, RunShard, R>(
+        shard_count: usize,
+        _mailbox_capacity: usize,
+        mut build_handle: BuildHandle,
+        run_shard: RunShard,
+        runtime: &R,
+    ) -> Self
+    where
+        C: Send + 'static,
+        BuildHandle: FnMut(usize, ShardSender<C>) -> H,
+        RunShard: Fn(ShardId, ShardReceiver<C>) + Copy + Send + 'static,
+        R: crate::shard_runtime::ShardRuntime + ?Sized,
+    {
+        use crate::shard_runtime::ShardSender;
+        let mut handles = Vec::with_capacity(shard_count);
+        for shard_idx in 0..shard_count {
+            let (mailbox, receiver) = bounded_mailbox_runtime(256);
+            let _join = runtime.spawn_shard(
+                ShardId(shard_idx),
+                crate::placement::Placement::Sequential,
+                alloc::boxed::Box::new(move || {
+                    run_shard(ShardId(shard_idx), receiver);
+                }),
+            );
+            handles.push(build_handle(shard_idx, mailbox));
+        }
+        Self { handles, joins: None, mailbox_capacity: 256 }
+    }
 }
 
 impl<H> ShardSet<H> {
@@ -399,7 +501,7 @@ impl<H> ShardSet<H> {
 
         Self {
             handles,
-            joins,
+            joins: Some(joins),
             mailbox_capacity,
         }
     }
@@ -432,7 +534,10 @@ impl<H> ShardSet<H> {
     }
 
     pub(crate) fn join_drained(&mut self) -> Result<(), ShardError> {
-        join_all(self.joins.drain(..).collect())
+        match self.joins.take() {
+            Some(joins) => join_all(joins),
+            None => Ok(()), // Runtime path: threads are self-managed.
+        }
     }
 
     pub(crate) fn stop_and_join<F>(&mut self, mut stop_one: F) -> Result<(), ShardError>
