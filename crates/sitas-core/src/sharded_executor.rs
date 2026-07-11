@@ -1736,7 +1736,7 @@ pub struct ShardedExecutorShardSnapshot {
     pub executor: Option<ExecutorSnapshot>,
 }
 
-impl fmt::Debug for ShardedExecutor {
+impl<R: crate::shard_runtime::ShardRuntime + 'static> fmt::Debug for ShardedExecutor<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ShardedExecutor")
             .field("shard_count", &self.shard_count())
