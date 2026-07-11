@@ -1,3 +1,4 @@
+pub mod basic_kv;
 pub mod ringbuf;
 pub mod shard_runtime;
 pub mod charlotte_abi;

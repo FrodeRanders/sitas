@@ -1120,9 +1120,8 @@ impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
     pub fn available_parallelism() -> usize {
         crate::placement::default_shard_count().map_or(1, usize::from)
     }
-}
 
-/// Cloneable handle for submitting work to a [`ShardedExecutor`].
+    /// Cloneable handle for submitting work to a [`ShardedExecutor`].
 ///
 /// A submitter is intentionally separate from the runtime owner. It can be
 /// moved into tasks so one shard can submit work to another shard and await the
