@@ -1,3 +1,6 @@
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
 //! Streaming reply channels for sharded services.
 //!
 //! A [`StreamReply<T>`] bridges between a shard producing multiple values and a

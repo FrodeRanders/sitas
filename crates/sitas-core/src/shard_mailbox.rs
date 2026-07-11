@@ -1,3 +1,6 @@
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
 //! Typed owned-message transfer between executor shards.
 //!
 //! A [`ShardMailboxSet`] owns one bounded inbound mailbox per shard. Producers

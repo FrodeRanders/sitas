@@ -1,3 +1,6 @@
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
 //! Error types returned by shard and runtime operations.
 //!
 //! [`ShardError`] is the central error type for the std-only shard runtime

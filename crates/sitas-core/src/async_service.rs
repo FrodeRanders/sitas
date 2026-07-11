@@ -1,3 +1,6 @@
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
 //! Async-service bridge for the shard-per-thread model.
 //!
 //! This module provides adapters that wrap std-layer sharded services

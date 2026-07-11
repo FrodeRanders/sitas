@@ -1,3 +1,6 @@
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::boxed::Box;
 //! Shard-per-thread async executor runtime.
 //!
 //! This module is the first bridge between the single-threaded async executor
@@ -9,7 +12,7 @@ use core::fmt;
 use core::future::Future;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::thread;
+use crate::shard_runtime::ShardJoinHandle;
 use core::time::{Duration, Instant};
 
 use crate::error::ShardError;
@@ -1725,7 +1728,7 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use std::thread;
+    use crate::shard_runtime::ShardJoinHandle;
     use core::time::{Duration, Instant};
 
     #[test]

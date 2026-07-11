@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod ringbuf;
+pub mod shard_runtime;
 pub mod charlotte_abi;
 pub mod io;
 pub mod instant;
