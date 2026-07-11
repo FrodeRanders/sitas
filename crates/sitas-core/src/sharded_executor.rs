@@ -1115,11 +1115,11 @@ impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
             .as_ref()
             .ok_or(ShardedSpawnError::Stopped(shard_id))
     }
-}
 
-/// Returns the host's reported available parallelism, falling back to one.
-pub fn available_parallelism() -> usize {
-    crate::placement::default_shard_count().map_or(1, usize::from)
+    /// Returns the host's reported available parallelism, falling back to one.
+    pub fn available_parallelism() -> usize {
+        crate::placement::default_shard_count().map_or(1, usize::from)
+    }
 }
 
 /// Cloneable handle for submitting work to a [`ShardedExecutor`].
