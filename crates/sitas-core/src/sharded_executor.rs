@@ -132,10 +132,6 @@ use spin::LazyLock;
 static CURRENT_SHARD: LazyLock<spin::Mutex<Option<ShardId>>> = LazyLock::new(|| spin::Mutex::new(None));
 static CURRENT_CPU: LazyLock<spin::Mutex<Option<crate::placement::CpuPlacementStatus>>> = LazyLock::new(|| spin::Mutex::new(None));
 static CURRENT_MEM: LazyLock<spin::Mutex<Option<crate::placement::MemoryPlacementStatus>>> = LazyLock::new(|| spin::Mutex::new(None));
-    static CURRENT_EXECUTOR_SHARD: core::cell::Cell<Option<ShardId>> = const { core::cell::Cell::new(None) };
-    static CURRENT_EXECUTOR_CPU_PLACEMENT: core::cell::RefCell<Option<CpuPlacementStatus>> = const { core::cell::RefCell::new(None) };
-    static CURRENT_EXECUTOR_MEMORY_PLACEMENT: core::cell::RefCell<Option<MemoryPlacementStatus>> = const { core::cell::RefCell::new(None) };
-}
 
 /// Returns the shard currently polling this task, if the caller is running on a
 /// [`ShardedExecutor`] shard thread.
