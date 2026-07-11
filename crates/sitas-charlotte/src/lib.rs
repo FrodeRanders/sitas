@@ -27,6 +27,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 
 use sitas_core::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker, SchedulerWake};
+use sitas_core::shard_runtime::{ShardJoinHandle, ShardRuntime, RawJoinHandle};
+use sitas_core::shard::ShardId;
 
 /// The virtual address where the CQ ring is mapped in the user AS.
 const CQ_RING_VADDR: usize = 0x0000_0000_0001_1000;
@@ -63,16 +65,10 @@ unsafe fn sys_close(asid: u64, cap: u64) {
     syscall(6, asid, cap, 0, 0);
 }
 
-/// Syscall: cross-LP wake (IPI to `target_lp`).
+/// Syscall: spawn a thread pinned to a specific LP.
 #[inline(always)]
-unsafe fn sys_wake(target_lp: u32) {
-    // Wake is currently an empty SVC (wake(cq) is not wired as a separate
-    // syscall; instead we use try_send_ipi_rpc via the kernel's IPI module,
-    // which is called internally by `send_ipi` when `ShardMailbox::try_send`
-    // or `try_send_ipi_rpc` is used. For the reactor backend, a wake is
-    // modeled as a no-op syscall that the kernel will handle once the
-    // cross-LP wake ABI is wired.)
-    let _ = syscall(7, target_lp as u64, 0, 0, 0);
+unsafe fn sys_spawn(asid: u64, entry_vaddr: u64, target_lp: u64) -> u64 {
+    syscall(7, asid, entry_vaddr, target_lp, 0)
 }
 
 // ---- reactor backend --------------------------------------------------------
@@ -242,5 +238,40 @@ impl ReactorBackend for CharlotteReactor {
             }
             core::hint::spin_loop();
         }
+    }
+}
+
+// ---- ShardRuntime implementation -------------------------------------------
+
+impl ShardRuntime for CharlotteReactor {
+    type JoinHandle<T: Send> = ShardJoinHandle<T>;
+
+    fn spawn_shard<T: Send + 'static>(
+        &self,
+        shard_id: ShardId,
+        _placement: sitas_core::placement::Placement,
+        entry: alloc::boxed::Box<dyn FnOnce() -> T + Send>,
+    ) -> ShardJoinHandle<T> {
+        let entry_ptr = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(entry));
+        let entry_vaddr = entry_ptr as *const () as usize;
+        unsafe {
+            sys_spawn(self.asid, entry_vaddr as u64, shard_id.0 as u64);
+        }
+        ShardJoinHandle::from_raw(RawJoinHandle)
+    }
+
+    fn channel<M: Send + 'static>(
+        &self,
+        capacity: usize,
+    ) -> sitas_core::shard_runtime::ShardChannelResult<M> {
+        let q = alloc::sync::Arc::new(sitas_core::ringbuf::RingBuffer::bounded(capacity));
+        Ok((
+            sitas_core::shard_runtime::ShardSender { queue: alloc::sync::Arc::clone(&q) },
+            sitas_core::shard_runtime::ShardReceiver { queue: q },
+        ))
+    }
+
+    fn sleep(&self, _duration: Duration) {
+        for _ in 0..10000 { core::hint::spin_loop(); }
     }
 }
