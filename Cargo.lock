@@ -28,6 +28,7 @@ name = "sitas-charlotte"
 version = "0.1.0"
 dependencies = [
  "sitas-core",
+ "spin",
 ]
 
 [[package]]

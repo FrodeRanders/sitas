@@ -26,6 +26,14 @@ pub enum ErrorKind {
     UnexpectedEof,
 }
 
+impl core::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.to_string())
+    }
+}
+
+impl core::error::Error for ErrorKind {}
+
 impl ErrorKind {
     pub fn to_string(&self) -> &'static str {
         match self {

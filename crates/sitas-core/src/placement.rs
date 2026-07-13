@@ -5,8 +5,7 @@
 //! standard library's hasher. The free function [`crate::placement::shard_for_hash`] provides
 //! the same hash-based mapping without the trait.
 
-use alloc::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use core::hash::{Hash, Hasher};
 
 use crate::ShardId;
 
@@ -26,6 +25,15 @@ pub trait Placement<K: ?Sized> {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HashPlacement;
 
+/// Runtime-level shard placement request passed to [`crate::shard_runtime::ShardRuntime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardPlacement {
+    /// Let the backend choose where the shard runs.
+    Unpinned,
+    /// Place shard `n` on logical processor `n` when the backend supports it.
+    Sequential,
+}
+
 impl<K: Hash + ?Sized> Placement<K> for HashPlacement {
     fn shard_for(&self, key: &K, shard_count: usize) -> ShardId {
         shard_for_hash(key, shard_count)
@@ -39,8 +47,30 @@ impl<K: Hash + ?Sized> Placement<K> for HashPlacement {
 pub fn shard_for_hash<K: Hash + ?Sized>(key: &K, shard_count: usize) -> ShardId {
     debug_assert!(shard_count > 0);
 
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FnvHasher::default();
     key.hash(&mut hasher);
 
     ShardId((hasher.finish() as usize) % shard_count)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FnvHasher(u64);
+
+impl Default for FnvHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
 }

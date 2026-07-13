@@ -8,3 +8,4 @@ repository = "https://github.com/FrodeRanders/sitas"
 
 [dependencies]
 sitas-core = { path = "../sitas-core" }
+spin = "0.9"

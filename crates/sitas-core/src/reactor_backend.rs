@@ -4,15 +4,15 @@
 //! single-threaded executor actually requires from the operating system in
 //! order to sleep until something interesting happens and to be woken from
 //! another thread or core. Today that contract is satisfied implicitly by the
-//! Unix [`OsReactor`](crate::os::OsReactor) / [`OsWaker`](crate::os::OsWaker)
+//! Unix `OsReactor` / `OsWaker`
 //! types under `#[cfg(unix)]`; naming it makes the seam a documented boundary
 //! that an alternative backend (for example a co-designed asynchronous OS whose
 //! kernel exposes completion capabilities) can implement behind the same
 //! interface.
 //!
 //! This is a *spike*: it defines and validates the boundary without yet
-//! rewriting [`Executor`](crate::executor) and
-//! [`Scheduler`](crate::executor) to be generic over it. The goal is to answer
+//! rewriting `Executor` and
+//! `Scheduler` to be generic over it. The goal is to answer
 //! the decision-gate questions:
 //!
 //! 1. Is the OS contract the executor needs genuinely small and clean?
@@ -46,8 +46,9 @@
 //! change; a follow-up step (not part of this spike) would thread the trait
 //! through `Executor`/`Scheduler` so the concrete type becomes a parameter.
 
-use std::io;
 use core::time::Duration;
+
+use crate::io;
 
 /// A cloneable handle that can wake a blocked [`ReactorBackend`] from another
 /// thread or core.
@@ -68,7 +69,7 @@ pub trait ReactorWaker: Clone + Send + Sync {
 ///
 /// The scheduler only ever needs to *wake* its reactor; it never needs the
 /// concrete waker type. Erasing the waker to this object-safe trait keeps the
-/// [`Scheduler`](crate::executor) non-generic while still routing wakes through
+/// `Scheduler` non-generic while still routing wakes through
 /// whatever [`ReactorWaker`] the active [`ReactorBackend`] provides. Any
 /// `ReactorWaker` that is also `Debug` is automatically a `SchedulerWake`.
 pub trait SchedulerWake: core::fmt::Debug + Send + Sync {
@@ -140,13 +141,13 @@ pub trait ReactorBackend {
 // These blanket implementations exist to *prove* the boundary is well-formed:
 // the current Unix reactor already fits behind it with no behavior change.
 
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 mod unix_impls {
     use super::{ReactorBackend, ReactorEvent, ReactorWaker};
     use crate::os::{OsEvent, OsReactor, OsWaker};
+    use core::time::Duration;
     use std::io;
     use std::os::unix::io::RawFd;
-    use core::time::Duration;
 
     impl ReactorWaker for OsWaker {
         fn wake(&self) -> io::Result<()> {
@@ -190,17 +191,17 @@ mod unix_impls {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     //! A minimal in-memory backend proving the contract is implementable
     //! without any OS descriptors — the stand-in for a future foreign backend
     //! (for example a CharlotteOS completion-capability reactor).
 
     use super::{ReactorBackend, ReactorEvent, ReactorWaker};
-    use std::io;
     use core::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
     use core::time::Duration;
+    use std::io;
+    use std::sync::{Arc, Condvar, Mutex};
 
     /// Interests are identified by an opaque integer id, standing in for a
     /// completion-capability handle rather than a Unix `RawFd`.

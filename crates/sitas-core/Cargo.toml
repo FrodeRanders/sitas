@@ -6,6 +6,10 @@ description = "sitas shard-per-core runtime core (no_std + alloc)"
 license = "MIT"
 repository = "https://github.com/FrodeRanders/sitas"
 
+[features]
+default = []
+std = []
+
 [dependencies]
 spin = "0.9"
 # concurrent-queue requires std; we provide a no_std SPSC ring buffer internally.

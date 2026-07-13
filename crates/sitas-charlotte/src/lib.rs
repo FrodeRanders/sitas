@@ -23,52 +23,73 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 
-use sitas_core::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker, SchedulerWake};
-use sitas_core::shard_runtime::{ShardJoinHandle, ShardRuntime, RawJoinHandle};
+use sitas_core::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker};
 use sitas_core::shard::ShardId;
+use sitas_core::shard_runtime::{RawJoinHandle, ShardJoinHandle, ShardRuntime};
+use spin::Mutex;
 
 /// The virtual address where the CQ ring is mapped in the user AS.
 const CQ_RING_VADDR: usize = 0x0000_0000_0001_1000;
+const SYSCALL_COMPLETION_SUBMIT: u16 = 1;
+const SYSCALL_SPAWN_THREAD: u16 = 7;
+const SYSCALL_MAILBOX_SEND: u16 = 9;
+
+static SHARD_ENTRIES: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
 
 // ---- syscall wrappers -------------------------------------------------------
 
 /// Invoke a syscall with the given SVC immediate and arguments.
 #[inline(always)]
 unsafe fn syscall(imm: u16, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "svc {}",
-            in(reg) imm,
-            inlateout("x0") x0 => ret,
-            in("x1") x1,
-            in("x2") x2,
-            in("x3") x3,
-            options(nostack, nomem, preserves_flags),
-        );
+    macro_rules! svc {
+        ($number:literal) => {{
+            let ret: u64;
+            unsafe {
+                core::arch::asm!(
+                    concat!("svc #", stringify!($number)),
+                    inlateout("x0") x0 => ret,
+                    in("x1") x1,
+                    in("x2") x2,
+                    in("x3") x3,
+                    options(nostack, nomem, preserves_flags),
+                );
+            }
+            ret
+        }};
     }
-    ret
-}
 
-/// Syscall: completion::wait(asid, cap) — blocks until the capability completes.
-#[inline(always)]
-unsafe fn sys_wait(asid: u64, cap: u64) {
-    syscall(4, asid, cap, 0, 0);
-}
-
-/// Syscall: completion::close(asid, cap) — frees a capability slot.
-#[inline(always)]
-unsafe fn sys_close(asid: u64, cap: u64) {
-    syscall(6, asid, cap, 0, 0);
+    match imm {
+        SYSCALL_COMPLETION_SUBMIT => svc!(1),
+        SYSCALL_SPAWN_THREAD => svc!(7),
+        SYSCALL_MAILBOX_SEND => svc!(9),
+        _ => {
+            let _ = (x0, x1, x2, x3);
+            1
+        }
+    }
 }
 
 /// Syscall: spawn a thread pinned to a specific LP.
 #[inline(always)]
 unsafe fn sys_spawn(asid: u64, entry_vaddr: u64, target_lp: u64) -> u64 {
-    syscall(7, asid, entry_vaddr, target_lp, 0)
+    unsafe { syscall(SYSCALL_SPAWN_THREAD, asid, entry_vaddr, target_lp, 0) }
+}
+
+#[inline(always)]
+unsafe fn sys_wake(asid: u64, target_lp: u32) -> u64 {
+    unsafe { syscall(SYSCALL_MAILBOX_SEND, asid, u64::from(target_lp), 1, 0) }
+}
+
+extern "C" fn shard_entry_trampoline() {
+    let entry = SHARD_ENTRIES.lock().pop();
+    if let Some(entry) = entry {
+        entry();
+    }
 }
 
 // ---- reactor backend --------------------------------------------------------
@@ -110,7 +131,15 @@ impl CharlotteReactor {
         let buf_ptr = buffer.map(|b| b.as_ptr() as u64).unwrap_or(0);
         let buf_len = buffer.map(|b| b.len() as u64).unwrap_or(0);
         // Syscall #1: COMPLETION_SUBMIT
-        unsafe { syscall(1, self.asid, op_code, buf_ptr, buf_len) };
+        unsafe {
+            syscall(
+                SYSCALL_COMPLETION_SUBMIT,
+                self.asid,
+                op_code,
+                buf_ptr,
+                buf_len,
+            )
+        };
         cap
     }
 }
@@ -135,13 +164,13 @@ pub struct CqEntry {
 }
 
 impl CqHeader {
-    fn pending(&self) -> u32 {
+    pub fn pending(&self) -> u32 {
         let h = unsafe { core::ptr::read_volatile(&self.head) };
         let t = unsafe { core::ptr::read_volatile(&self.tail) };
         if h >= t { h - t } else { h + self.capacity - t }
     }
 
-    fn read_one(&self) -> Option<CqEntry> {
+    pub fn read_one(&self) -> Option<CqEntry> {
         if self.pending() == 0 {
             return None;
         }
@@ -149,11 +178,13 @@ impl CqHeader {
         let entry_ptr = unsafe {
             let base = self as *const Self as *const u8;
             let entries_offset = core::mem::offset_of!(Self, overflow) + 4;
-            base.add(entries_offset).add(t as usize * core::mem::size_of::<CqEntry>()) as *const CqEntry
+            base.add(entries_offset)
+                .add(t as usize * core::mem::size_of::<CqEntry>()) as *const CqEntry
         };
         unsafe {
             let entry = core::ptr::read_volatile(entry_ptr);
-            core::ptr::write_volatile(&raw mut *(self as *const Self as *mut Self).tail, (t + 1) % self.capacity);
+            let this = self as *const Self as *mut Self;
+            core::ptr::write_volatile(&raw mut (*this).tail, (t + 1) % self.capacity);
             Some(entry)
         }
     }
@@ -165,24 +196,25 @@ impl CqHeader {
 #[derive(Clone)]
 pub struct CharlWaker {
     target_lp: u32,
+    asid: u64,
 }
 
 impl ReactorWaker for CharlWaker {
     fn wake(&self) -> Result<(), sitas_core::io::ErrorKind> {
-        unsafe { sys_wake(self.target_lp) };
-        Ok(())
+        let result = unsafe { sys_wake(self.asid, self.target_lp) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(sitas_core::io::ErrorKind::WouldBlock)
+        }
     }
 }
 
 impl core::fmt::Debug for CharlWaker {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CharlWaker").field("target_lp", &self.target_lp).finish()
-    }
-}
-
-impl SchedulerWake for CharlWaker {
-    fn wake(&self) {
-        let _ = ReactorWaker::wake(self);
+        f.debug_struct("CharlWaker")
+            .field("target_lp", &self.target_lp)
+            .finish()
     }
 }
 
@@ -193,9 +225,15 @@ pub struct CharlEvent {
 
 impl ReactorEvent for CharlEvent {
     type Handle = u64;
-    fn woke(&self) -> bool { self.woke }
-    fn readable(&self) -> &[u64] { &self.readable }
-    fn writable(&self) -> &[u64] { &[] }
+    fn woke(&self) -> bool {
+        self.woke
+    }
+    fn readable(&self) -> &[u64] {
+        &self.readable
+    }
+    fn writable(&self) -> &[u64] {
+        &[]
+    }
 }
 
 impl ReactorBackend for CharlotteReactor {
@@ -204,7 +242,10 @@ impl ReactorBackend for CharlotteReactor {
     type Event = CharlEvent;
 
     fn waker(&self) -> CharlWaker {
-        CharlWaker { target_lp: self.lp_id }
+        CharlWaker {
+            target_lp: self.lp_id,
+            asid: self.asid,
+        }
     }
 
     fn wait(
@@ -229,12 +270,18 @@ impl ReactorBackend for CharlotteReactor {
                         caps.push(entry.cap);
                     }
                 }
-                return Ok(CharlEvent { woke: false, readable: caps });
+                return Ok(CharlEvent {
+                    woke: false,
+                    readable: caps,
+                });
             }
-            if let Some(dl) = deadline {
-                if sitas_core::instant::Instant::now() >= dl {
-                    return Ok(CharlEvent { woke: false, readable: alloc::vec::Vec::new() });
-                }
+            if let Some(dl) = deadline
+                && sitas_core::instant::Instant::now() >= dl
+            {
+                return Ok(CharlEvent {
+                    woke: false,
+                    readable: alloc::vec::Vec::new(),
+                });
             }
             core::hint::spin_loop();
         }
@@ -249,11 +296,13 @@ impl ShardRuntime for CharlotteReactor {
     fn spawn_shard<T: Send + 'static>(
         &self,
         shard_id: ShardId,
-        _placement: sitas_core::placement::Placement,
+        _placement: sitas_core::placement::ShardPlacement,
         entry: alloc::boxed::Box<dyn FnOnce() -> T + Send>,
     ) -> ShardJoinHandle<T> {
-        let entry_ptr = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(entry));
-        let entry_vaddr = entry_ptr as *const () as usize;
+        SHARD_ENTRIES.lock().push(Box::new(move || {
+            let _ = entry();
+        }));
+        let entry_vaddr = shard_entry_trampoline as *const () as usize;
         unsafe {
             sys_spawn(self.asid, entry_vaddr as u64, shard_id.0 as u64);
         }
@@ -264,14 +313,12 @@ impl ShardRuntime for CharlotteReactor {
         &self,
         capacity: usize,
     ) -> sitas_core::shard_runtime::ShardChannelResult<M> {
-        let q = alloc::sync::Arc::new(sitas_core::ringbuf::RingBuffer::bounded(capacity));
-        Ok((
-            sitas_core::shard_runtime::ShardSender { queue: alloc::sync::Arc::clone(&q) },
-            sitas_core::shard_runtime::ShardReceiver { queue: q },
-        ))
+        sitas_core::shard_runtime::channel(capacity)
     }
 
     fn sleep(&self, _duration: Duration) {
-        for _ in 0..10000 { core::hint::spin_loop(); }
+        for _ in 0..10000 {
+            core::hint::spin_loop();
+        }
     }
 }

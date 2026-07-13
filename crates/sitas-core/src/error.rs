@@ -1,6 +1,5 @@
 use alloc::string::String;
-use alloc::vec::Vec;
-use alloc::boxed::Box;;
+use core::error::Error;
 use core::fmt;
 
 /// Errors returned by shard lifecycle and mailbox operations.

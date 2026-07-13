@@ -16,12 +16,13 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
+use core::marker::PhantomData;
 use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 
+use crate::placement::ShardPlacement;
 use crate::ringbuf::RingBuffer;
 use crate::shard::ShardId;
 
@@ -29,6 +30,7 @@ use crate::shard::ShardId;
 /// The handle can be waited on (joining the thread) and checked for completion.
 pub struct ShardJoinHandle<T> {
     inner: JoinHandleInner<T>,
+    _result: PhantomData<fn() -> T>,
 }
 
 enum JoinHandleInner<T> {
@@ -36,26 +38,38 @@ enum JoinHandleInner<T> {
     Raw(RawJoinHandle),
     #[cfg(feature = "std")]
     Std(std::thread::JoinHandle<T>),
+    #[cfg(not(feature = "std"))]
+    _Result(PhantomData<fn() -> T>),
 }
 
 impl<T> ShardJoinHandle<T> {
     #[cfg(feature = "std")]
     pub fn from_std(handle: std::thread::JoinHandle<T>) -> Self {
-        Self { inner: JoinHandleInner::Std(handle) }
+        Self {
+            inner: JoinHandleInner::Std(handle),
+            _result: PhantomData,
+        }
     }
 
     #[cfg(not(feature = "std"))]
     pub fn from_raw(handle: RawJoinHandle) -> Self {
-        Self { inner: JoinHandleInner::Raw(handle) }
+        Self {
+            inner: JoinHandleInner::Raw(handle),
+            _result: PhantomData,
+        }
     }
 
     /// Blocks until the spawned thread exits and returns its result.
     pub fn join(self) -> core::result::Result<T, Box<dyn core::error::Error + Send + Sync>> {
         match self.inner {
             #[cfg(feature = "std")]
-            JoinHandleInner::Std(handle) => handle.join().map_err(|e| Box::new(e.to_string().as_str())),
+            JoinHandleInner::Std(handle) => handle.join().map_err(|_| {
+                Box::new(crate::io::ErrorKind::Other) as Box<dyn core::error::Error + Send + Sync>
+            }),
             #[cfg(not(feature = "std"))]
             JoinHandleInner::Raw(handle) => handle.join(),
+            #[cfg(not(feature = "std"))]
+            JoinHandleInner::_Result(_) => unreachable!(),
         }
     }
 
@@ -65,6 +79,8 @@ impl<T> ShardJoinHandle<T> {
             JoinHandleInner::Std(handle) => handle.is_finished(),
             #[cfg(not(feature = "std"))]
             JoinHandleInner::Raw(handle) => handle.is_finished(),
+            #[cfg(not(feature = "std"))]
+            JoinHandleInner::_Result(_) => unreachable!(),
         }
     }
 }
@@ -82,24 +98,62 @@ impl<T> fmt::Debug for ShardJoinHandle<T> {
 pub struct RawJoinHandle;
 
 impl RawJoinHandle {
-    pub fn is_finished(&self) -> bool { false }
-    pub fn join(self) -> core::result::Result<(), Box<dyn core::error::Error + Send + Sync>> {
+    pub fn is_finished(&self) -> bool {
+        false
+    }
+    pub fn join<T>(self) -> core::result::Result<T, Box<dyn core::error::Error + Send + Sync>> {
         Err(Box::new(crate::io::ErrorKind::Other) as Box<dyn core::error::Error + Send + Sync>)
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardChannelError {
+    InvalidCapacity,
+}
+
+impl fmt::Display for ShardChannelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCapacity => write!(f, "channel capacity must be at least two"),
+        }
+    }
+}
+
+impl core::error::Error for ShardChannelError {}
+
 /// The result type for `ShardRuntime::channel`.
-pub type ShardChannelResult<M> = core::result::Result<(ShardSender<M>, ShardReceiver<M>), ()>;
+pub type ShardChannelResult<M> =
+    core::result::Result<(ShardSender<M>, ShardReceiver<M>), ShardChannelError>;
+
+pub fn channel<M: Send + 'static>(capacity: usize) -> ShardChannelResult<M> {
+    if capacity < 2 {
+        return Err(ShardChannelError::InvalidCapacity);
+    }
+    let queue = Arc::new(RingBuffer::bounded(capacity));
+    Ok((
+        ShardSender {
+            queue: Arc::clone(&queue),
+        },
+        ShardReceiver { queue },
+    ))
+}
 
 /// A cloneable sender for a typed inter-shard channel.
-#[derive(Debug)]
 pub struct ShardSender<M> {
     queue: Arc<RingBuffer<M>>,
 }
 
+impl<M> fmt::Debug for ShardSender<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardSender").finish_non_exhaustive()
+    }
+}
+
 impl<M> Clone for ShardSender<M> {
     fn clone(&self) -> Self {
-        Self { queue: Arc::clone(&self.queue) }
+        Self {
+            queue: Arc::clone(&self.queue),
+        }
     }
 }
 
@@ -110,9 +164,14 @@ impl<M> ShardSender<M> {
 }
 
 /// A single-consumer receiver for a typed inter-shard channel.
-#[derive(Debug)]
 pub struct ShardReceiver<M> {
     queue: Arc<RingBuffer<M>>,
+}
+
+impl<M> fmt::Debug for ShardReceiver<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardReceiver").finish_non_exhaustive()
+    }
 }
 
 impl<M> ShardReceiver<M> {
@@ -136,7 +195,7 @@ pub trait ShardRuntime: Send + Sync {
     fn spawn_shard<T: Send + 'static>(
         &self,
         shard_id: ShardId,
-        placement: crate::placement::Placement,
+        placement: ShardPlacement,
         entry: Box<dyn FnOnce() -> T + Send>,
     ) -> Self::JoinHandle<T>;
 

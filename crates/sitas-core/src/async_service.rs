@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::boxed::Box;;
+use alloc::boxed::Box;
 use crate::kv::ShardedKv;
 
 /// Async wrapper around a [`ShardedKv`] reference.
