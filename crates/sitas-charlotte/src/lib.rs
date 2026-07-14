@@ -25,7 +25,6 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 
 use sitas_core::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker};
@@ -45,17 +44,17 @@ static SHARD_ENTRIES: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new
 
 /// Invoke a syscall with the given SVC immediate and arguments.
 #[inline(always)]
-unsafe fn syscall(imm: u16, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
+unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     macro_rules! svc {
         ($number:literal) => {{
             let ret: u64;
             unsafe {
                 core::arch::asm!(
                     concat!("svc #", stringify!($number)),
-                    inlateout("x0") x0 => ret,
-                    in("x1") x1,
-                    in("x2") x2,
-                    in("x3") x3,
+                    lateout("x0") ret,
+                    in("x1") arg1,
+                    in("x2") arg2,
+                    in("x3") arg3,
                     options(nostack, nomem, preserves_flags),
                 );
             }
@@ -68,7 +67,7 @@ unsafe fn syscall(imm: u16, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
         SYSCALL_SPAWN_THREAD => svc!(7),
         SYSCALL_MAILBOX_SEND => svc!(9),
         _ => {
-            let _ = (x0, x1, x2, x3);
+            let _ = (arg1, arg2, arg3);
             1
         }
     }
@@ -76,13 +75,13 @@ unsafe fn syscall(imm: u16, x0: u64, x1: u64, x2: u64, x3: u64) -> u64 {
 
 /// Syscall: spawn a thread pinned to a specific LP.
 #[inline(always)]
-unsafe fn sys_spawn(asid: u64, entry_vaddr: u64, target_lp: u64) -> u64 {
-    unsafe { syscall(SYSCALL_SPAWN_THREAD, asid, entry_vaddr, target_lp, 0) }
+unsafe fn sys_spawn(entry_vaddr: u64, target_lp: u64) -> u64 {
+    unsafe { syscall(SYSCALL_SPAWN_THREAD, entry_vaddr, target_lp, 0) }
 }
 
 #[inline(always)]
-unsafe fn sys_wake(asid: u64, target_lp: u32) -> u64 {
-    unsafe { syscall(SYSCALL_MAILBOX_SEND, asid, u64::from(target_lp), 1, 0) }
+unsafe fn sys_wake(target_lp: u32) -> u64 {
+    unsafe { syscall(SYSCALL_MAILBOX_SEND, u64::from(target_lp), 1, 0) }
 }
 
 extern "C" fn shard_entry_trampoline() {
@@ -97,21 +96,13 @@ extern "C" fn shard_entry_trampoline() {
 /// A reactor for one LP (shard). All state is in the CQ ring mapped at
 /// `CQ_RING_VADDR` and the per-LP kernel completion table.
 pub struct CharlotteReactor {
-    /// The address-space id this reactor's shard uses for completions.
-    asid: u64,
     /// Which LP this reactor is pinned to.
     lp_id: u32,
-    /// Monotonically-allocated completion-cap IDs (local to this reactor).
-    next_cap: AtomicU64,
 }
 
 impl CharlotteReactor {
-    pub fn new(asid: u64, lp_id: u32) -> Self {
-        Self {
-            asid,
-            lp_id,
-            next_cap: AtomicU64::new(1),
-        }
+    pub fn new(lp_id: u32) -> Self {
+        Self { lp_id }
     }
 
     /// Returns the underlying CQ ring header.
@@ -119,28 +110,13 @@ impl CharlotteReactor {
         unsafe { &*(CQ_RING_VADDR as *const CqHeader) }
     }
 
-    /// Monotonically allocates a local capability ID.
-    fn alloc_cap(&self) -> u64 {
-        self.next_cap.fetch_add(1, Ordering::Relaxed)
-    }
-
     /// Submit an async operation and return a future that completes when the
     /// kernel posts the completion.
     pub fn submit_wait(&self, op_code: u64, buffer: Option<&[u8]>) -> u64 {
-        let cap = self.alloc_cap();
         let buf_ptr = buffer.map(|b| b.as_ptr() as u64).unwrap_or(0);
         let buf_len = buffer.map(|b| b.len() as u64).unwrap_or(0);
-        // Syscall #1: COMPLETION_SUBMIT
-        unsafe {
-            syscall(
-                SYSCALL_COMPLETION_SUBMIT,
-                self.asid,
-                op_code,
-                buf_ptr,
-                buf_len,
-            )
-        };
-        cap
+        // Syscall #1: COMPLETION_SUBMIT returns the kernel-owned completion cap.
+        unsafe { syscall(SYSCALL_COMPLETION_SUBMIT, op_code, buf_ptr, buf_len) }
     }
 }
 
@@ -196,12 +172,11 @@ impl CqHeader {
 #[derive(Clone)]
 pub struct CharlWaker {
     target_lp: u32,
-    asid: u64,
 }
 
 impl ReactorWaker for CharlWaker {
     fn wake(&self) -> Result<(), sitas_core::io::ErrorKind> {
-        let result = unsafe { sys_wake(self.asid, self.target_lp) };
+        let result = unsafe { sys_wake(self.target_lp) };
         if result == 0 {
             Ok(())
         } else {
@@ -244,7 +219,6 @@ impl ReactorBackend for CharlotteReactor {
     fn waker(&self) -> CharlWaker {
         CharlWaker {
             target_lp: self.lp_id,
-            asid: self.asid,
         }
     }
 
@@ -304,7 +278,7 @@ impl ShardRuntime for CharlotteReactor {
         }));
         let entry_vaddr = shard_entry_trampoline as *const () as usize;
         unsafe {
-            sys_spawn(self.asid, entry_vaddr as u64, shard_id.0 as u64);
+            sys_spawn(entry_vaddr as u64, shard_id.0 as u64);
         }
         ShardJoinHandle::from_raw(RawJoinHandle)
     }
