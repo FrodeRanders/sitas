@@ -204,4 +204,33 @@ pub trait ShardRuntime: Send + Sync {
 
     /// Block the calling thread for at least `duration`.
     fn sleep(&self, duration: core::time::Duration);
+
+    /// Obtain a shared [`ShardParker`] for this runtime. A shard waiting for
+    /// a message or a reply parks through it — sleeping with no CPU cost —
+    /// instead of busy-spinning, and a peer shard releases it with
+    /// [`ShardParker::unpark`].
+    fn parker(&self) -> Arc<dyn ShardParker>;
+}
+
+/// A shareable handle to park the calling shard and to release parked shards.
+///
+/// This is the seam that lets sitas services block instead of busy-spinning
+/// while waiting for an inter-shard message or reply. `park` sleeps the caller
+/// (with no CPU cost) until a peer calls `unpark`, until an optional deadline
+/// elapses, or spuriously; `unpark` releases parked shards so they re-check
+/// their state. Callers must always re-check their condition after `park`
+/// returns, because spurious and coalesced wakeups are permitted.
+///
+/// On a co-designed asynchronous OS the implementation is the kernel's
+/// completion-queue wait/wake (`CQ_WAIT`/`CQ_WAKE`); a hosted backend would
+/// use a futex or condition variable.
+pub trait ShardParker: Send + Sync {
+    /// Park the calling shard until [`unpark`](ShardParker::unpark) is called,
+    /// `timeout` elapses (if given), or a spurious wakeup occurs.
+    fn park(&self, timeout: Option<core::time::Duration>);
+
+    /// Release shards parked on this runtime so they re-check their state.
+    /// Waking more shards than strictly necessary is permitted (they simply
+    /// re-check and re-park).
+    fn unpark(&self);
 }

@@ -34,7 +34,9 @@ use core::time::Duration;
 
 use sitas_core::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker};
 use sitas_core::shard::ShardId;
-use sitas_core::shard_runtime::{RawJoinHandle, ShardJoinHandle, ShardRuntime};
+use sitas_core::shard_runtime::{
+    RawJoinHandle, ShardJoinHandle, ShardParker, ShardRuntime,
+};
 use spin::Mutex;
 
 /// The virtual address where the CQ ring is mapped in the user AS.
@@ -350,5 +352,49 @@ impl ShardRuntime for CharlotteReactor {
         // deadline (or a spurious peer wake) releases us.
         let timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1);
         let _ = unsafe { sys_cq_wait_timeout(u64::from(u32::MAX), timeout_ms) };
+    }
+
+    fn parker(&self) -> alloc::sync::Arc<dyn ShardParker> {
+        alloc::sync::Arc::new(CharlotteParker)
+    }
+}
+
+/// Parks and wakes shards through the kernel completion queue.
+///
+/// A shard waiting for an inter-shard message or reply parks in `CQ_WAIT`
+/// (bounded by a short deadline so a stolen or coalesced wake self-heals while
+/// the process-wide CQ is shared by all shards); a peer releases it with
+/// `CQ_WAKE`. This replaces the KV service's former `spin_loop` busy-waits, so
+/// a blocked shard consumes no CPU.
+///
+/// The deadline bound is a deliberate robustness choice until per-shard CQ
+/// rings are mapped into user space: with one process-wide ring, a single
+/// `CQ_WAKE` releases only one waiter, so a shard whose wake was consumed by a
+/// peer still re-checks its state within one park interval rather than
+/// stalling.
+#[derive(Clone, Copy)]
+pub struct CharlotteParker;
+
+/// The park interval, chosen small enough that a stolen/coalesced wake costs
+/// at most this much latency, and large enough that idle parking is genuinely
+/// cheap (a single kernel wait, no spinning).
+const PARK_INTERVAL_MS: u64 = 5;
+
+impl ShardParker for CharlotteParker {
+    fn park(&self, timeout: Option<Duration>) {
+        let ms = match timeout {
+            Some(duration) => {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).min(PARK_INTERVAL_MS).max(1)
+            }
+            None => PARK_INTERVAL_MS,
+        };
+        // A min_complete the small ring can never reach means the wait is
+        // released only by a peer `CQ_WAKE` or by the deadline — never by a
+        // stray completion entry meant for the reactor.
+        let _ = unsafe { sys_cq_wait_timeout(u64::from(u32::MAX), ms) };
+    }
+
+    fn unpark(&self) {
+        let _ = unsafe { sys_cq_wake() };
     }
 }

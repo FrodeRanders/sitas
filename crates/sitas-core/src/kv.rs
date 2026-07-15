@@ -1,4 +1,9 @@
 //! Minimal no_std sharded key-value service for foreign runtimes.
+//!
+//! Waiting is parked, never spun: a shard with an empty mailbox and a
+//! requester awaiting a reply both sleep through the runtime's
+//! [`ShardParker`] (on CharlotteOS: the kernel's `CQ_WAIT`/`CQ_WAKE`), and
+//! the peer that produces the awaited state releases them with `unpark`.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -6,11 +11,17 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 
 use crate::ShardError;
 use crate::placement::{HashPlacement, Placement, ShardPlacement};
 use crate::shard::ShardId;
-use crate::shard_runtime::{ShardReceiver, ShardRuntime, ShardSender};
+use crate::shard_runtime::{ShardParker, ShardReceiver, ShardRuntime, ShardSender};
+
+/// Upper bound on one park while waiting for a message or reply. Parks are a
+/// latency optimisation, not a correctness dependency: a lost or stolen wake
+/// costs at most one interval before the parked side re-checks its state.
+const PARK_TIMEOUT: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardedKvConfig {
@@ -44,6 +55,7 @@ impl ShardedKvConfig {
 
 pub struct ShardedKv {
     shards: Vec<KvShardHandle>,
+    parker: Arc<dyn ShardParker>,
 }
 
 impl ShardedKv {
@@ -52,6 +64,7 @@ impl ShardedKv {
         R: ShardRuntime + ?Sized,
     {
         let config = config.validate()?;
+        let parker = runtime.parker();
         let mut shards = Vec::with_capacity(config.shard_count);
 
         for index in 0..config.shard_count {
@@ -60,20 +73,22 @@ impl ShardedKv {
                 .map_err(|_| ShardError::InvalidMailboxCapacity)?;
             let stopped = Arc::new(AtomicBool::new(false));
             let shard_stopped = Arc::clone(&stopped);
+            let shard_parker = Arc::clone(&parker);
             let shard_id = ShardId(index);
             runtime.spawn_shard(
                 shard_id,
                 ShardPlacement::Sequential,
-                Box::new(move || run_kv_shard(receiver, shard_stopped)),
+                Box::new(move || run_kv_shard(receiver, shard_stopped, shard_parker)),
             );
             shards.push(KvShardHandle {
                 id: shard_id,
                 sender,
                 stopped,
+                parker: Arc::clone(&parker),
             });
         }
 
-        Ok(Self { shards })
+        Ok(Self { shards, parker })
     }
 
     pub fn put(&self, key: &str, value: &str) -> Result<(), ShardError> {
@@ -113,6 +128,7 @@ struct KvShardHandle {
     id: ShardId,
     sender: ShardSender<KvEnvelope>,
     stopped: Arc<AtomicBool>,
+    parker: Arc<dyn ShardParker>,
 }
 
 impl KvShardHandle {
@@ -127,8 +143,13 @@ impl KvShardHandle {
                 reply: Arc::clone(&reply),
             })
             .map_err(|_| ShardError::MailboxFull)?;
+        // Release the serving shard's park so it observes the new message.
+        self.parker.unpark();
         let _ = self.id;
-        Ok(KvReply { reply })
+        Ok(KvReply {
+            reply,
+            parker: Arc::clone(&self.parker),
+        })
     }
 }
 
@@ -151,41 +172,50 @@ enum KvReplyValue {
 
 struct KvReply {
     reply: Arc<crate::ringbuf::RingBuffer<KvReplyValue>>,
+    parker: Arc<dyn ShardParker>,
 }
 
 impl KvReply {
     fn recv_unit(self) -> Result<(), ShardError> {
-        match self.spin_recv()? {
+        match self.recv()? {
             KvReplyValue::Unit => Ok(()),
             _ => Err(ShardError::ReplyFailed),
         }
     }
 
     fn recv_string_option(self) -> Result<Option<String>, ShardError> {
-        match self.spin_recv()? {
+        match self.recv()? {
             KvReplyValue::StringOption(value) => Ok(value),
             _ => Err(ShardError::ReplyFailed),
         }
     }
 
     fn recv_usize(self) -> Result<usize, ShardError> {
-        match self.spin_recv()? {
+        match self.recv()? {
             KvReplyValue::Usize(value) => Ok(value),
             _ => Err(ShardError::ReplyFailed),
         }
     }
 
-    fn spin_recv(self) -> Result<KvReplyValue, ShardError> {
+    /// Wait for the serving shard's reply, parking (not spinning) between
+    /// checks. The serving shard `unpark`s us after it pushes the reply, so a
+    /// park normally lasts only until that wake; the bounded interval makes a
+    /// stolen or coalesced wake self-healing.
+    fn recv(self) -> Result<KvReplyValue, ShardError> {
         loop {
             if let Some(value) = self.reply.pop() {
                 return Ok(value);
             }
-            core::hint::spin_loop();
+            self.parker.park(Some(PARK_TIMEOUT));
         }
     }
 }
 
-fn run_kv_shard(mut receiver: ShardReceiver<KvEnvelope>, stopped: Arc<AtomicBool>) {
+fn run_kv_shard(
+    mut receiver: ShardReceiver<KvEnvelope>,
+    stopped: Arc<AtomicBool>,
+    parker: Arc<dyn ShardParker>,
+) {
     let mut map = BTreeMap::<String, String>::new();
 
     loop {
@@ -200,12 +230,16 @@ fn run_kv_shard(mut receiver: ShardReceiver<KvEnvelope>, stopped: Arc<AtomicBool
                     KvCommand::Len => KvReplyValue::Usize(map.len()),
                 };
                 let _ = envelope.reply.try_push(value);
+                // Release the requester waiting on this reply.
+                parker.unpark();
             }
             None => {
                 if stopped.load(Ordering::Acquire) {
                     break;
                 }
-                core::hint::spin_loop();
+                // Mailbox empty: park until a sender `unpark`s us (or the
+                // bounded interval elapses so shutdown is observed promptly).
+                parker.park(Some(PARK_TIMEOUT));
             }
         }
     }
@@ -216,5 +250,8 @@ impl Drop for ShardedKv {
         for shard in &self.shards {
             shard.stopped.store(true, Ordering::Release);
         }
+        // Release any shard parked on an empty mailbox so it observes the
+        // stop flag and exits, rather than waiting out its park interval.
+        self.parker.unpark();
     }
 }
