@@ -95,7 +95,7 @@ unsafe fn sys_cq_wait(min_complete: u64) -> u64 {
 }
 
 /// Syscall: like [`sys_cq_wait`] but also returns when `timeout_ms` elapses.
-/// Returns `(pending, timed_out)`.
+/// Waits on the default completion queue (id 0). Returns `(pending, timed_out)`.
 #[inline(always)]
 unsafe fn sys_cq_wait_timeout(min_complete: u64, timeout_ms: u64) -> (u64, u64) {
     let ret: u64;
@@ -106,6 +106,7 @@ unsafe fn sys_cq_wait_timeout(min_complete: u64, timeout_ms: u64) -> (u64, u64) 
             lateout("x0") ret,
             inlateout("x1") min_complete => timed_out,
             in("x2") timeout_ms,
+            in("x3") 0u64, // default CQ (id 0) until per-shard rings are mapped
             options(nostack, nomem, preserves_flags),
         );
     }
