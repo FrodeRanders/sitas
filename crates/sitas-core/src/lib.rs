@@ -11,6 +11,7 @@ pub mod placement;
 pub mod reactor_backend;
 pub mod ringbuf;
 pub mod shard;
+pub mod shard_executor;
 pub mod shard_runtime;
 
 #[cfg(feature = "std")]

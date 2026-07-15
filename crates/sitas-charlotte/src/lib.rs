@@ -322,6 +322,7 @@ impl ReactorBackend for CharlotteReactor {
 
 impl ShardRuntime for CharlotteReactor {
     type JoinHandle<T: Send> = ShardJoinHandle<T>;
+    type Reactor = CharlotteReactor;
 
     fn spawn_shard<T: Send + 'static>(
         &self,
@@ -356,6 +357,13 @@ impl ShardRuntime for CharlotteReactor {
 
     fn parker(&self) -> alloc::sync::Arc<dyn ShardParker> {
         alloc::sync::Arc::new(CharlotteParker)
+    }
+
+    fn shard_reactor(&self, shard_id: ShardId) -> CharlotteReactor {
+        // Until per-shard CQ rings are mapped into user space, every shard's
+        // reactor shares the process-wide default ring and queue; the LP id
+        // records the intended affinity for the per-shard partitioning step.
+        CharlotteReactor::new(shard_id.0 as u32)
     }
 }
 

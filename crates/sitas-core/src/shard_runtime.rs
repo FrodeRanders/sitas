@@ -20,7 +20,8 @@ use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use crate::placement::ShardPlacement;
 use crate::ringbuf::RingBuffer;
@@ -129,18 +130,40 @@ pub fn channel<M: Send + 'static>(capacity: usize) -> ShardChannelResult<M> {
     if capacity < 2 {
         return Err(ShardChannelError::InvalidCapacity);
     }
-    let queue = Arc::new(RingBuffer::bounded(capacity));
+    let shared = Arc::new(ChannelShared {
+        queue: RingBuffer::bounded(capacity),
+        recv_waker: spin::Mutex::new(None),
+        closed: AtomicBool::new(false),
+    });
     Ok((
         ShardSender {
-            queue: Arc::clone(&queue),
+            shared: Arc::clone(&shared),
         },
-        ShardReceiver { queue },
+        ShardReceiver { shared },
     ))
+}
+
+/// State shared by both channel endpoints: the message ring, the receiving
+/// task's registered waker (taken and invoked on send/close so the receiver's
+/// executor re-polls it), and the closed flag.
+struct ChannelShared<M> {
+    queue: RingBuffer<M>,
+    recv_waker: spin::Mutex<Option<Waker>>,
+    closed: AtomicBool,
+}
+
+impl<M> ChannelShared<M> {
+    fn wake_receiver(&self) {
+        let waker = self.recv_waker.lock().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
 }
 
 /// A cloneable sender for a typed inter-shard channel.
 pub struct ShardSender<M> {
-    queue: Arc<RingBuffer<M>>,
+    shared: Arc<ChannelShared<M>>,
 }
 
 impl<M> fmt::Debug for ShardSender<M> {
@@ -152,20 +175,34 @@ impl<M> fmt::Debug for ShardSender<M> {
 impl<M> Clone for ShardSender<M> {
     fn clone(&self) -> Self {
         Self {
-            queue: Arc::clone(&self.queue),
+            shared: Arc::clone(&self.shared),
         }
     }
 }
 
 impl<M> ShardSender<M> {
     pub fn try_send(&self, msg: M) -> Result<(), M> {
-        self.queue.try_push(msg)
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(msg);
+        }
+        self.shared.queue.try_push(msg)?;
+        // Re-poll a receiver task parked in `recv().await`.
+        self.shared.wake_receiver();
+        Ok(())
+    }
+
+    /// Close the channel. A receiver awaiting [`ShardReceiver::recv`] first
+    /// drains any queued messages and then resolves to `None`, so closing is
+    /// the shutdown signal for a shard's message loop.
+    pub fn close(&self) {
+        self.shared.closed.store(true, Ordering::Release);
+        self.shared.wake_receiver();
     }
 }
 
 /// A single-consumer receiver for a typed inter-shard channel.
 pub struct ShardReceiver<M> {
-    queue: Arc<RingBuffer<M>>,
+    shared: Arc<ChannelShared<M>>,
 }
 
 impl<M> fmt::Debug for ShardReceiver<M> {
@@ -176,20 +213,55 @@ impl<M> fmt::Debug for ShardReceiver<M> {
 
 impl<M> ShardReceiver<M> {
     pub fn try_recv(&mut self) -> Option<M> {
-        self.queue.pop()
+        self.shared.queue.pop()
+    }
+
+    /// Await the next message. Resolves to `None` once the channel is closed
+    /// and drained. While pending, the task's waker is registered with the
+    /// channel; `try_send`/`close` invoke it, which re-queues the task on its
+    /// shard executor and releases the shard's blocked reactor wait.
+    pub fn recv(&mut self) -> Recv<'_, M> {
+        Recv { receiver: self }
     }
 }
 
-impl<M> Future for ShardReceiver<M> {
+/// Future returned by [`ShardReceiver::recv`].
+pub struct Recv<'a, M> {
+    receiver: &'a mut ShardReceiver<M>,
+}
+
+impl<M> Future for Recv<'_, M> {
     type Output = Option<M>;
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(self.get_mut().try_recv())
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<M>> {
+        let shared = &self.get_mut().receiver.shared;
+        if let Some(msg) = shared.queue.pop() {
+            return Poll::Ready(Some(msg));
+        }
+        // Drain before reporting closure so queued messages are not lost.
+        if shared.closed.load(Ordering::Acquire) {
+            return Poll::Ready(None);
+        }
+        *shared.recv_waker.lock() = Some(cx.waker().clone());
+        // Re-check after registering: a send or close racing the
+        // registration may have missed the waker.
+        if let Some(msg) = shared.queue.pop() {
+            return Poll::Ready(Some(msg));
+        }
+        if shared.closed.load(Ordering::Acquire) {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
     }
 }
 
 /// The OS thread-spawning interface the sharded executor requires.
 pub trait ShardRuntime: Send + Sync {
     type JoinHandle<T: Send>: Send;
+
+    /// The per-shard reactor this runtime provides (see
+    /// [`shard_reactor`](ShardRuntime::shard_reactor)).
+    type Reactor: crate::reactor_backend::ReactorBackend + Send + 'static;
 
     /// Spawn a new shard worker thread, pinned to the given core/placement.
     fn spawn_shard<T: Send + 'static>(
@@ -210,6 +282,11 @@ pub trait ShardRuntime: Send + Sync {
     /// instead of busy-spinning, and a peer shard releases it with
     /// [`ShardParker::unpark`].
     fn parker(&self) -> Arc<dyn ShardParker>;
+
+    /// Construct the reactor a shard's executor blocks on. Each shard owns
+    /// one reactor (one wait point, §7 of the co-designed architecture); on
+    /// CharlotteOS this is the completion-queue reactor for that shard's LP.
+    fn shard_reactor(&self, shard_id: ShardId) -> Self::Reactor;
 }
 
 /// A shareable handle to park the calling shard and to release parked shards.

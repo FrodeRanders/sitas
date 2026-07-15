@@ -1,9 +1,11 @@
 //! Minimal no_std sharded key-value service for foreign runtimes.
 //!
-//! Waiting is parked, never spun: a shard with an empty mailbox and a
-//! requester awaiting a reply both sleep through the runtime's
-//! [`ShardParker`] (on CharlotteOS: the kernel's `CQ_WAIT`/`CQ_WAKE`), and
-//! the peer that produces the awaited state releases them with `unpark`.
+//! Each shard runs its message loop as a **future** on a
+//! [`ShardExecutor`](crate::shard_executor::ShardExecutor): awaiting the next
+//! envelope parks the shard in its reactor's single blocking wait (§7 of the
+//! co-designed architecture), and a sender's wake re-queues exactly that
+//! task. Requesters awaiting a reply park through the runtime's
+//! [`ShardParker`]. Nothing spins.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -15,12 +17,15 @@ use core::time::Duration;
 
 use crate::ShardError;
 use crate::placement::{HashPlacement, Placement, ShardPlacement};
+use crate::reactor_backend::ReactorBackend;
 use crate::shard::ShardId;
+use crate::shard_executor::ShardExecutor;
 use crate::shard_runtime::{ShardParker, ShardReceiver, ShardRuntime, ShardSender};
 
-/// Upper bound on one park while waiting for a message or reply. Parks are a
-/// latency optimisation, not a correctness dependency: a lost or stolen wake
-/// costs at most one interval before the parked side re-checks its state.
+/// Upper bound on one park/wait while waiting for a message or reply. Parks
+/// are a latency optimisation, not a correctness dependency: a lost or stolen
+/// wake costs at most one interval before the parked side re-checks its state
+/// (relevant while all shards share one process-wide completion queue).
 const PARK_TIMEOUT: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,13 +77,13 @@ impl ShardedKv {
                 .channel(config.mailbox_capacity)
                 .map_err(|_| ShardError::InvalidMailboxCapacity)?;
             let stopped = Arc::new(AtomicBool::new(false));
-            let shard_stopped = Arc::clone(&stopped);
             let shard_parker = Arc::clone(&parker);
             let shard_id = ShardId(index);
+            let reactor = runtime.shard_reactor(shard_id);
             runtime.spawn_shard(
                 shard_id,
                 ShardPlacement::Sequential,
-                Box::new(move || run_kv_shard(receiver, shard_stopped, shard_parker)),
+                Box::new(move || run_kv_shard(receiver, shard_parker, reactor)),
             );
             shards.push(KvShardHandle {
                 id: shard_id,
@@ -211,37 +216,38 @@ impl KvReply {
     }
 }
 
-fn run_kv_shard(
-    mut receiver: ShardReceiver<KvEnvelope>,
-    stopped: Arc<AtomicBool>,
+fn run_kv_shard<R>(
+    receiver: ShardReceiver<KvEnvelope>,
     parker: Arc<dyn ShardParker>,
-) {
-    let mut map = BTreeMap::<String, String>::new();
+    reactor: R,
+) where
+    R: ReactorBackend + Send + 'static,
+    R::Waker: 'static,
+{
+    // The shard's message loop is a task on its own executor. Awaiting the
+    // next envelope parks the shard in the reactor's single blocking wait; a
+    // sender's wake (the channel waker → reactor wake) re-polls exactly this
+    // task. A bounded idle wait keeps the shard self-healing on the shared
+    // process-wide completion queue.
+    let mut executor = ShardExecutor::new(reactor).with_idle_wait(Some(PARK_TIMEOUT));
+    executor.spawn(kv_shard_task(receiver, parker));
+    executor.run();
+}
 
-    loop {
-        match receiver.try_recv() {
-            Some(envelope) => {
-                let value = match envelope.command {
-                    KvCommand::Get { key } => KvReplyValue::StringOption(map.get(&key).cloned()),
-                    KvCommand::Put { key, value } => {
-                        map.insert(key, value);
-                        KvReplyValue::Unit
-                    }
-                    KvCommand::Len => KvReplyValue::Usize(map.len()),
-                };
-                let _ = envelope.reply.try_push(value);
-                // Release the requester waiting on this reply.
-                parker.unpark();
+async fn kv_shard_task(mut receiver: ShardReceiver<KvEnvelope>, parker: Arc<dyn ShardParker>) {
+    let mut map = BTreeMap::<String, String>::new();
+    while let Some(envelope) = receiver.recv().await {
+        let value = match envelope.command {
+            KvCommand::Get { key } => KvReplyValue::StringOption(map.get(&key).cloned()),
+            KvCommand::Put { key, value } => {
+                map.insert(key, value);
+                KvReplyValue::Unit
             }
-            None => {
-                if stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                // Mailbox empty: park until a sender `unpark`s us (or the
-                // bounded interval elapses so shutdown is observed promptly).
-                parker.park(Some(PARK_TIMEOUT));
-            }
-        }
+            KvCommand::Len => KvReplyValue::Usize(map.len()),
+        };
+        let _ = envelope.reply.try_push(value);
+        // Release the requester parked on this reply.
+        parker.unpark();
     }
 }
 
@@ -249,9 +255,12 @@ impl Drop for ShardedKv {
     fn drop(&mut self) {
         for shard in &self.shards {
             shard.stopped.store(true, Ordering::Release);
+            // Close the mailbox so the shard's `recv().await` resolves to
+            // `None`, its task completes, and its executor returns.
+            shard.sender.close();
         }
-        // Release any shard parked on an empty mailbox so it observes the
-        // stop flag and exits, rather than waiting out its park interval.
+        // Release any shard or requester parked on the shared queue so they
+        // observe the shutdown promptly rather than waiting out an interval.
         self.parker.unpark();
     }
 }
