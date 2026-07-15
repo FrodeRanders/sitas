@@ -6,14 +6,19 @@
 //!
 //! ## Design
 //!
-//! The executor's idle wait (`wait(read, write, timeout)`) maps to polling the
-//! kernel's CQ ring for the calling shard. The CQ ring is a shared-memory page
-//! mapped at a known virtual address in the user AS. The kernel writes
-//! completion entries (cap, result) to the ring; userspace reads them without
-//! syscalls.
+//! The executor's idle wait (`wait(read, write, timeout)`) drains the kernel's
+//! CQ ring — a shared-memory page mapped at a known virtual address in the
+//! user AS, written by the kernel and read here without syscalls — and, when
+//! the ring is empty, **blocks** in the kernel via `CQ_WAIT` /
+//! `CQ_WAIT_TIMEOUT`. The kernel wait returns when a completion entry is
+//! posted, when a peer thread posts an explicit `CQ_WAKE`, or (for the timed
+//! variant) when the deadline fires. There is no busy polling.
 //!
-//! The waker (`ReactorWaker::wake`) uses the kernel's cross-LP IPI via
-//! `try_send_ipi_rpc`. Each shard's reactor is identified by its LP index.
+//! The waker (`ReactorWaker::wake`) posts `CQ_WAKE`, which releases any thread
+//! of this address space blocked in a CQ wait. Until per-shard CQ partitioning
+//! exists, the CQ (and therefore the wake) is per-process: all shards share
+//! one ring, so a wake releases every blocked shard of the process rather than
+//! one target LP.
 //!
 //! Thread spawn (`ShardRuntime::spawn_shard`) uses the kernel's
 //! `spawn_thread` via SVC, pinned to a specific LP.
@@ -36,7 +41,9 @@ use spin::Mutex;
 const CQ_RING_VADDR: usize = 0x0000_0000_0001_1000;
 const SYSCALL_COMPLETION_SUBMIT: u16 = 1;
 const SYSCALL_SPAWN_THREAD: u16 = 7;
-const SYSCALL_MAILBOX_SEND: u16 = 9;
+const SYSCALL_CQ_WAIT: u16 = 12;
+const SYSCALL_CQ_WAKE: u16 = 41;
+const SYSCALL_CQ_WAIT_TIMEOUT: u16 = 42;
 
 static SHARD_ENTRIES: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
 
@@ -65,7 +72,8 @@ unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     match imm {
         SYSCALL_COMPLETION_SUBMIT => svc!(1),
         SYSCALL_SPAWN_THREAD => svc!(7),
-        SYSCALL_MAILBOX_SEND => svc!(9),
+        SYSCALL_CQ_WAIT => svc!(12),
+        SYSCALL_CQ_WAKE => svc!(41),
         _ => {
             let _ = (arg1, arg2, arg3);
             1
@@ -79,9 +87,36 @@ unsafe fn sys_spawn(entry_vaddr: u64, target_lp: u64) -> u64 {
     unsafe { syscall(SYSCALL_SPAWN_THREAD, entry_vaddr, target_lp, 0) }
 }
 
+/// Syscall: block until the CQ has at least `min_complete` entries or an
+/// explicit wake is posted. Returns the pending entry count.
 #[inline(always)]
-unsafe fn sys_wake(target_lp: u32) -> u64 {
-    unsafe { syscall(SYSCALL_MAILBOX_SEND, u64::from(target_lp), 1, 0) }
+unsafe fn sys_cq_wait(min_complete: u64) -> u64 {
+    unsafe { syscall(SYSCALL_CQ_WAIT, min_complete, 0, 0) }
+}
+
+/// Syscall: like [`sys_cq_wait`] but also returns when `timeout_ms` elapses.
+/// Returns `(pending, timed_out)`.
+#[inline(always)]
+unsafe fn sys_cq_wait_timeout(min_complete: u64, timeout_ms: u64) -> (u64, u64) {
+    let ret: u64;
+    let timed_out: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #42",
+            lateout("x0") ret,
+            inlateout("x1") min_complete => timed_out,
+            in("x2") timeout_ms,
+            options(nostack, nomem, preserves_flags),
+        );
+    }
+    let _ = SYSCALL_CQ_WAIT_TIMEOUT;
+    (ret, timed_out)
+}
+
+/// Syscall: post an explicit wake to this address space's CQ waiters.
+#[inline(always)]
+unsafe fn sys_cq_wake() -> u64 {
+    unsafe { syscall(SYSCALL_CQ_WAKE, 0, 0, 0) }
 }
 
 extern "C" fn shard_entry_trampoline() {
@@ -176,7 +211,11 @@ pub struct CharlWaker {
 
 impl ReactorWaker for CharlWaker {
     fn wake(&self) -> Result<(), sitas_core::io::ErrorKind> {
-        let result = unsafe { sys_wake(self.target_lp) };
+        // Release any thread of this address space blocked in a CQ wait. Until
+        // per-shard CQ partitioning exists the wake is process-wide, not
+        // targeted at `target_lp`.
+        let _ = self.target_lp;
+        let result = unsafe { sys_cq_wake() };
         if result == 0 {
             Ok(())
         } else {
@@ -228,17 +267,11 @@ impl ReactorBackend for CharlotteReactor {
         _write: &[u64],
         timeout: Option<Duration>,
     ) -> Result<CharlEvent, sitas_core::io::ErrorKind> {
-        // Poll the CQ ring until a completion arrives or the timeout expires.
-        // In a real implementation this would use either a blocking syscall
-        // (completion::wait) or a yield loop; for now it busy-polls.
-        let deadline = timeout.map(|d| {
-            let now = sitas_core::instant::Instant::now();
-            now.checked_add(d).unwrap_or(now)
-        });
         loop {
+            // Drain whatever the kernel has already posted — no syscall needed.
             let pending = self.cq().pending();
             if pending > 0 {
-                let mut caps = alloc::vec::Vec::new();
+                let mut caps = Vec::new();
                 for _ in 0..pending {
                     if let Some(entry) = self.cq().read_one() {
                         caps.push(entry.cap);
@@ -249,15 +282,35 @@ impl ReactorBackend for CharlotteReactor {
                     readable: caps,
                 });
             }
-            if let Some(dl) = deadline
-                && sitas_core::instant::Instant::now() >= dl
-            {
-                return Ok(CharlEvent {
-                    woke: false,
-                    readable: alloc::vec::Vec::new(),
-                });
+
+            // Ring empty: block in the kernel until a completion entry is
+            // posted, a peer posts CQ_WAKE, or the deadline fires.
+            match timeout {
+                Some(duration) => {
+                    let timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1);
+                    let (_pending, timed_out) = unsafe { sys_cq_wait_timeout(1, timeout_ms) };
+                    if self.cq().pending() > 0 {
+                        continue; // completions arrived: drain them above
+                    }
+                    return Ok(CharlEvent {
+                        // timed_out == 0 means the wait condition released us,
+                        // and with an empty ring that condition was a wake.
+                        woke: timed_out == 0,
+                        readable: Vec::new(),
+                    });
+                }
+                None => {
+                    unsafe { sys_cq_wait(1) };
+                    if self.cq().pending() > 0 {
+                        continue; // completions arrived: drain them above
+                    }
+                    // Released without entries: an explicit wake.
+                    return Ok(CharlEvent {
+                        woke: true,
+                        readable: Vec::new(),
+                    });
+                }
             }
-            core::hint::spin_loop();
         }
     }
 }
@@ -290,9 +343,11 @@ impl ShardRuntime for CharlotteReactor {
         sitas_core::shard_runtime::channel(capacity)
     }
 
-    fn sleep(&self, _duration: Duration) {
-        for _ in 0..10000 {
-            core::hint::spin_loop();
-        }
+    fn sleep(&self, duration: Duration) {
+        // Block in the kernel for the requested duration instead of spinning.
+        // A min_complete that the small ring can never reach means only the
+        // deadline (or a spurious peer wake) releases us.
+        let timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1);
+        let _ = unsafe { sys_cq_wait_timeout(u64::from(u32::MAX), timeout_ms) };
     }
 }
