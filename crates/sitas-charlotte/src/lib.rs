@@ -39,13 +39,31 @@ use sitas_core::shard_runtime::{
 };
 use spin::Mutex;
 
-/// The virtual address where the CQ ring is mapped in the user AS.
+/// The virtual address where the default (queue 0) CQ ring is mapped.
 const CQ_RING_VADDR: usize = 0x0000_0000_0001_1000;
+/// The canonical config page (kernel↔user contract).
+const CONFIG_VADDR: usize = 0x0000_0000_0001_0000;
+/// Byte offset in the config page of the per-shard CQ ring base virtual
+/// address (matches `catten_rt::config::SHARD_CQ_BASE_OFFSET`).
+const SHARD_CQ_BASE_OFFSET: usize = 2064;
+/// Byte offset of the per-shard CQ ring count
+/// (matches `catten_rt::config::SHARD_CQ_COUNT_OFFSET`).
+const SHARD_CQ_COUNT_OFFSET: usize = 2072;
 const SYSCALL_COMPLETION_SUBMIT: u16 = 1;
 const SYSCALL_SPAWN_THREAD: u16 = 7;
 const SYSCALL_CQ_WAIT: u16 = 12;
 const SYSCALL_CQ_WAKE: u16 = 41;
 const SYSCALL_CQ_WAIT_TIMEOUT: u16 = 42;
+
+/// Read the per-shard CQ ring layout the loader published in the config page:
+/// `(base_vaddr, count)`, or `(0, 0)` if no per-shard rings were mapped.
+fn shard_cq_layout() -> (usize, usize) {
+    let base =
+        unsafe { core::ptr::read_volatile((CONFIG_VADDR + SHARD_CQ_BASE_OFFSET) as *const u64) };
+    let count =
+        unsafe { core::ptr::read_volatile((CONFIG_VADDR + SHARD_CQ_COUNT_OFFSET) as *const u64) };
+    (base as usize, count as usize)
+}
 
 static SHARD_ENTRIES: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
 
@@ -89,17 +107,24 @@ unsafe fn sys_spawn(entry_vaddr: u64, target_lp: u64) -> u64 {
     unsafe { syscall(SYSCALL_SPAWN_THREAD, entry_vaddr, target_lp, 0) }
 }
 
-/// Syscall: block until the CQ has at least `min_complete` entries or an
-/// explicit wake is posted. Returns the pending entry count.
+/// Post an explicit wake to queue `cq` (a per-shard wake releases only the
+/// target shard's blocked `CQ_WAIT`).
 #[inline(always)]
-unsafe fn sys_cq_wait(min_complete: u64) -> u64 {
-    unsafe { syscall(SYSCALL_CQ_WAIT, min_complete, 0, 0) }
+unsafe fn sys_cq_wake(cq: u32) -> u64 {
+    unsafe { syscall(SYSCALL_CQ_WAKE, cq as u64, 0, 0) }
 }
 
-/// Syscall: like [`sys_cq_wait`] but also returns when `timeout_ms` elapses.
-/// Waits on the default completion queue (id 0). Returns `(pending, timed_out)`.
+/// Block until the shard's CQ has at least `min_complete` entries or an
+/// explicit wake is posted to it.
 #[inline(always)]
-unsafe fn sys_cq_wait_timeout(min_complete: u64, timeout_ms: u64) -> (u64, u64) {
+unsafe fn sys_cq_wait(min_complete: u64, cq: u32) -> u64 {
+    unsafe { syscall(SYSCALL_CQ_WAIT, min_complete, cq as u64, 0) }
+}
+
+/// Like [`sys_cq_wait`] but also returns when `timeout_ms` elapses.
+/// Returns `(pending, timed_out)`.
+#[inline(always)]
+unsafe fn sys_cq_wait_timeout(min_complete: u64, timeout_ms: u64, cq: u32) -> (u64, u64) {
     let ret: u64;
     let timed_out: u64;
     unsafe {
@@ -108,18 +133,12 @@ unsafe fn sys_cq_wait_timeout(min_complete: u64, timeout_ms: u64) -> (u64, u64) 
             lateout("x0") ret,
             inlateout("x1") min_complete => timed_out,
             in("x2") timeout_ms,
-            in("x3") 0u64, // default CQ (id 0) until per-shard rings are mapped
+            in("x3") cq as u64,
             options(nostack, nomem, preserves_flags),
         );
     }
     let _ = SYSCALL_CQ_WAIT_TIMEOUT;
     (ret, timed_out)
-}
-
-/// Syscall: post an explicit wake to this address space's CQ waiters.
-#[inline(always)]
-unsafe fn sys_cq_wake() -> u64 {
-    unsafe { syscall(SYSCALL_CQ_WAKE, 0, 0, 0) }
 }
 
 extern "C" fn shard_entry_trampoline() {
@@ -131,21 +150,44 @@ extern "C" fn shard_entry_trampoline() {
 
 // ---- reactor backend --------------------------------------------------------
 
-/// A reactor for one LP (shard). All state is in the CQ ring mapped at
-/// `CQ_RING_VADDR` and the per-LP kernel completion table.
+/// A reactor for one LP (one shard). Where per-shard CQ rings are mapped,
+/// one shard's executor waits on its own ring and only a wake targeted at
+/// that ring's queue id releases it; where they are not (legacy path) the
+/// process-wide default queue 0 is used. All state is in the CQ ring mapped
+/// in the user AS and the per-LP kernel completion table.
 pub struct CharlotteReactor {
-    /// Which LP this reactor is pinned to.
     lp_id: u32,
+    /// The virtual address of this shard's CQ ring page.
+    ring_vaddr: usize,
+    /// The kernel queue id the reactor waits on and the waker wakes.
+    cq_id: u32,
 }
 
 impl CharlotteReactor {
+    /// Default constructor: process-wide queue 0 at the canonical ring
+    /// address. For single-shard services and the pre-per-shard legacy path.
     pub fn new(lp_id: u32) -> Self {
-        Self { lp_id }
+        Self {
+            lp_id,
+            ring_vaddr: CQ_RING_VADDR,
+            cq_id: 0,
+        }
     }
 
-    /// Returns the underlying CQ ring header.
+    /// Per-shard constructor: the reactor blocks on queue `cq_id` and drains
+    /// the ring page at `ring_vaddr`. `lp_id` records the intended core
+    /// affinity.
+    pub fn with_cq(lp_id: u32, ring_vaddr: usize, cq_id: u32) -> Self {
+        Self {
+            lp_id,
+            ring_vaddr,
+            cq_id,
+        }
+    }
+
+    /// Returns the underlying CQ ring header at the shard's ring address.
     pub fn cq(&self) -> &CqHeader {
-        unsafe { &*(CQ_RING_VADDR as *const CqHeader) }
+        unsafe { &*(self.ring_vaddr as *const CqHeader) }
     }
 
     /// Submit an async operation and return a future that completes when the
@@ -209,16 +251,17 @@ impl CqHeader {
 /// A handle that can wake this reactor from another shard/LP.
 #[derive(Clone)]
 pub struct CharlWaker {
+    /// The logical processor the owning shard runs on (for future affinity
+    /// use; currently not targeted by the wake).
     target_lp: u32,
+    /// The completion queue id blocked in `CQ_WAIT`; a wake targets only
+    /// this queue so per-shard rings receive isolated, non-stealing wakes.
+    cq_id: u32,
 }
 
 impl ReactorWaker for CharlWaker {
     fn wake(&self) -> Result<(), sitas_core::io::ErrorKind> {
-        // Release any thread of this address space blocked in a CQ wait. Until
-        // per-shard CQ partitioning exists the wake is process-wide, not
-        // targeted at `target_lp`.
-        let _ = self.target_lp;
-        let result = unsafe { sys_cq_wake() };
+        let result = unsafe { sys_cq_wake(self.cq_id) };
         if result == 0 {
             Ok(())
         } else {
@@ -261,6 +304,7 @@ impl ReactorBackend for CharlotteReactor {
     fn waker(&self) -> CharlWaker {
         CharlWaker {
             target_lp: self.lp_id,
+            cq_id: self.cq_id,
         }
     }
 
@@ -287,27 +331,26 @@ impl ReactorBackend for CharlotteReactor {
             }
 
             // Ring empty: block in the kernel until a completion entry is
-            // posted, a peer posts CQ_WAKE, or the deadline fires.
+            // posted, a peer posts CQ_WAKE to this shard's queue, or the
+            // deadline fires.
             match timeout {
                 Some(duration) => {
                     let timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1);
-                    let (_pending, timed_out) = unsafe { sys_cq_wait_timeout(1, timeout_ms) };
+                    let (_pending, timed_out) =
+                        unsafe { sys_cq_wait_timeout(1, timeout_ms, self.cq_id) };
                     if self.cq().pending() > 0 {
                         continue; // completions arrived: drain them above
                     }
                     return Ok(CharlEvent {
-                        // timed_out == 0 means the wait condition released us,
-                        // and with an empty ring that condition was a wake.
                         woke: timed_out == 0,
                         readable: Vec::new(),
                     });
                 }
                 None => {
-                    unsafe { sys_cq_wait(1) };
+                    unsafe { sys_cq_wait(1, self.cq_id) };
                     if self.cq().pending() > 0 {
                         continue; // completions arrived: drain them above
                     }
-                    // Released without entries: an explicit wake.
                     return Ok(CharlEvent {
                         woke: true,
                         readable: Vec::new(),
@@ -349,21 +392,33 @@ impl ShardRuntime for CharlotteReactor {
 
     fn sleep(&self, duration: Duration) {
         // Block in the kernel for the requested duration instead of spinning.
-        // A min_complete that the small ring can never reach means only the
+        // A min_complete the small ring can never reach means only the
         // deadline (or a spurious peer wake) releases us.
         let timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1);
-        let _ = unsafe { sys_cq_wait_timeout(u64::from(u32::MAX), timeout_ms) };
+        let _ = unsafe { sys_cq_wait_timeout(u64::from(u32::MAX), timeout_ms, self.cq_id) };
     }
 
     fn parker(&self) -> alloc::sync::Arc<dyn ShardParker> {
-        alloc::sync::Arc::new(CharlotteParker)
+        // The parker always uses the process-wide default queue (0). The
+        // requester thread (main / catten-user) parks there waiting for
+        // replies, and each serving shard's reply code unpark()s CQ 0; only
+        // one non-shard waiter exists per process so wake-stealing is not a
+        // concern. Cross-shard wakes flow through the executor's TaskWaker →
+        // ReactorWaker targeting each shard's own CQ.
+        alloc::sync::Arc::new(CharlotteParker::new(0))
     }
 
     fn shard_reactor(&self, shard_id: ShardId) -> CharlotteReactor {
-        // Until per-shard CQ rings are mapped into user space, every shard's
-        // reactor shares the process-wide default ring and queue; the LP id
-        // records the intended affinity for the per-shard partitioning step.
-        CharlotteReactor::new(shard_id.0 as u32)
+        let (base, count) = shard_cq_layout();
+        let shard = shard_id.0;
+        if base != 0 && shard < count {
+            // Per-shard ring: `cq_id = shard + 1`, ring at `base + shard * 4096`.
+            CharlotteReactor::with_cq(shard as u32, base + shard * 4096, (shard as u32) + 1)
+        } else {
+            // Fallback for shard counts beyond the pre-allocated rings, or when
+            // the loader did not map per-shard CQ pages (legacy single-ring path).
+            CharlotteReactor::new(shard as u32)
+        }
     }
 }
 
@@ -380,8 +435,15 @@ impl ShardRuntime for CharlotteReactor {
 /// `CQ_WAKE` releases only one waiter, so a shard whose wake was consumed by a
 /// peer still re-checks its state within one park interval rather than
 /// stalling.
-#[derive(Clone, Copy)]
-pub struct CharlotteParker;
+pub struct CharlotteParker {
+    cq_id: u32,
+}
+
+impl CharlotteParker {
+    pub fn new(cq_id: u32) -> Self {
+        Self { cq_id }
+    }
+}
 
 /// The park interval, chosen small enough that a stolen/coalesced wake costs
 /// at most this much latency, and large enough that idle parking is genuinely
@@ -399,10 +461,10 @@ impl ShardParker for CharlotteParker {
         // A min_complete the small ring can never reach means the wait is
         // released only by a peer `CQ_WAKE` or by the deadline — never by a
         // stray completion entry meant for the reactor.
-        let _ = unsafe { sys_cq_wait_timeout(u64::from(u32::MAX), ms) };
+        let _ = unsafe { sys_cq_wait_timeout(u64::from(u32::MAX), ms, self.cq_id) };
     }
 
     fn unpark(&self) {
-        let _ = unsafe { sys_cq_wake() };
+        let _ = unsafe { sys_cq_wake(self.cq_id) };
     }
 }

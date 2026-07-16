@@ -15,7 +15,7 @@ use crate::shard_runtime::ShardRuntime;
 /// `result_page` must be valid for a volatile `u32` write for the duration of
 /// this call.
 pub unsafe fn basic_kv_test<R: ShardRuntime + ?Sized>(runtime: &R, result_page: *mut u32) {
-    let config = ShardedKvConfig::new(1);
+    let config = ShardedKvConfig::new(2);
     let kv = match ShardedKv::start_with_runtime(config, runtime) {
         Ok(kv) => kv,
         Err(_) => {

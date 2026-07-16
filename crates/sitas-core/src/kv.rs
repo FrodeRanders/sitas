@@ -255,8 +255,6 @@ impl Drop for ShardedKv {
     fn drop(&mut self) {
         for shard in &self.shards {
             shard.stopped.store(true, Ordering::Release);
-            // Close the mailbox so the shard's `recv().await` resolves to
-            // `None`, its task completes, and its executor returns.
             shard.sender.close();
         }
         // Release any shard or requester parked on the shared queue so they
