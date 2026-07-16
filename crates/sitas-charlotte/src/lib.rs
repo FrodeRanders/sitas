@@ -215,7 +215,10 @@ pub struct CqHeader {
 
 #[repr(C)]
 pub struct CqEntry {
-    pub cap: u64,
+    pub operation: u64,
+    pub cookie: u64,
+    pub status: u32,
+    pub flags: u32,
     pub result: i64,
 }
 
@@ -321,7 +324,7 @@ impl ReactorBackend for CharlotteReactor {
                 let mut caps = Vec::new();
                 for _ in 0..pending {
                     if let Some(entry) = self.cq().read_one() {
-                        caps.push(entry.cap);
+                        caps.push(entry.cookie);
                     }
                 }
                 return Ok(CharlEvent {
