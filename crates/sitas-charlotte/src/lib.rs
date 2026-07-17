@@ -218,6 +218,8 @@ pub struct CqEntry {
     pub operation: u64,
     pub cookie: u64,
     pub status: u32,
+    /// Bit 0: reserved for `returned_capability_present` (§8.2). When set,
+    /// the following 8 bytes hold a `returned_capability: u64`.
     pub flags: u32,
     pub result: i64,
 }
