@@ -19,14 +19,14 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sitas"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sitas-core",
 ]
 
 [[package]]
 name = "sitas-charlotte"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sitas-core",
  "spin",
@@ -34,14 +34,14 @@ dependencies = [
 
 [[package]]
 name = "sitas-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "spin",
 ]
 
 [[package]]
 name = "sitas-unix"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sitas-core",
 ]
