@@ -35,11 +35,9 @@ pub struct ShardJoinHandle<T> {
 }
 
 enum JoinHandleInner<T> {
-    #[cfg(not(feature = "std"))]
     Raw(RawJoinHandle),
     #[cfg(feature = "std")]
     Std(std::thread::JoinHandle<T>),
-    #[cfg(not(feature = "std"))]
     _Result(PhantomData<fn() -> T>),
 }
 
@@ -52,7 +50,9 @@ impl<T> ShardJoinHandle<T> {
         }
     }
 
-    #[cfg(not(feature = "std"))]
+    /// Wraps a raw (foreign-runtime) join handle. Always available so that
+    /// `no_std` backends such as `sitas-charlotte` keep compiling when a
+    /// std-enabled `sitas-core` is unified into the same build graph.
     pub fn from_raw(handle: RawJoinHandle) -> Self {
         Self {
             inner: JoinHandleInner::Raw(handle),
@@ -67,9 +67,7 @@ impl<T> ShardJoinHandle<T> {
             JoinHandleInner::Std(handle) => handle.join().map_err(|_| {
                 Box::new(crate::io::ErrorKind::Other) as Box<dyn core::error::Error + Send + Sync>
             }),
-            #[cfg(not(feature = "std"))]
             JoinHandleInner::Raw(handle) => handle.join(),
-            #[cfg(not(feature = "std"))]
             JoinHandleInner::_Result(_) => unreachable!(),
         }
     }
@@ -78,9 +76,7 @@ impl<T> ShardJoinHandle<T> {
         match &self.inner {
             #[cfg(feature = "std")]
             JoinHandleInner::Std(handle) => handle.is_finished(),
-            #[cfg(not(feature = "std"))]
             JoinHandleInner::Raw(handle) => handle.is_finished(),
-            #[cfg(not(feature = "std"))]
             JoinHandleInner::_Result(_) => unreachable!(),
         }
     }

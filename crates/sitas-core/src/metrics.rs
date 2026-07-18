@@ -8,9 +8,9 @@
 //! The [`RuntimeMetrics`] collector can be installed into any layer of the
 //! runtime and provides thread-safe accumulation via atomics.
 
-use core::fmt;
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// A thread-safe metrics collector for the sharded runtime.
 #[derive(Debug, Clone)]

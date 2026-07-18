@@ -7,15 +7,15 @@
 //! Uses Welford's algorithm for numerically stable one-pass mean and
 //! variance computation.
 
-use core::fmt;
-use core::time::{Duration, Instant};
+use std::fmt;
+use std::time::{Duration, Instant};
 
 /// Online statistics accumulator for `f64` samples.
 ///
 /// # Example
 ///
 /// ```
-/// use sitas::RunningStatistics;
+/// use sitas_core::RunningStatistics;
 ///
 /// let mut stats = RunningStatistics::new();
 /// stats.add_sample(2.0);

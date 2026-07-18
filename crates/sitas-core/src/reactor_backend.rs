@@ -144,14 +144,14 @@ pub trait ReactorBackend {
 #[cfg(all(feature = "std", unix))]
 mod unix_impls {
     use super::{ReactorBackend, ReactorEvent, ReactorWaker};
+    use crate::io;
     use crate::os::{OsEvent, OsReactor, OsWaker};
     use core::time::Duration;
-    use std::io;
     use std::os::unix::io::RawFd;
 
     impl ReactorWaker for OsWaker {
         fn wake(&self) -> io::Result<()> {
-            OsWaker::wake(self)
+            OsWaker::wake(self).map_err(io::ErrorKind::from)
         }
     }
 
@@ -186,7 +186,7 @@ mod unix_impls {
             write: &[RawFd],
             timeout: Option<Duration>,
         ) -> io::Result<OsEvent> {
-            OsReactor::wait_io(self, read, write, timeout)
+            OsReactor::wait_io(self, read, write, timeout).map_err(io::ErrorKind::from)
         }
     }
 }
@@ -198,9 +198,9 @@ mod tests {
     //! (for example a CharlotteOS completion-capability reactor).
 
     use super::{ReactorBackend, ReactorEvent, ReactorWaker};
+    use crate::io;
     use core::sync::atomic::{AtomicBool, Ordering};
     use core::time::Duration;
-    use std::io;
     use std::sync::{Arc, Condvar, Mutex};
 
     /// Interests are identified by an opaque integer id, standing in for a

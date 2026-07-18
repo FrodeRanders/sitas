@@ -25,7 +25,9 @@ unsafe impl<T: Send> Sync for RingBuffer<T> {}
 impl<T> RingBuffer<T> {
     pub fn bounded(capacity: usize) -> Self {
         let mut v = alloc::vec::Vec::with_capacity(capacity);
-        v.resize_with(capacity, || UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+        v.resize_with(capacity, || {
+            UnsafeCell::new(core::mem::MaybeUninit::uninit())
+        });
         Self {
             buffer: UnsafeCell::new(v.into_boxed_slice()),
             capacity,
@@ -59,7 +61,8 @@ impl<T> RingBuffer<T> {
         }
         let buf = unsafe { &mut *self.buffer.get() };
         let item = unsafe { buf[tail].get().read().assume_init() };
-        self.tail.store((tail + 1) % self.capacity, Ordering::Release);
+        self.tail
+            .store((tail + 1) % self.capacity, Ordering::Release);
         Some(item)
     }
 

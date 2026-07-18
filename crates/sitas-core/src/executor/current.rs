@@ -29,7 +29,7 @@ pub(super) struct CurrentTaskGuard {
 pub(super) fn current_scheduler() -> Arc<Scheduler> {
     CURRENT_SCHEDULER
         .with(|current| current.borrow().as_ref().cloned())
-        .expect("executor futures must be polled by sitas::executor::Executor")
+        .expect("executor futures must be polled by sitas_core::executor::Executor")
 }
 
 pub(super) fn enter_scheduler(scheduler: Arc<Scheduler>) -> CurrentSchedulerGuard {

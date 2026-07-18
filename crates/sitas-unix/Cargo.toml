@@ -2,10 +2,9 @@
 name = "sitas-unix"
 version = "0.1.0"
 edition = "2024"
-description = "sitas Unix backend (std-based, epoll/kqueue/poll/io_uring)"
+description = "sitas Unix backend: a std ShardRuntime over the sitas-core no_std lane"
 license = "MIT"
 repository = "https://github.com/FrodeRanders/sitas"
 
 [dependencies]
-sitas-core = { path = "../sitas-core" }
-libc = "0.2"
+sitas-core = { path = "../sitas-core", features = ["std"] }

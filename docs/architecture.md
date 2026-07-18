@@ -14,6 +14,17 @@
 
 The project started with a standard-library-only sharded key-value store. That baseline remains the semantic reference. Newer branches extend it with a custom executor, Unix readiness primitives, TCP helpers, sharded async execution, shard-local values, observability snapshots, CPU placement, and Linux `io_uring` support.
 
+## 1.1 Crate layout
+
+The repository is a workspace with four crates:
+
+- **`crates/sitas-core`** — the runtime kernel. Its default build is `no_std` + `alloc` and carries the portable lane used by foreign runtimes: the `ShardRuntime` trait (thread spawn, channels, parking, reactors), the `ReactorBackend` contract, the single-threaded `ShardExecutor`, and the minimal `kv`/`basic_kv` service. The `std` feature (`#![cfg_attr(not(feature = "std"), no_std)]`) additionally compiles the full host runtime: the bounded-mailbox services (`runtime`, `kv_service`, `counter`, `sharded`), the custom async executor with readiness I/O, TCP/UDP and Linux `io_uring` (`executor`, `os`), and the shard-per-thread async runtime (`sharded_executor`, `shard_local`, `shard_mailbox`, `sharded_tcp`).
+- **`crates/sitas`** — the batteries-included host facade (package `sitas`). It re-exports `sitas-core` with `std` enabled and owns the examples and integration tests.
+- **`crates/sitas-unix`** — the Unix `ShardRuntime` backend (`UnixRuntime`): `std::thread` spawn, a `Mutex`/`Condvar` parker, and the portable `OsReactor` per shard. It exists so the exact code path CharlotteOS uses runs and is tested on Linux and macOS hosts.
+- **`crates/sitas-charlotte`** — the CharlotteOS `no_std` backend: `CharlotteReactor` implements `ReactorBackend` and `ShardRuntime` over the kernel's completion-queue syscalls. The `catten-user` binary in the charlotte-os repository links `sitas-core` (default features) plus this crate for the bare-metal `aarch64-unknown-none` target.
+
+The two lanes share one contract: `reactor_backend`, `shard_runtime`, `shard`, `placement`, `error`, and the `no_std` services are the frozen surface both backends build on. Code behind the `std` feature must never leak into the default lane; `cargo check -p sitas-core -p sitas-charlotte --target aarch64-unknown-none` guards this in the validation script.
+
 ## 2. Architectural invariants
 
 These invariants define the project.
@@ -226,7 +237,7 @@ The executor is small and dependency-free---a semantic experiment before a produ
 ### Scheduling groups
 
 Scheduling groups are the first Seastar-like resource-class mechanism. A
-[`Spawner`](../src/executor/spawner.rs) can create an executor-local group with
+[`Spawner`](../crates/sitas-core/src/executor/spawner.rs) can create an executor-local group with
 a name and relative share count, then spawn tasks into that group. Ordinary
 `spawn` calls use the default group with 100 shares. A group handle created by
 one executor is rejected by other executors; the default group handle is

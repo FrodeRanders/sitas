@@ -1,6 +1,3 @@
-use alloc::string::String;
-use alloc::vec::Vec;
-use alloc::boxed::Box;
 //! Shard-per-thread async executor runtime.
 //!
 //! This module is the first bridge between the single-threaded async executor
@@ -8,11 +5,12 @@ use alloc::boxed::Box;
 //! running on one OS thread. Callers place work explicitly with [`ShardId`],
 //! and spawned tasks stay on that shard for their whole lifetime.
 
-use core::fmt;
-use core::future::Future;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use crate::shard_runtime::ShardJoinHandle;
-use core::time::{Duration, Instant};
+use std::fmt;
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::error::ShardError;
 use crate::executor::{
@@ -117,8 +115,8 @@ impl fmt::Display for ShardedSchedulingGroupError {
     }
 }
 
-impl core::error::Error for ShardedSchedulingGroupError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+impl std::error::Error for ShardedSchedulingGroupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ShardedSchedulingGroupError::Group(error) => Some(error),
             ShardedSchedulingGroupError::Spawn(error) => Some(error),
@@ -127,16 +125,16 @@ impl core::error::Error for ShardedSchedulingGroupError {
     }
 }
 
-// thread_local! replacement: use per-LP statics
-use spin::LazyLock;
-static CURRENT_SHARD: LazyLock<spin::Mutex<Option<ShardId>>> = LazyLock::new(|| spin::Mutex::new(None));
-static CURRENT_CPU: LazyLock<spin::Mutex<Option<crate::placement::CpuPlacementStatus>>> = LazyLock::new(|| spin::Mutex::new(None));
-static CURRENT_MEM: LazyLock<spin::Mutex<Option<crate::placement::MemoryPlacementStatus>>> = LazyLock::new(|| spin::Mutex::new(None));
+thread_local! {
+    static CURRENT_EXECUTOR_SHARD: std::cell::Cell<Option<ShardId>> = const { std::cell::Cell::new(None) };
+    static CURRENT_EXECUTOR_CPU_PLACEMENT: std::cell::RefCell<Option<CpuPlacementStatus>> = const { std::cell::RefCell::new(None) };
+    static CURRENT_EXECUTOR_MEMORY_PLACEMENT: std::cell::RefCell<Option<MemoryPlacementStatus>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Returns the shard currently polling this task, if the caller is running on a
 /// [`ShardedExecutor`] shard thread.
 pub fn current_executor_shard() -> Option<ShardId> {
-    CURRENT_SHARD.lock().clone()
+    CURRENT_EXECUTOR_SHARD.with(std::cell::Cell::get)
 }
 
 /// Returns the CPU placement status observed when the current
@@ -144,7 +142,7 @@ pub fn current_executor_shard() -> Option<ShardId> {
 ///
 /// This returns `None` outside sharded executor threads.
 pub fn current_executor_cpu_placement() -> Option<CpuPlacementStatus> {
-    CURRENT_CPU.lock().clone()
+    CURRENT_EXECUTOR_CPU_PLACEMENT.with(|placement| placement.borrow().clone())
 }
 
 /// Returns the memory placement status observed when the current
@@ -152,7 +150,7 @@ pub fn current_executor_cpu_placement() -> Option<CpuPlacementStatus> {
 ///
 /// This returns `None` outside sharded executor threads.
 pub fn current_executor_memory_placement() -> Option<MemoryPlacementStatus> {
-    CURRENT_MEM.lock().clone()
+    CURRENT_EXECUTOR_MEMORY_PLACEMENT.with(|placement| placement.borrow().clone())
 }
 
 /// Configuration for starting a [`ShardedExecutor`].
@@ -328,16 +326,11 @@ impl ShardedExecutorConfig {
 /// [`ShardedExecutor::spawn_with_handle_on`]. Dropping or stopping the runtime
 /// drops the last owned spawners, allowing idle executor threads to drain and
 /// exit.
-///
-/// `R` is the [`ShardRuntime`](crate::shard_runtime::ShardRuntime) backend
-/// that abstracts thread spawning. On Unix this is `std::thread::Builder`; on
-/// CharlotteOS it is the kernel's `SPAWN_THREAD` syscall.
 #[must_use = "dropping the sharded executor stops all owned shard threads"]
-pub struct ShardedExecutor<R: crate::shard_runtime::ShardRuntime + 'static> {
+pub struct ShardedExecutor {
     runtime_id: ShardedExecutorId,
     shards: Vec<AsyncShard>,
-    joins: Vec<R::JoinHandle<()>>,
-    _runtime: core::marker::PhantomData<R>,
+    joins: Vec<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -378,7 +371,7 @@ impl ShardedShutdownOutcome {
     }
 }
 
-impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
+impl ShardedExecutor {
     /// Starts `shard_count` async executor shards.
     pub fn start(shard_count: usize) -> Result<Self, ShardError> {
         Self::start_with_config(ShardedExecutorConfig::new(shard_count))
@@ -407,44 +400,8 @@ impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
         Self::start_with_config(ShardedExecutorConfig::for_required_pinned_available_cpus())
     }
 
-    /// Starts async executor shards using `config` and the given `runtime`
-    /// backend. This is the CharlotteOS / no_std entry point: thread spawn is
-    /// delegated to [`ShardRuntime::spawn_shard`](crate::shard_runtime::ShardRuntime::spawn_shard)
-    /// instead of `std::thread::Builder`.
-    pub fn start_with_runtime(
-        config: ShardedExecutorConfig,
-        runtime: &R,
-    ) -> Result<Self, ShardError> {
-        config.validate()?;
-        let runtime_id = ShardedExecutorId::allocate();
-        let mut shards = Vec::with_capacity(config.shard_count);
-        let mut joins = Vec::with_capacity(config.shard_count);
-
-        for shard_idx in 0..config.shard_count {
-            let shard_id = ShardId(shard_idx);
-            let (executor, spawner) = executor_and_spawner();
-
-            let join = runtime.spawn_shard(
-                shard_id,
-                crate::placement::Placement::Sequential,
-                alloc::boxed::Box::new(move || {
-                    CURRENT_SHARD.lock().replace(Some(shard_id));
-                    executor.run();
-                    CURRENT_SHARD.lock().replace(None);
-                }),
-            );
-
-            joins.push(join);
-            shards.push(AsyncShard { shard_id, spawner: Some(spawner) });
-        }
-
-        Ok(ShardedExecutor {
-            runtime_id,
-            shards,
-            joins,
-            _runtime: core::marker::PhantomData,
-        })
-    }
+    /// Starts async executor shards using `config`.
+    pub fn start_with_config(config: ShardedExecutorConfig) -> Result<Self, ShardError> {
         config.validate()?;
 
         let available_cpus = available_cpu_ids();
@@ -473,17 +430,17 @@ impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
                         &memory_placement_request,
                         &cpu_placement,
                     );
-                    CURRENT_SHARD.lock().replace(Some(shard_id));
-                    CURRENT_CPU.lock().replace(Some(cpu_placement.clone()));
-                    CURRENT_MEM.lock().replace(Some(memory_placement.clone()));
+                    CURRENT_EXECUTOR_SHARD.set(Some(shard_id));
+                    CURRENT_EXECUTOR_CPU_PLACEMENT.replace(Some(cpu_placement.clone()));
+                    CURRENT_EXECUTOR_MEMORY_PLACEMENT.replace(Some(memory_placement.clone()));
                     let _ = started_sender.send(ShardStartStatus {
                         cpu_placement,
                         memory_placement,
                     });
                     executor.run();
-                    CURRENT_MEM.lock().replace(None);
-                    CURRENT_CPU.lock().replace(None);
-                    CURRENT_SHARD.lock().replace(None);
+                    CURRENT_EXECUTOR_MEMORY_PLACEMENT.replace(None);
+                    CURRENT_EXECUTOR_CPU_PLACEMENT.replace(None);
+                    CURRENT_EXECUTOR_SHARD.set(None);
                 }) {
                 Ok(join) => join,
                 Err(_) => {
@@ -543,7 +500,7 @@ impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
         })
     }
 
-    fn cleanup_started_shards(shards: &mut [AsyncShard], joins: &mut Vec<crate::shard_runtime::ShardJoinHandle<()>>) {
+    fn cleanup_started_shards(shards: &mut [AsyncShard], joins: &mut Vec<thread::JoinHandle<()>>) {
         for shard in shards {
             shard.spawner.take();
         }
@@ -1048,7 +1005,7 @@ impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
 
     /// Stops all owned shard executors while keeping the runtime handle
     /// inspectable.
-    pub fn shutdown(&mut self) where R: crate::shard_runtime::ShardRuntime + 'static -> Result<(), ShardError> {
+    pub fn shutdown(&mut self) -> Result<(), ShardError> {
         for shard in &mut self.shards {
             shard.spawner.take();
         }
@@ -1079,12 +1036,12 @@ impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
         }
 
         let deadline = Instant::now() + timeout;
-        while !self.joins.iter().all(crate::shard_runtime::ShardJoinHandle::is_finished) {
+        while !self.joins.iter().all(thread::JoinHandle::is_finished) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            crate::shard_runtime::ShardRuntime::sleep(SHUTDOWN_TIMEOUT_POLL_INTERVAL.min(remaining));
+            thread::sleep(SHUTDOWN_TIMEOUT_POLL_INTERVAL.min(remaining));
         }
 
         let mut forced_shards = Vec::new();
@@ -1115,13 +1072,14 @@ impl<R: crate::shard_runtime::ShardRuntime + 'static> ShardedExecutor<R> {
             .as_ref()
             .ok_or(ShardedSpawnError::Stopped(shard_id))
     }
+}
 
-    /// Returns the host's reported available parallelism, falling back to one.
-    pub fn available_parallelism() -> usize {
-        crate::placement::default_shard_count().map_or(1, usize::from)
-    }
+/// Returns the host's reported available parallelism, falling back to one.
+pub fn available_parallelism() -> usize {
+    thread::available_parallelism().map_or(1, usize::from)
+}
 
-    /// Cloneable handle for submitting work to a [`ShardedExecutor`].
+/// Cloneable handle for submitting work to a [`ShardedExecutor`].
 ///
 /// A submitter is intentionally separate from the runtime owner. It can be
 /// moved into tasks so one shard can submit work to another shard and await the
@@ -1735,7 +1693,7 @@ pub struct ShardedExecutorShardSnapshot {
     pub executor: Option<ExecutorSnapshot>,
 }
 
-impl<R: crate::shard_runtime::ShardRuntime + 'static> fmt::Debug for ShardedExecutor<R> {
+impl fmt::Debug for ShardedExecutor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ShardedExecutor")
             .field("shard_count", &self.shard_count())
@@ -1744,7 +1702,7 @@ impl<R: crate::shard_runtime::ShardRuntime + 'static> fmt::Debug for ShardedExec
     }
 }
 
-impl<R: crate::shard_runtime::ShardRuntime + 'static> Drop for ShardedExecutor<R> {
+impl Drop for ShardedExecutor {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
@@ -1767,8 +1725,8 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use crate::shard_runtime::ShardJoinHandle;
-    use core::time::{Duration, Instant};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn start_rejects_zero_shards() {
@@ -1883,7 +1841,7 @@ mod tests {
 
     #[test]
     fn available_parallelism_config_uses_reported_parallelism() {
-        let reported = crate::placement::default_shard_count().map_or(1, usize::from);
+        let reported = thread::available_parallelism().map_or(1, usize::from);
         let config = ShardedExecutorConfig::for_available_parallelism();
 
         assert_eq!(available_parallelism(), reported);
@@ -2329,7 +2287,7 @@ mod tests {
                 Instant::now() < deadline,
                 "unnamed grouped task was not observable"
             );
-            crate::shard_runtime::ShardRuntime::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
 
         assert_eq!(block_on(handle).unwrap(), ShardId(1));
@@ -2413,7 +2371,7 @@ mod tests {
 
         assert!(error.is_timed_out());
         assert_eq!(error.shard_id(), ShardId(0));
-        crate::shard_runtime::ShardRuntime::sleep(Duration::from_millis(150));
+        thread::sleep(Duration::from_millis(150));
         assert!(!second_completed.load(Ordering::SeqCst));
 
         runtime.stop().unwrap();
@@ -2670,7 +2628,7 @@ mod tests {
                 Instant::now() < deadline,
                 "slow-worker did not enter timer wait state: {task:?}"
             );
-            crate::shard_runtime::ShardRuntime::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         };
 
         let executor = shard.executor.as_ref().unwrap();
@@ -3004,7 +2962,7 @@ mod tests {
                 Instant::now() < deadline,
                 "tasks were not observable: expected {expected:?}, observed {task_names:?}"
             );
-            crate::shard_runtime::ShardRuntime::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
     }
 

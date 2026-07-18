@@ -19,16 +19,16 @@
 //!   discipline, mirrored on the kernel side);
 //! - bounded, non-lossy backpressure on both submission and completion.
 //!
-//! [`MockKernel`](crate::charlotte_abi::MockKernel) models the kernel;
-//! [`CharlotteReactor`](crate::charlotte_abi::CharlotteReactor) is the
-//! [`ReactorBackend`](crate::reactor_backend::ReactorBackend) a `sitas-charlotte`
+//! [`MockKernel`] models the kernel;
+//! [`CharlotteReactor`] is the
+//! [`ReactorBackend`] a `sitas-charlotte`
 //! backend would provide. The tests validate the decision-gate claims recorded
 //! in `docs/sitas-runtime-model.md` §11 (Phase 2).
 
-use alloc::collections::HashMap;
-use alloc::collections::VecDeque;
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
-use core::time::{Duration, Instant};
+use std::time::{Duration, Instant};
 
 use crate::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker};
 
@@ -467,7 +467,7 @@ impl MockKernel {
         }
     }
 
-    fn lock(&self) -> spin::MutexGuard<'_, KernelState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, KernelState> {
         self.inner
             .state
             .lock()
@@ -487,9 +487,9 @@ pub struct CharlotteWaker {
 
 impl ReactorWaker for CharlotteWaker {
     fn wake(&self) -> crate::io::Result<()> {
-        self.kernel.wake(self.cq).map_err(|_| {
-            crate::io::Error::new(crate::io::ErrorKind::NotFound, "unknown completion queue")
-        })
+        self.kernel
+            .wake(self.cq)
+            .map_err(|_| crate::io::ErrorKind::NotFound)
     }
 }
 
@@ -564,9 +564,9 @@ impl ReactorBackend for CharlotteReactor {
         timeout: Option<Duration>,
     ) -> crate::io::Result<CharlotteEvent> {
         let deadline = timeout.map(|d| Instant::now() + d);
-        self.kernel.wait(self.cq, 0, deadline).map_err(|_| {
-            crate::io::Error::new(crate::io::ErrorKind::NotFound, "unknown completion queue")
-        })?;
+        self.kernel
+            .wait(self.cq, 0, deadline)
+            .map_err(|_| crate::io::ErrorKind::NotFound)?;
         let woke = self.kernel.take_woke(self.cq);
         let readable = self.kernel.ready_caps(self.cq);
         Ok(CharlotteEvent {

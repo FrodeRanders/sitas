@@ -1,7 +1,28 @@
-use alloc::string::String;
-use alloc::vec::Vec;
-use alloc::boxed::Box;
-use crate::kv::ShardedKv;
+//! Async-service bridge for the shard-per-thread model.
+//!
+//! This module provides adapters that wrap std-layer sharded services
+//! ([`ShardedKv`], [`ShardedCounter`](crate::counter::ShardedCounter))
+//! for use inside async tasks running on a [`ShardedExecutor`](crate::ShardedExecutor).
+//!
+//! The key insight is that [`Reply::wait_async`](crate::runtime::Reply::wait_async) already
+//! integrates with the custom executor's waker. This module provides ergonomic
+//! async wrappers that call `submit_*` and then `wait_async().await` in a single
+//! async method.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use sitas_core::{ShardedKv, AsyncShardedKv};
+//!
+//! let kv = ShardedKv::start(4).unwrap();
+//! let async_kv = AsyncShardedKv::new(&kv);
+//!
+//! // Inside an async task on a ShardedExecutor:
+//! let value = async_kv.get("my-key").await.unwrap();
+//! ```
+
+use crate::ShardError;
+use crate::kv_service::ShardedKv;
 
 /// Async wrapper around a [`ShardedKv`] reference.
 ///
@@ -113,8 +134,8 @@ impl<'a> AsyncShardedKv<'a> {
     }
 }
 
-impl<'a> core::fmt::Debug for AsyncShardedKv<'a> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<'a> std::fmt::Debug for AsyncShardedKv<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncShardedKv")
             .field("shard_count", &self.kv.shard_count())
             .finish_non_exhaustive()
@@ -184,8 +205,8 @@ impl OwnedAsyncShardedKv {
     }
 }
 
-impl core::fmt::Debug for OwnedAsyncShardedKv {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl std::fmt::Debug for OwnedAsyncShardedKv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OwnedAsyncShardedKv")
             .field("shard_count", &self.kv.as_ref().map(|kv| kv.shard_count()))
             .finish_non_exhaustive()
@@ -249,8 +270,8 @@ impl<'a> AsyncShardedCounter<'a> {
     }
 }
 
-impl<'a> core::fmt::Debug for AsyncShardedCounter<'a> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<'a> std::fmt::Debug for AsyncShardedCounter<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncShardedCounter")
             .field("shard_count", &self.counter.shard_count())
             .finish_non_exhaustive()

@@ -34,9 +34,7 @@ use core::time::Duration;
 
 use sitas_core::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker};
 use sitas_core::shard::ShardId;
-use sitas_core::shard_runtime::{
-    RawJoinHandle, ShardJoinHandle, ShardParker, ShardRuntime,
-};
+use sitas_core::shard_runtime::{RawJoinHandle, ShardJoinHandle, ShardParker, ShardRuntime};
 use spin::Mutex;
 
 /// The virtual address where the default (queue 0) CQ ring is mapped.
@@ -340,7 +338,9 @@ impl ReactorBackend for CharlotteReactor {
             // deadline fires.
             match timeout {
                 Some(duration) => {
-                    let timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1);
+                    let timeout_ms = u64::try_from(duration.as_millis())
+                        .unwrap_or(u64::MAX)
+                        .max(1);
                     let (_pending, timed_out) =
                         unsafe { sys_cq_wait_timeout(1, timeout_ms, self.cq_id) };
                     if self.cq().pending() > 0 {
@@ -399,7 +399,9 @@ impl ShardRuntime for CharlotteReactor {
         // Block in the kernel for the requested duration instead of spinning.
         // A min_complete the small ring can never reach means only the
         // deadline (or a spurious peer wake) releases us.
-        let timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).max(1);
+        let timeout_ms = u64::try_from(duration.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
         let _ = unsafe { sys_cq_wait_timeout(u64::from(u32::MAX), timeout_ms, self.cq_id) };
     }
 
@@ -458,9 +460,9 @@ const PARK_INTERVAL_MS: u64 = 5;
 impl ShardParker for CharlotteParker {
     fn park(&self, timeout: Option<Duration>) {
         let ms = match timeout {
-            Some(duration) => {
-                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX).min(PARK_INTERVAL_MS).max(1)
-            }
+            Some(duration) => u64::try_from(duration.as_millis())
+                .unwrap_or(u64::MAX)
+                .clamp(1, PARK_INTERVAL_MS),
             None => PARK_INTERVAL_MS,
         };
         // A min_complete the small ring can never reach means the wait is

@@ -1,11 +1,10 @@
 //! Minimal no_std sharded key-value service for foreign runtimes.
 //!
-//! Each shard runs its message loop as a **future** on a
-//! [`ShardExecutor`](crate::shard_executor::ShardExecutor): awaiting the next
-//! envelope parks the shard in its reactor's single blocking wait (§7 of the
-//! co-designed architecture), and a sender's wake re-queues exactly that
-//! task. Requesters awaiting a reply park through the runtime's
-//! [`ShardParker`]. Nothing spins.
+//! Each shard runs its message loop as a **future** on a [`ShardExecutor`]:
+//! awaiting the next envelope parks the shard in its reactor's single
+//! blocking wait (§7 of the co-designed architecture), and a sender's wake
+//! re-queues exactly that task. Requesters awaiting a reply park through the
+//! runtime's [`ShardParker`]. Nothing spins.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -216,11 +215,8 @@ impl KvReply {
     }
 }
 
-fn run_kv_shard<R>(
-    receiver: ShardReceiver<KvEnvelope>,
-    parker: Arc<dyn ShardParker>,
-    reactor: R,
-) where
+fn run_kv_shard<R>(receiver: ShardReceiver<KvEnvelope>, parker: Arc<dyn ShardParker>, reactor: R)
+where
     R: ReactorBackend + Send + 'static,
     R::Waker: 'static,
 {

@@ -5,11 +5,11 @@
 //! is being polled on that shard, and no reference to `T` can escape the
 //! closure.
 
-use core::cell::{Cell, UnsafeCell};
-use core::fmt;
-use core::future::Future;
-use alloc::sync::Arc;
-use core::time::Duration;
+use std::cell::{Cell, UnsafeCell};
+use std::fmt;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::executor::{StopSource, StopToken, stop_pair};
 use crate::shard::ShardId;
@@ -507,8 +507,8 @@ impl fmt::Display for ShardLocalWorkerTimeoutError {
     }
 }
 
-impl core::error::Error for ShardLocalWorkerTimeoutError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+impl std::error::Error for ShardLocalWorkerTimeoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ShardLocalWorkerTimeoutError::Join(error) => Some(error),
             ShardLocalWorkerTimeoutError::TimedOut { .. } => None,
@@ -676,7 +676,7 @@ impl fmt::Display for ShardLocalAccessError {
     }
 }
 
-impl core::error::Error for ShardLocalAccessError {}
+impl std::error::Error for ShardLocalAccessError {}
 
 impl<T> ShardLocalCell<T> {
     fn with_mut<R, F>(&self, operation: F) -> R
@@ -728,7 +728,7 @@ mod tests {
     use crate::ShardId;
     use crate::executor::{block_on, sleep};
     use crate::sharded_executor::{ShardedExecutor, join_all_shards};
-    use core::time::Duration;
+    use std::time::Duration;
 
     #[test]
     fn shard_local_values_are_accessed_on_owning_shards() {

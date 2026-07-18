@@ -54,11 +54,11 @@ struct ExecutorShared<W> {
 impl<W: ReactorWaker> ExecutorShared<W> {
     fn mark_ready(&self, task: usize) {
         let mut ready = self.ready.lock();
-        if let Some(queued) = ready.queued.get_mut(task) {
-            if !*queued {
-                *queued = true;
-                ready.queue.push_back(task);
-            }
+        if let Some(queued) = ready.queued.get_mut(task)
+            && !*queued
+        {
+            *queued = true;
+            ready.queue.push_back(task);
         }
         drop(ready);
         // Release the reactor if the executor is blocked in `wait`. Waking an
@@ -265,8 +265,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use crate::io;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A reactor whose `wait` returns immediately, reporting a wake when one
     /// was posted and any handles marked ready by the test.
@@ -324,8 +324,7 @@ mod tests {
         ) -> io::Result<MockEvent> {
             let woke = self.woken.swap(false, Ordering::AcqRel);
             let mut ready = self.readable.lock();
-            let readable: Vec<u64> =
-                ready.iter().copied().filter(|h| read.contains(h)).collect();
+            let readable: Vec<u64> = ready.iter().copied().filter(|h| read.contains(h)).collect();
             ready.retain(|h| !readable.contains(h));
             Ok(MockEvent { woke, readable })
         }

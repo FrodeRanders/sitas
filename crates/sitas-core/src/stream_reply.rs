@@ -1,7 +1,19 @@
-use alloc::string::String;
-use alloc::vec::Vec;
-use alloc::boxed::Box;
-use core::task::{Context, Poll, Waker};
+//! Streaming reply channels for sharded services.
+//!
+//! A [`StreamReply<T>`] bridges between a shard producing multiple values and a
+//! consumer that receives them. Unlike a one-shot [`Reply<T>`](crate::runtime::Reply),
+//! a stream reply delivers a sequence of owned values followed by a terminal
+//! completion signal. Blocking consumers use [`StreamReply::recv`],
+//! [`StreamReply::recv_batch`], [`StreamReply::collect`], or
+//! [`StreamReply::fold`]. Async consumers call [`StreamReply::next_batch`]
+//! which returns a [`StreamBatch`] future for waker-integrated polling.
+
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll, Waker};
 
 /// Error returned when a streaming reply is dropped before completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +33,7 @@ impl fmt::Display for StreamError {
     }
 }
 
-impl core::error::Error for StreamError {}
+impl std::error::Error for StreamError {}
 
 /// The sending side of a streaming reply channel.
 ///
@@ -244,8 +256,8 @@ impl<T> StreamReply<T> {
     /// waker, and returns when values arrive or the stream is exhausted.
     ///
     /// ```
-    /// # use sitas::stream_reply::{stream_channel, StreamBatch};
-    /// # use sitas::executor::block_on;
+    /// # use sitas_core::stream_reply::{stream_channel, StreamBatch};
+    /// # use sitas_core::executor::block_on;
     /// # block_on(async {
     /// let (sender, mut reply) = stream_channel::<i32>();
     /// sender.send(1).unwrap();
@@ -357,8 +369,8 @@ impl<T> Future for StreamBatch<'_, T> {
 /// [`StreamFuture::fold`] that drain the entire stream.
 ///
 /// ```
-/// # use sitas::stream_reply::{stream_channel, StreamFuture};
-/// # use sitas::executor::block_on;
+/// # use sitas_core::stream_reply::{stream_channel, StreamFuture};
+/// # use sitas_core::executor::block_on;
 /// # block_on(async {
 /// let (sender, reply) = stream_channel::<i32>();
 /// sender.send(1).unwrap();
@@ -449,7 +461,7 @@ mod tests {
     use super::*;
     use crate::executor::block_on;
     use std::thread;
-    use core::time::Duration;
+    use std::time::Duration;
 
     #[test]
     fn stream_reply_collects_all_values() {

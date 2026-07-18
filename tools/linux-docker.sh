@@ -21,58 +21,66 @@ if [ "$#" -eq 0 ]; then
         export PATH="/usr/local/cargo/bin:$PATH"
         rustup component add rustfmt
         rustup component add clippy
+        rustup target add aarch64-unknown-none
         cargo fmt --check
-        cargo clippy --all-targets -- -D warnings
+        cargo clippy --workspace --all-targets -- -D warnings
+        cargo clippy -p sitas-core --features std --all-targets -- -D warnings
         cargo test
+        cargo test -p sitas-core --features std
+        cargo check -p sitas-core -p sitas-charlotte --target aarch64-unknown-none
         cargo doc --no-deps
-        cargo run --example basic_kv
-        cargo run --example concurrent_kv
-        cargo run --example submit_kv
-        cargo run --example async_kv
-        cargo run --example sharded_executor
-        cargo run --example sharded_index_build
-        cargo run --example sharded_index_build_uring
-        cargo run --example sharded_observability
-        cargo run --example sharded_submit
-        cargo run --example sharded_broadcast
-        cargo run --example sharded_map_reduce
-        cargo run --example shard_local
-        cargo run --example shard_local_handle
-        cargo run --example shard_local_current
-        cargo run --example shard_local_workers
-        cargo run --example shard_local_stoppable_workers
-        cargo run --example shard_local_stoppable_workers_timeout
-        cargo run --example shard_local_worker_observability
-        cargo run --example async_accept
-        cargo run --example async_connect
-        cargo run --example async_tcp_echo
-        cargo run --example async_tcp_pair
-        cargo run --example async_tcp_server
-        cargo run --example async_tcp_server_timeout
-        cargo run --example async_tcp_idle_server
-        cargo run --example async_tcp_idle_server_timeout
-        cargo run --example async_tcp_stoppable_server
-        cargo run --example async_tcp_scoped_server
-        cargo run --example async_tcp_timeout
-        cargo run --example async_tcp_multi_echo
-        cargo run --example async_copy
-        cargo run --example async_readable
-        cargo run --example async_write
-        cargo run --example executor_sleep
-        cargo run --example executor_abort
-        cargo run --example executor_timeout
-        cargo run --example executor_race
-        cargo run --example executor_task_scope
-        cargo run --example custom_placement
-        cargo run --example basic_counter
-        cargo run --example os_reactor
-        cargo run --example os_readable
-        cargo run --example os_uring
-        cargo run --example os_uring_batch
-        cargo run --example os_uring_abandon
-        cargo run --example os_uring_lifecycle
-        cargo run --example scheduling_group_demo
-        cargo run --example sharded_scheduling_groups
+        cargo run -p sitas --example basic_kv
+        cargo run -p sitas --example concurrent_kv
+        cargo run -p sitas --example submit_kv
+        cargo run -p sitas --example async_kv
+        cargo run -p sitas --example sharded_executor
+        cargo run -p sitas --example sharded_index_build
+        cargo run -p sitas --example sharded_index_build_uring
+        cargo run -p sitas --example sharded_index_mailbox
+        cargo run -p sitas --example sharded_observability
+        cargo run -p sitas --example sharded_submit
+        cargo run -p sitas --example sharded_broadcast
+        cargo run -p sitas --example sharded_map_reduce
+        cargo run -p sitas --example sharded_cpu_placement
+        cargo run -p sitas --example sharded_memory_placement
+        cargo run -p sitas --example shard_local
+        cargo run -p sitas --example shard_local_handle
+        cargo run -p sitas --example shard_local_current
+        cargo run -p sitas --example shard_local_workers
+        cargo run -p sitas --example shard_local_stoppable_workers
+        cargo run -p sitas --example shard_local_stoppable_workers_timeout
+        cargo run -p sitas --example shard_local_worker_observability
+        cargo run -p sitas --example async_accept
+        cargo run -p sitas --example async_connect
+        cargo run -p sitas --example async_tcp_echo
+        cargo run -p sitas --example async_tcp_pair
+        cargo run -p sitas --example async_tcp_server
+        cargo run -p sitas --example async_tcp_server_timeout
+        cargo run -p sitas --example async_tcp_idle_server
+        cargo run -p sitas --example async_tcp_idle_server_timeout
+        cargo run -p sitas --example async_tcp_stoppable_server
+        cargo run -p sitas --example async_tcp_scoped_server
+        cargo run -p sitas --example async_tcp_scheduling_groups
+        cargo run -p sitas --example async_tcp_timeout
+        cargo run -p sitas --example async_tcp_multi_echo
+        cargo run -p sitas --example async_copy
+        cargo run -p sitas --example async_readable
+        cargo run -p sitas --example async_write
+        cargo run -p sitas --example executor_sleep
+        cargo run -p sitas --example executor_abort
+        cargo run -p sitas --example executor_timeout
+        cargo run -p sitas --example executor_race
+        cargo run -p sitas --example executor_task_scope
+        cargo run -p sitas --example custom_placement
+        cargo run -p sitas --example basic_counter
+        cargo run -p sitas --example os_reactor
+        cargo run -p sitas --example os_readable
+        cargo run -p sitas --example os_uring
+        cargo run -p sitas --example os_uring_batch
+        cargo run -p sitas --example os_uring_abandon
+        cargo run -p sitas --example os_uring_lifecycle
+        cargo run -p sitas --example scheduling_group_demo
+        cargo run -p sitas --example sharded_scheduling_groups
     '
 else
     INSTALL_RUSTFMT=0
