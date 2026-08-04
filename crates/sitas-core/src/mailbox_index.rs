@@ -34,7 +34,7 @@ use crate::shard_executor::ShardExecutor;
 use crate::shard_runtime::{ShardParker, ShardReceiver, ShardRuntime, ShardSender};
 
 /// Number of records in the in-memory data set.
-pub const RECORD_COUNT: usize = 512;
+pub const RECORD_COUNT: usize = 1024;
 /// Number of physical shards (scanner + assembler threads).
 pub const SHARD_COUNT: usize = 2;
 /// Number of logical assembler work units: one more than shards, with the last
