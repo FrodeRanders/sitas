@@ -176,6 +176,25 @@ mod tests {
     }
 
     #[test]
+    fn unix_runtime_builds_the_mailbox_index() {
+        use sitas_core::mailbox_index::{
+            FAILURE_SENTINEL, RECORD_COUNT, SUCCESS_SENTINEL, mailbox_index_test,
+        };
+
+        let runtime = UnixRuntime::new();
+        let mut result = 0u32;
+        unsafe { mailbox_index_test(&runtime, &mut result) };
+        assert_ne!(
+            result, FAILURE_SENTINEL,
+            "mailbox index demo failed (failure sentinel written)"
+        );
+        assert_eq!(
+            result, SUCCESS_SENTINEL,
+            "expected verified record count {RECORD_COUNT}, got {result}"
+        );
+    }
+
+    #[test]
     fn parker_wakes_a_parked_thread() {
         let runtime = UnixRuntime::new();
         let parker = runtime.parker();

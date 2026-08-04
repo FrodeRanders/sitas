@@ -25,6 +25,7 @@ pub mod error;
 pub mod instant;
 pub mod io;
 pub mod kv;
+pub mod mailbox_index;
 pub mod placement;
 pub mod reactor_backend;
 pub mod ringbuf;
