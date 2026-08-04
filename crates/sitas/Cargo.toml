@@ -9,4 +9,5 @@ readme = "../../README.md"
 license = "Apache-2.0"
 
 [dependencies]
-sitas-core = { path = "../sitas-core", features = ["std"] }
+sitas-core = { version = "0.2.0", path = "../sitas-core", features = ["std"] }
+sitas-unix = { version = "0.2.0", path = "../sitas-unix" }
