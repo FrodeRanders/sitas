@@ -88,9 +88,12 @@ impl<T> fmt::Debug for ShardJoinHandle<T> {
     }
 }
 
-/// A raw join handle for no_std targets. On CharlotteOS this represents a
-/// thread that was spawned via the kernel's `spawn_thread` syscall; joining
-/// is not yet implemented (the kernel's thread lifecycle is cooperative).
+/// A raw join handle for no_std targets. This is the placeholder handle for
+/// backends that have not implemented thread joining yet: it never reports
+/// finished and `join` always errors. `sitas-charlotte` does not use it —
+/// that backend provides its own kernel-backed `CharlotteJoinHandle`, whose
+/// `join` blocks on a completion capability fired when the kernel reaps the
+/// thread.
 #[derive(Debug)]
 pub struct RawJoinHandle;
 
@@ -128,6 +131,7 @@ pub fn channel<M: Send + 'static>(capacity: usize) -> ShardChannelResult<M> {
     }
     let shared = Arc::new(ChannelShared {
         queue: RingBuffer::bounded(capacity),
+        push_lock: spin::Mutex::new(()),
         recv_waker: spin::Mutex::new(None),
         closed: AtomicBool::new(false),
     });
@@ -142,8 +146,14 @@ pub fn channel<M: Send + 'static>(capacity: usize) -> ShardChannelResult<M> {
 /// State shared by both channel endpoints: the message ring, the receiving
 /// task's registered waker (taken and invoked on send/close so the receiver's
 /// executor re-polls it), and the closed flag.
+///
+/// `ShardSender` is cloneable, so a channel is multi-producer: the backing
+/// [`RingBuffer`] is single-producer, and `push_lock` serializes concurrent
+/// producers instead. The receiver side is single-consumer (`ShardReceiver`
+/// is not cloneable), so `pop` needs no lock.
 struct ChannelShared<M> {
     queue: RingBuffer<M>,
+    push_lock: spin::Mutex<()>,
     recv_waker: spin::Mutex<Option<Waker>>,
     closed: AtomicBool,
 }
@@ -181,7 +191,9 @@ impl<M> ShardSender<M> {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(msg);
         }
+        let _guard = self.shared.push_lock.lock();
         self.shared.queue.try_push(msg)?;
+        drop(_guard);
         // Re-poll a receiver task parked in `recv().await`.
         self.shared.wake_receiver();
         Ok(())
