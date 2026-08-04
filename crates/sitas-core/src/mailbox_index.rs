@@ -85,16 +85,14 @@ fn build_index_with_mailboxes<R: ShardRuntime + ?Sized>(runtime: &R) -> Result<u
     let mut assembler_senders = Vec::with_capacity(ASSEMBLER_COUNT);
     let mut assembler_receivers = Vec::with_capacity(ASSEMBLER_COUNT);
     for _ in 0..ASSEMBLER_COUNT {
-        let (sender, receiver) =
-            runtime.channel(CHANNEL_CAPACITY).map_err(|_| ())?;
+        let (sender, receiver) = runtime.channel(CHANNEL_CAPACITY).map_err(|_| ())?;
         assembler_senders.push(sender);
         assembler_receivers.push(receiver);
     }
 
     // Result mailbox: assemblers deliver their owned sorted runs here.
-    let (result_sender, mut result_receiver) = runtime
-        .channel(RESULT_CHANNEL_CAPACITY)
-        .map_err(|_| ())?;
+    let (result_sender, mut result_receiver) =
+        runtime.channel(RESULT_CHANNEL_CAPACITY).map_err(|_| ())?;
 
     // Start receivers before producers.
     for (work_unit, receiver) in assembler_receivers.into_iter().enumerate() {
@@ -155,7 +153,9 @@ fn run_scanner_shard(
 ) {
     let (start, end) = partition_for(shard_idx, SHARD_COUNT, RECORD_COUNT);
     let shard_id = ShardId(shard_idx);
-    let mut batches = vec![Vec::with_capacity(SEND_BATCH_ENTRIES); ASSEMBLER_COUNT];
+    let mut batches = (0..ASSEMBLER_COUNT)
+        .map(|_| Vec::with_capacity(SEND_BATCH_ENTRIES))
+        .collect::<Vec<_>>();
 
     for record_idx in start..end {
         let key = record_key(record_idx);
@@ -192,7 +192,11 @@ fn run_scanner_shard(
 
     // Signal completion to every assembler.
     for sender in &senders {
-        send_message(sender, parker.as_ref(), IndexMessage::ProducerDone { from: shard_id });
+        send_message(
+            sender,
+            parker.as_ref(),
+            IndexMessage::ProducerDone { from: shard_id },
+        );
     }
 }
 
@@ -239,7 +243,11 @@ async fn assembler_task(
     }
 
     entries.sort_unstable();
-    send_run(&result_sender, parker.as_ref(), RunResult { work_unit, entries });
+    send_run(
+        &result_sender,
+        parker.as_ref(),
+        RunResult { work_unit, entries },
+    );
 }
 
 /// Send one message through a mailbox, backing off with a short park when the
@@ -263,11 +271,7 @@ fn send_message(
 
 /// Deliver the owned sorted run to the coordinator, backing off on a full
 /// result mailbox.
-fn send_run(
-    sender: &ShardSender<RunResult>,
-    parker: &dyn ShardParker,
-    mut run: RunResult,
-) {
+fn send_run(sender: &ShardSender<RunResult>, parker: &dyn ShardParker, mut run: RunResult) {
     loop {
         match sender.try_send(run) {
             Ok(()) => return,
