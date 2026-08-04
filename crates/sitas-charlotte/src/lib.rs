@@ -57,6 +57,7 @@ const SYSCALL_CQ_WAIT: u16 = 12;
 const SYSCALL_CQ_WAKE: u16 = 41;
 const SYSCALL_CQ_WAIT_TIMEOUT: u16 = 42;
 const SYSCALL_OBSERVE_THREAD_EXIT: u16 = 61;
+const SYSCALL_GET_TID: u16 = 62;
 
 /// Read the per-shard CQ ring layout the loader published in the config page:
 /// `(base_vaddr, count)`, or `(0, 0)` if no per-shard rings were mapped.
@@ -68,7 +69,14 @@ fn shard_cq_layout() -> (usize, usize) {
     (base as usize, count as usize)
 }
 
-static SHARD_ENTRIES: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
+/// Entry queue for shard threads: `(tid, closure)`. A spawned shard thread
+/// removes the entry whose tid matches its own (the kernel reports it via
+/// `GET_TID`), so the closure a thread runs — and therefore the result slot
+/// its handle reads — is determined by the thread's identity, never by the
+/// order threads happen to be scheduled in. (A plain pop would race: two
+/// shards can be scheduled in either order, and the handle created for spawn
+/// N must observe the value computed by exactly that spawn.)
+static SHARD_ENTRIES: Mutex<Vec<(u64, Box<dyn FnOnce() + Send>)>> = Mutex::new(Vec::new());
 
 // ---- syscall wrappers -------------------------------------------------------
 
@@ -100,6 +108,7 @@ unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         SYSCALL_CQ_WAIT => svc!(12),
         SYSCALL_CQ_WAKE => svc!(41),
         SYSCALL_OBSERVE_THREAD_EXIT => svc!(61),
+        SYSCALL_GET_TID => svc!(62),
         _ => {
             let _ = (arg1, arg2, arg3);
             1
@@ -121,6 +130,12 @@ unsafe fn sys_thread_exit() -> ! {
     unsafe {
         core::arch::asm!("svc #8", options(noreturn));
     }
+}
+
+/// Syscall: report the calling thread's kernel thread id.
+#[inline(always)]
+unsafe fn sys_get_tid() -> u64 {
+    unsafe { syscall(SYSCALL_GET_TID, 0, 0, 0) }
 }
 
 /// Register a completion capability that fires when thread `tid` exits.
@@ -196,10 +211,19 @@ unsafe fn sys_cq_wait_timeout(min_complete: u64, timeout_ms: u64, cq: u32) -> (u
 }
 
 extern "C" fn shard_entry_trampoline() {
-    let entry = SHARD_ENTRIES.lock().pop();
-    if let Some(entry) = entry {
-        entry();
-    }
+    let tid = unsafe { sys_get_tid() };
+    // The spawner stages this thread's entry right after SPAWN_THREAD
+    // returns, so the thread can be scheduled and run before the entry
+    // exists. Spin until it appears: the push is unconditional and
+    // immediate, and falling through would re-enter the trampoline forever.
+    let entry = loop {
+        let mut entries = SHARD_ENTRIES.lock();
+        match entries.iter().position(|(spawn_tid, _)| *spawn_tid == tid) {
+            Some(index) => break entries.remove(index).1,
+            None => drop(entries),
+        }
+    };
+    entry();
     // The shard closure has run to completion. A user thread has no
     // "returned" trap: if this function simply returned, the thread would
     // re-enter the trampoline forever. Terminate explicitly so the kernel
@@ -446,12 +470,12 @@ impl ShardRuntime for CharlotteReactor {
         // can read the value without racing the thread.
         let result = alloc::sync::Arc::new(spin::Mutex::new(None::<T>));
         let result_for_thread = alloc::sync::Arc::clone(&result);
-        SHARD_ENTRIES.lock().push(Box::new(move || {
-            let value = entry();
-            *result_for_thread.lock() = Some(value);
-        }));
         let entry_vaddr = shard_entry_trampoline as *const () as usize;
         let tid = unsafe { sys_spawn(entry_vaddr as u64, shard_id.0 as u64) };
+        SHARD_ENTRIES.lock().push((tid, Box::new(move || {
+            let value = entry();
+            *result_for_thread.lock() = Some(value);
+        })));
         // Observe the spawned thread's exit; the returned capability
         // completes when the kernel reaps the thread.
         let cap = unsafe { sys_observe_exit(tid) };
