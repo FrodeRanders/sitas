@@ -34,7 +34,7 @@ use core::time::Duration;
 
 use sitas_core::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker};
 use sitas_core::shard::ShardId;
-use sitas_core::shard_runtime::{RawJoinHandle, ShardJoinHandle, ShardParker, ShardRuntime};
+use sitas_core::shard_runtime::{ShardParker, ShardRuntime};
 use spin::Mutex;
 
 /// The virtual address where the default (queue 0) CQ ring is mapped.
@@ -48,10 +48,15 @@ const SHARD_CQ_BASE_OFFSET: usize = 2064;
 /// (matches `catten_rt::config::SHARD_CQ_COUNT_OFFSET`).
 const SHARD_CQ_COUNT_OFFSET: usize = 2072;
 const SYSCALL_COMPLETION_SUBMIT: u16 = 1;
+const SYSCALL_COMPLETION_POLL: u16 = 3;
+const SYSCALL_COMPLETION_WAIT: u16 = 4;
+const SYSCALL_COMPLETION_CLOSE: u16 = 6;
 const SYSCALL_SPAWN_THREAD: u16 = 7;
+const SYSCALL_THREAD_EXIT: u16 = 8;
 const SYSCALL_CQ_WAIT: u16 = 12;
 const SYSCALL_CQ_WAKE: u16 = 41;
 const SYSCALL_CQ_WAIT_TIMEOUT: u16 = 42;
+const SYSCALL_OBSERVE_THREAD_EXIT: u16 = 61;
 
 /// Read the per-shard CQ ring layout the loader published in the config page:
 /// `(base_vaddr, count)`, or `(0, 0)` if no per-shard rings were mapped.
@@ -89,9 +94,12 @@ unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 
     match imm {
         SYSCALL_COMPLETION_SUBMIT => svc!(1),
+        SYSCALL_COMPLETION_WAIT => svc!(4),
+        SYSCALL_COMPLETION_CLOSE => svc!(6),
         SYSCALL_SPAWN_THREAD => svc!(7),
         SYSCALL_CQ_WAIT => svc!(12),
         SYSCALL_CQ_WAKE => svc!(41),
+        SYSCALL_OBSERVE_THREAD_EXIT => svc!(61),
         _ => {
             let _ = (arg1, arg2, arg3);
             1
@@ -103,6 +111,54 @@ unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 #[inline(always)]
 unsafe fn sys_spawn(entry_vaddr: u64, target_lp: u64) -> u64 {
     unsafe { syscall(SYSCALL_SPAWN_THREAD, entry_vaddr, target_lp, 0) }
+}
+
+/// Terminate the calling thread; the kernel reaps it and fires any exit
+/// observer registered against it. Never returns.
+#[inline(always)]
+unsafe fn sys_thread_exit() -> ! {
+    let _ = SYSCALL_THREAD_EXIT;
+    unsafe {
+        core::arch::asm!("svc #8", options(noreturn));
+    }
+}
+
+/// Register a completion capability that fires when thread `tid` exits.
+/// Returns the capability, or `u64::MAX` when the thread id is invalid.
+#[inline(always)]
+unsafe fn sys_observe_exit(tid: u64) -> u64 {
+    unsafe { syscall(SYSCALL_OBSERVE_THREAD_EXIT, tid, 0, 0) }
+}
+
+/// Block the calling thread until the given completion capability reaches a
+/// terminal state.
+#[inline(always)]
+unsafe fn sys_wait(cap: u64) {
+    unsafe { syscall(SYSCALL_COMPLETION_WAIT, cap, 0, 0) };
+}
+
+/// Release a completed capability slot.
+#[inline(always)]
+unsafe fn sys_close(cap: u64) {
+    unsafe { syscall(SYSCALL_COMPLETION_CLOSE, cap, 0, 0) };
+}
+
+/// Poll a completion capability: `(0, _)` once terminal, `(1, 0)` while
+/// pending.
+#[inline(always)]
+unsafe fn sys_poll(cap: u64) -> (u64, u64) {
+    let _ = SYSCALL_COMPLETION_POLL;
+    let state: u64;
+    let result: u64;
+    unsafe {
+        core::arch::asm!(
+            "svc #3",
+            lateout("x0") state,
+            inlateout("x1") cap => result,
+            options(nostack, nomem, preserves_flags),
+        );
+    }
+    (state, result)
 }
 
 /// Post an explicit wake to queue `cq` (a per-shard wake releases only the
@@ -144,6 +200,13 @@ extern "C" fn shard_entry_trampoline() {
     if let Some(entry) = entry {
         entry();
     }
+    // The shard closure has run to completion. A user thread has no
+    // "returned" trap: if this function simply returned, the thread would
+    // re-enter the trampoline forever. Terminate explicitly so the kernel
+    // reaps the thread and fires any exit observer registered against it
+    // (this is what makes `CharlotteJoinHandle::join` complete). Never
+    // returns.
+    unsafe { sys_thread_exit() };
 }
 
 // ---- reactor backend --------------------------------------------------------
@@ -369,7 +432,7 @@ impl ReactorBackend for CharlotteReactor {
 // ---- ShardRuntime implementation -------------------------------------------
 
 impl ShardRuntime for CharlotteReactor {
-    type JoinHandle<T: Send> = ShardJoinHandle<T>;
+    type JoinHandle<T: Send> = CharlotteJoinHandle<T>;
     type Reactor = CharlotteReactor;
 
     fn spawn_shard<T: Send + 'static>(
@@ -377,15 +440,22 @@ impl ShardRuntime for CharlotteReactor {
         shard_id: ShardId,
         _placement: sitas_core::placement::ShardPlacement,
         entry: alloc::boxed::Box<dyn FnOnce() -> T + Send>,
-    ) -> ShardJoinHandle<T> {
+    ) -> CharlotteJoinHandle<T> {
+        // The result slot is filled by the shard thread before it terminates;
+        // the exit observer fires only after the closure completed, so `join`
+        // can read the value without racing the thread.
+        let result = alloc::sync::Arc::new(spin::Mutex::new(None::<T>));
+        let result_for_thread = alloc::sync::Arc::clone(&result);
         SHARD_ENTRIES.lock().push(Box::new(move || {
-            let _ = entry();
+            let value = entry();
+            *result_for_thread.lock() = Some(value);
         }));
         let entry_vaddr = shard_entry_trampoline as *const () as usize;
-        unsafe {
-            sys_spawn(entry_vaddr as u64, shard_id.0 as u64);
-        }
-        ShardJoinHandle::from_raw(RawJoinHandle)
+        let tid = unsafe { sys_spawn(entry_vaddr as u64, shard_id.0 as u64) };
+        // Observe the spawned thread's exit; the returned capability
+        // completes when the kernel reaps the thread.
+        let cap = unsafe { sys_observe_exit(tid) };
+        CharlotteJoinHandle { cap, result }
     }
 
     fn channel<M: Send + 'static>(
@@ -426,6 +496,38 @@ impl ShardRuntime for CharlotteReactor {
             // the loader did not map per-shard CQ pages (legacy single-ring path).
             CharlotteReactor::new(shard as u32)
         }
+    }
+}
+
+// ---- join handles -----------------------------------------------------------
+
+/// A kernel-backed join handle for a CharlotteOS shard thread.
+///
+/// `join` blocks on a completion capability that fires when the kernel reaps
+/// the thread (the exit observer registered by `SPAWN_THREAD` + a dedicated
+/// syscall); the shard closure's return value is delivered through the shared
+/// result slot, which the thread fills before terminating. This replaces the
+/// always-error `RawJoinHandle` placeholder: joining is real, and the waiting
+/// side parks in the kernel's completion wait rather than spinning.
+pub struct CharlotteJoinHandle<T> {
+    cap: u64,
+    result: alloc::sync::Arc<spin::Mutex<Option<T>>>,
+}
+
+impl<T> CharlotteJoinHandle<T> {
+    /// Returns `true` once the shard thread has exited and been reaped.
+    pub fn is_finished(&self) -> bool {
+        let (state, _) = unsafe { sys_poll(self.cap) };
+        state == 0
+    }
+
+    /// Blocks until the shard thread exits and returns its closure's value.
+    pub fn join(self) -> core::result::Result<T, Box<dyn core::error::Error + Send + Sync>> {
+        unsafe { sys_wait(self.cap) };
+        unsafe { sys_close(self.cap) };
+        self.result.lock().take().ok_or_else(|| {
+            Box::new(sitas_core::io::ErrorKind::Other) as Box<dyn core::error::Error + Send + Sync>
+        })
     }
 }
 
