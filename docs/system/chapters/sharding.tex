@@ -10,15 +10,10 @@ for submitting work to one shard, all shards, or a map/reduce over shards.
 Work does not migrate implicitly. A future runs on its assigned shard until
 code deliberately submits work elsewhere.
 
-This mirrors the most important Seastar idea: parallelism comes from many
-independent shards, not from many threads mutating the same service object.
-Each shard has its own executor, task queues, timers, readiness registrations,
-and shard-local values.
-
-Cache locality and ownership clarity drive this shape. Each shard owns its
-state and works on its own queue, so no global lock is needed. Cross-shard
-communication is an explicit design cost, not an accidental side effect of
-shared references.
+Parallelism comes from independent shards rather than threads mutating one
+service object. Each shard owns its executor, queues, timers, readiness
+registrations, and local values. Cross-shard communication is therefore an
+explicit cost and ownership boundary.
 
 \begin{center}
 \begin{tikzpicture}[
@@ -48,10 +43,9 @@ resumes on its original shard after the remote work completes.
 Submitters own spawner clones. They are lifetime capabilities and must be
 dropped before a runtime can fully drain.
 
-The important detail is the return path. A task on shard 0 submits work to
-shard 1 and awaits the join handle. The submitted future is polled on shard 1.
-On completion, the awaiting future on shard 0 wakes and continues on shard 0.
-The result crosses the boundary as an owned value.
+If shard 0 submits work to shard 1, shard 1 polls the submitted future. Its
+owned result completes the join handle, waking the awaiting task on shard 0;
+the awaiting task does not migrate.
 
 \begin{center}
 \begin{tikzpicture}[
@@ -76,16 +70,17 @@ This is why cross-shard APIs require \texttt{Send + 'static} where a future or
 value can move to another thread. It is also why references into shard-local
 state cannot be submitted.
 
-The submitter API is more explicit than work stealing. Work stealing would blur
-the core lesson: placement is part of the program's semantics. Submitting to
-shard 1 means shard 1 is the correct owner for that work.
+The submitter does not steal work. Submitting to shard 1 explicitly states that
+shard 1 is the correct execution context.
 
 \section{Mailbox routing}
 
-\texttt{ShardedSubmitter} moves futures. \texttt{shard\_mailbox} moves owned
-messages. A mailbox does not make application state shared; it gives producers
-a typed way to transfer ownership to a receiver that remains local to its
-assigned shard.
+\texttt{ShardedSubmitter} moves futures. The host-only
+\texttt{shard\_mailbox} module moves owned messages through bounded queues. A
+mailbox transfers ownership to one shard-local receiver; it does not make the
+receiver's application state shared. The portable \texttt{ShardRuntime}
+channel has the same cloneable-sender, single-receiver shape, but uses the
+\texttt{no\_std} ring buffer and serializes concurrent producers at push.
 
 There are two routing modes.
 
@@ -148,9 +143,8 @@ behavior through owned snapshots and example output.
 
 \section{Cache behavior of shard movement}
 
-The shared-nothing model is often described as a way to improve cache locality.
-That is true, but it is important to be precise about what improves and what
-still costs real hardware traffic.
+Shared-nothing ownership can improve cache locality, but messages and queue
+metadata still cause hardware traffic.
 
 A shard owns its mutable application state. If a key-value shard repeatedly
 updates its local map, the working set for that map tends to stay in the cache
@@ -170,22 +164,14 @@ Suppose shard 0 builds an owned message and sends it to shard 1:
     \item Shard 1 reads the message payload and mutates its own local state.
 \end{enumerate}
 
-The first and fourth steps touch the payload. The cache lines holding the
-payload are likely warm on shard 0 after construction. When shard 1 reads the
-message, those cache lines must become available to shard 1. On a coherent
-processor this can mean transferring a modified line from another core's cache,
-invalidating an old copy, or refetching data through lower cache levels or main
-memory. The type system proves that shard 0 no longer has a borrowed reference
-into the message after transfer, but it does not make the physical cache-line
-movement disappear.
+The payload is likely warm on shard 0 after construction. Shard 1 must fetch
+those cache lines before consuming it. Rust ownership prevents stale borrowed
+access on shard 0; it does not remove the physical transfer.
 
-The second and third steps touch mailbox metadata. A bounded mailbox typically
-has queue slots plus small pieces of coordination state: producer and consumer
-positions, capacity accounting, closed flags, waiter lists or wakers, rejection
-counters, and snapshot counters. Those fields are runtime synchronization, not
-shared application state, but they can still be written by different cores. A
-single hot metadata cache line can bounce between cores even when every message
-payload is an owned value.
+Enqueue and dequeue also touch coordination state such as queue positions,
+capacity, close flags, wakers, and counters. These fields are transport
+synchronization rather than shared application state, but they can still
+become cache-coherence hot spots.
 
 \begin{center}
 \begin{tikzpicture}[
@@ -226,10 +212,8 @@ This is the distinction the architecture relies on:
 
 \subsection{Payload size and batching}
 
-Small commands are usually cheap to move, but they can create high metadata
-traffic if sent at very high rates. Large messages reduce per-message overhead
-but can evict useful local data from the receiver's caches. The right shape is
-workload-dependent.
+Small commands can create high metadata traffic at high rates; large messages
+can evict useful receiver data. The balance is workload-dependent.
 
 For hot paths, prefer commands that describe the operation compactly and let
 the destination shard perform the mutation locally. When many tiny records
@@ -277,7 +261,7 @@ target's inbound queue metadata becomes shared by many producers. The
 application state behind the receiver is still protected by the ownership
 model, but the transport path may limit throughput.
 
-The usual remedies are architectural, not magical queue tricks:
+Mitigations include:
 
 \begin{itemize}
     \item route data so work is more evenly partitioned;
@@ -297,17 +281,12 @@ from sending between sockets. CPU placement does not by itself solve NUMA
 placement, but it makes the question visible: which shard runs where, and what
 data does it mostly touch?
 
-The project's current CPU placement support is experimental and Linux-focused.
-It can request where shard threads run, but it does not yet provide a complete
-memory-placement policy by default. On Linux, applied CPU placement also
-records the NUMA node for the pinned CPU when sysfs exposes that topology.
-Callers that want a memory policy can opt in explicitly. The runtime can apply
-a shard-thread default policy with \texttt{set\_mempolicy}: bind to a specific
-node, prefer a node, interleave across nodes, or bind to the node local to the
-pinned CPU. Required memory placement turns failure into startup failure;
-otherwise the result is recorded in snapshots. The conservative assumption is
-that cross-shard messages have nonzero cost even when placement succeeds, and
-that cross-socket movement may be materially more expensive.
+CPU and memory placement are explicit Linux requests. Applied CPU placement
+records the NUMA node when sysfs exposes it. An optional shard-thread default
+memory policy can bind, prefer, or interleave nodes, or select the node local to
+the pinned CPU. Required placement converts failure into startup failure;
+otherwise snapshots record the result. Cross-shard and especially cross-socket
+movement still has nonzero cost after successful placement.
 
 This is not complete allocator control. The policy affects future allocations
 made by the shard thread according to kernel rules. The runtime does not yet
@@ -329,9 +308,8 @@ does not make a mailbox free. Its promise is narrower and stronger:
           transfer points rather than hidden shared-state access.
 \end{itemize}
 
-That is why the project treats mailboxes as a transport boundary. They are a
-necessary shared runtime mechanism, but they do not weaken the rule that
-application service state belongs to the receiving shard.
+Mailboxes are shared transport mechanisms. Application service state still
+belongs to the receiving shard.
 
 \section{Shard-local values}
 
@@ -344,14 +322,8 @@ References to local state cannot escape the closure and cannot cross
 \texttt{.await}. Ownership stays local even when the runtime uses
 synchronization for task bookkeeping.
 
-Two ways to read \texttt{ShardLocal<T>}:
-
-\begin{itemize}
-    \item as a safe teaching model for shared-nothing state, because each shard
-          owns exactly one \texttt{T};
-    \item as a runtime boundary test, because the code must prevent references
-          to \texttt{T} from becoming async state.
-\end{itemize}
+Each shard owns one \texttt{T}; the API must prevent references to that value
+from becoming async state.
 
 The API prefers closures returning owned results. If a computation needs to
 wait, copy or compute an owned value from the shard-local state first, then
@@ -400,13 +372,9 @@ In containers, the available CPU set may already be restricted, so the runtime
 first queries what the kernel allows. On macOS and other platforms, placement
 reports unsupported rather than pretending that pinning happened.
 
-The feature is useful even in experimental form because it forces the runtime
-to separate desired placement from observed placement. A shard can report which
-CPU it asked for, which CPU set the host allowed, and whether startup treated
-failure as advisory or fatal. On Linux, a successfully pinned shard can also
-report the NUMA node associated with its CPU when the host exposes
-\texttt{/sys/devices/system/cpu/cpuN/node*}. That makes CPU and memory-locality
-questions visible to callers choosing an explicit memory-placement policy.
+Snapshots separate requested placement, the host's allowed CPU set, and the
+observed result. When available, they also report the NUMA node associated with
+the pinned CPU.
 
 Memory placement follows the same explicit-request model. The default is no
 memory policy change. When requested, Linux applies a thread default memory

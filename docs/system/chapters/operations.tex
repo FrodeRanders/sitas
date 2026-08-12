@@ -19,10 +19,8 @@ packages used by \filepath{sitasdoc.cls}: \texttt{geometry}, \texttt{fancyhdr},
 \texttt{hyperref}. The manual avoids project-specific generated
 assets so it can be rebuilt from text alone.
 
-Keeping the manual build simple is intentional. The documentation does not
-depend on the runtime being runnable, Docker being available, or generated
-diagrams. A plain text-to-PDF path makes it cheap to update design
-explanations alongside code changes.
+The documentation build does not require a runnable Sitas binary, Docker, or
+generated diagrams.
 
 \section{Cleaning generated files}
 
@@ -42,53 +40,52 @@ directory into a Linux container and can request an \texttt{io\_uring}-capable
 configuration:
 
 \begin{lstlisting}[language=bash]
-SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test os::uring::tests -- --nocapture
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test -p sitas-core --features std uring -- --nocapture
 \end{lstlisting}
 
 When the host or container configuration cannot provide \texttt{io\_uring}, the
 Linux-only examples report that the backend is unavailable rather than faking a
 successful run.
 
-The Docker path exists because macOS is a good development environment for most
-of the code, while Linux is the only honest target for Linux-specific
-primitives like hard CPU affinity and \texttt{io\_uring}. The helper keeps that
-platform check repeatable without pretending the project is platform-neutral
-where it is not.
+The Docker path provides repeatable validation for hard CPU affinity,
+\texttt{epoll}, and \texttt{io\_uring}, which cannot be exercised honestly on
+macOS.
 
 \section{Continuous integration}
 
-The project includes a GitHub Actions workflow (\filepath{.github/workflows/ci.yml})
-that runs on every push and pull request:
+The repository contains a workflow definition at
+\filepath{,github/workflows/ci.yml}. GitHub only discovers workflows below
+\filepath{.github/workflows/}, so the definition is not active at its current
+path. Once moved to the standard directory, it is configured for pushes and
+pull requests to \texttt{main} and would run:
 
 \begin{itemize}
-    \item \texttt{rustfmt} and \texttt{clippy} checks on Ubuntu.
-    \item Full test suite (\texttt{cargo test --all-targets}) on both Ubuntu
-          and macOS.
-    \item Documentation build (\texttt{cargo doc --no-deps}) with
-          \texttt{\#![warn(missing\_docs)]} enforcement.
-    \item All example programs are compiled and run on Ubuntu.
+    \item \texttt{rustfmt}, warning-denied \texttt{clippy},
+          \texttt{cargo test}, and \texttt{cargo doc --no-deps} on Ubuntu and
+          macOS;
+    \item a fixed list of host examples on Ubuntu.
 \end{itemize}
 
-This provides cross-platform validation for the unsafe FFI and
-platform-gated features (epoll/kqueue/poll, CPU affinity, io\_uring).
+The definition does not build this PDF or run the bare-metal target check.
 
 
 \section{Documentation conventions}
 
-Every source file carries a \texttt{//!} module-level comment describing its
-purpose and the types it contains. The crate root declares
-\texttt{\#![warn(missing\_docs)]}, which makes undocumented public items
-compilation errors.
+The codebase uses module comments, public API documentation, and local safety
+comments extensively. These are conventions rather than a complete lint gate:
+the crate roots do not currently enable \texttt{missing\_docs}, so
+\texttt{cargo doc} checks that documentation builds but not that every public
+item is documented.
 
 \begin{itemize}
-    \item \textbf{Public API} (\texttt{///}): required on all \texttt{pub}
-          items. Enforced by the lint.
-    \item \textbf{Module docs} (\texttt{//!}): present on every \texttt{.rs}
-          file, both top-level public modules and internal sub-files.
-    \item \textbf{Unsafe blocks} (\texttt{// SAFETY:}): every unsafe block
-          has a preceding comment explaining why the operation is sound.
-    \item \textbf{FFI blocks}: all use \texttt{unsafe extern "C" \{ ... \}}
-          per Rust Edition 2024.
+    \item \textbf{Public API} (\texttt{///}): document contracts, ownership,
+          error behavior, and platform restrictions.
+    \item \textbf{Module docs} (\texttt{//!}): explain each module's role and
+          safety boundaries.
+    \item \textbf{Unsafe blocks} (\texttt{// SAFETY:}): precede each unsafe
+          operation with the invariant that makes it sound.
+    \item \textbf{FFI blocks}: use \texttt{unsafe extern "C" \{ ... \}} as
+          required by Rust Edition 2024.
     \item \textbf{Test names}: follow a descriptive
           \texttt{subject\_action\_expected\_outcome} convention.
 \end{itemize}
@@ -101,6 +98,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo doc --no-deps
+cargo check -p sitas-core -p sitas-charlotte --target aarch64-unknown-none
 \end{lstlisting}
 
 \section{Validation strategy}
@@ -122,8 +120,9 @@ For changes touching Linux-only code, use the Docker helper after local macOS
 validation:
 
 \begin{lstlisting}[language=bash,caption={Linux platform pass}]
-SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo test
-SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo clippy --all-targets -- -D warnings
+tools/linux-docker.sh
+SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh sh -c \
+  'cargo test -p sitas-core --features std uring && cargo run -p sitas --example os_uring'
 \end{lstlisting}
 
 The order matters. Focused tests make it easier to understand the failure.

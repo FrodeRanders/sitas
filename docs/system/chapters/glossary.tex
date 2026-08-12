@@ -1,12 +1,6 @@
 \chapter{Mechanism Glossary}
 \label{chap:glossary}
 
-\section{Why this chapter exists}
-
-The same words appear repeatedly in the runtime: task, shard, waker, readiness,
-completion, submitter, snapshot, and scheduling group. This chapter is a short
-field guide for those words.
-
 \section{Runtime terms}
 
 \begin{description}
@@ -17,6 +11,14 @@ field guide for those words.
     \item[Executor] A single-threaded async kernel. It owns tasks, timers,
         readiness registrations, optional \texttt{io\_uring} dispatcher state,
         and scheduler counters.
+
+    \item[Shard runtime] The portable \texttt{no\_std} contract for spawning
+        shard threads, creating typed channels, parking, and constructing a
+        reactor for each shard. Unix and CharlotteOS provide separate
+        implementations.
+
+    \item[Reactor backend] The portable interface through which a shard
+        executor waits for events and receives cross-thread wakes.
 
     \item[Task] The executor-owned wrapper around a pinned future. A task has
         an id, optional name, scheduling group id, lifecycle state, poll
@@ -32,9 +34,14 @@ field guide for those words.
     \item[Submitter] A sharded capability for explicit cross-shard async
         submission. It owns the ability to place work on shard executors.
 
-    \item[Shard mailbox] A bounded typed queue for transferring owned messages
-        to one shard-local receiver. \texttt{ShardMailboxSet<M>} is the
-        uniform form: one inbound mailbox per shard.
+    \item[Shard mailbox] A host-runtime bounded queue for transferring owned
+        messages to one shard-local receiver. \texttt{ShardMailboxSet<M>} is
+        the uniform form: one inbound mailbox per shard.
+
+    \item[Portable shard channel] The \texttt{ShardRuntime} channel used by
+        \texttt{no\_std} and foreign-runtime backends. Senders are cloneable,
+        sends are serialized before entering the single-producer ring, and the
+        receiver is single-consumer.
 
     \item[Work unit] A logical receiver role, such as an index assembler. A
         work unit has a name and an assigned shard. Multiple work units may be
@@ -48,10 +55,13 @@ field guide for those words.
         \texttt{UniformShardRouter} maps a key to \texttt{ShardId};
         \texttt{WorkUnitRouter<N>} maps a key to a logical work-unit name.
 
-    \item[Join handle] An awaitable handle for a spawned task result. It is
-        also the cancellation handle: aborting it requests that the task be
-        dropped if it has not completed. Dropping a join handle without
-        awaiting it automatically aborts the underlying task.
+    \item[Executor join handle] An awaitable handle for a spawned task result.
+        Aborting it requests task cancellation. Dropping it without awaiting
+        also aborts the underlying task.
+
+    \item[Shard thread join handle] A backend-provided blocking join for a
+        shard thread. The Unix backend uses a thread join. CharlotteOS waits on
+        a kernel exit-observer completion and returns the closure result.
 
     \item[Task scope] A structured owner for child tasks. It gives a group of
         children one cooperative stop source and one bounded shutdown path.
@@ -108,11 +118,9 @@ field guide for those words.
 \section{Observability terms}
 
 \begin{description}
-    \item[Running statistics] An online accumulator using Welford's algorithm
-        that computes count, mean, variance, standard deviation, coefficient
-        of variation, min, max, and total from streaming \texttt{f64} samples
-        without storing the values. Two accumulators can be merged. Duration
-        convenience methods accept \texttt{Duration} and \texttt{Instant} pairs.
+    \item[Running statistics] An online Welford accumulator for count, mean,
+        variance, standard deviation, coefficient of variation, min, max, and
+        total. Accumulators can be merged without retaining samples.
 
     \item[Snapshot] An owned point-in-time copy of runtime state. A snapshot is
         not live and does not keep the runtime alive.

@@ -3,14 +3,8 @@
 
 \section{Purpose}
 
-This chapter turns the manual into a workbook. Each lab has a command to run,
-something to observe, and a small modification to try. The goal is to connect
-visible behavior to the mechanisms described earlier.
-
-The labs are organized around ``why'' questions. Why does a timer need a waker?
-Why does readiness require retrying? Why does cross-shard submission return an
-owned result? Why does \texttt{io\_uring} need abandonment tracking? Running
-the examples first makes those design choices concrete.
+Each lab provides a command, observations, and a small modification. The aim is
+to connect visible behavior to the mechanisms described earlier.
 
 \begin{notabene}[Lab style]
 Run one lab at a time. After each command, inspect the example source and the
@@ -18,7 +12,9 @@ runtime module it exercises. The examples are small enough that modifying them
 is part of learning them.
 \end{notabene}
 
-\section{Lab 1: Timers and cooperative polling \hfill \textnormal{\textit{Beginner}}}
+\section{Lab 1: Timers and cooperative polling}
+
+\textit{Level: Beginner.}
 
 Run:
 
@@ -29,8 +25,9 @@ cargo run --example executor_race
 \end{lstlisting}
 
 Observe that the executor can drive futures that suspend and resume without
-using a third-party runtime. Then read \filepath{src/executor/future.rs} and
-\filepath{src/executor/timer.rs}.
+using a third-party runtime. Then read
+\filepath{crates/sitas-core/src/executor/future.rs} and
+\filepath{crates/sitas-core/src/executor/timer.rs}.
 
 Try this:
 
@@ -40,10 +37,12 @@ Try this:
     \item Print which task completes first.
 \end{enumerate}
 
-The lesson: timers do not run in their own thread. The executor records
+Timers do not run in their own thread. The executor records
 deadlines, waits until the next event, and wakes tasks whose deadlines expire.
 
-\section{Lab 2: Wake coalescing \hfill \textnormal{\textit{Beginner}}}
+\section{Lab 2: Wake coalescing}
+
+\textit{Level: Beginner.}
 
 Run the unit tests that mention repeated wakes:
 
@@ -51,8 +50,9 @@ Run the unit tests that mention repeated wakes:
 cargo test repeated_wakes_share_one_ready_queue_entry -- --nocapture
 \end{lstlisting}
 
-Then read the task queueing code in \filepath{src/executor/task.rs} and
-\filepath{src/executor/task\_set.rs}.
+Then read the task queueing code in
+\filepath{crates/sitas-core/src/executor/task.rs} and
+\filepath{crates/sitas-core/src/executor/task\_set.rs}.
 
 Try this:
 
@@ -64,10 +64,12 @@ Try this:
           entries for the same task.
 \end{enumerate}
 
-The lesson: a waker requests another poll; it does not flood the scheduler
+A waker requests another poll; it does not flood the scheduler
 with duplicate queue entries.
 
-\section{Lab 3: Readiness-driven TCP \hfill \textnormal{\textit{Intermediate}}}
+\section{Lab 3: Readiness-driven TCP}
+
+\textit{Level: Intermediate.}
 
 Run:
 
@@ -89,10 +91,12 @@ Try this:
           server task suspends between writes.
 \end{enumerate}
 
-The lesson: readiness is retry-oriented. A writable notification does not mean
+Readiness is retry-oriented. A writable notification does not mean
 every byte has been written; the helper retries until the operation completes.
 
-\section{Lab 4: Scheduling groups \hfill \textnormal{\textit{Intermediate}}}
+\section{Lab 4: Scheduling groups}
+
+\textit{Level: Intermediate.}
 
 Run:
 
@@ -116,10 +120,12 @@ Try this:
           \texttt{vruntime} columns.
 \end{enumerate}
 
-The lesson: scheduling groups are cooperative accounting classes, not
+Scheduling groups are cooperative accounting classes, not
 preemptive priorities. Long-running futures must yield.
 
-\section{Lab 5: Observability snapshots \hfill \textnormal{\textit{Beginner}}}
+\section{Lab 5: Observability snapshots}
+
+\textit{Level: Beginner.}
 
 Run:
 
@@ -139,10 +145,12 @@ Try this:
     \item Observe how task count, timer count, and state duration change.
 \end{enumerate}
 
-The lesson: snapshots are owned samples, not tracing events. To build a
+Snapshots are owned samples, not tracing events. To build a
 console-like view, sample repeatedly and compute differences.
 
-\section{Lab 6: Cross-shard submission \hfill \textnormal{\textit{Intermediate}}}
+\section{Lab 6: Cross-shard submission}
+
+\textit{Level: Intermediate.}
 
 Run:
 
@@ -164,10 +172,12 @@ Try this:
           caller's shard.
 \end{enumerate}
 
-The lesson: the remote future is polled remotely, and the result crosses back
+The remote future is polled remotely, and the result crosses back
 as an owned value.
 
-\section{Lab 7: Shard-local state \hfill \textnormal{\textit{Intermediate}}}
+\section{Lab 7: Shard-local state}
+
+\textit{Level: Intermediate.}
 
 Run:
 
@@ -188,10 +198,12 @@ Try this:
     \item Return an owned summary instead of a reference.
 \end{enumerate}
 
-The lesson: shard-local access is synchronous. To await, first produce an
+Shard-local access is synchronous. To await, first produce an
 owned value and await outside the local-state closure.
 
-\section{Lab 8: CPU placement \hfill \textnormal{\textit{Intermediate}}}
+\section{Lab 8: CPU placement}
+
+\textit{Level: Intermediate.}
 
 Run:
 
@@ -216,10 +228,12 @@ Try this:
     \item Inspect the shard snapshots printed by the example.
 \end{enumerate}
 
-The lesson: CPU placement is an explicit request to the OS. It is not a load
+CPU placement is an explicit request to the OS. It is not a load
 balancer.
 
-\section{Lab 9: Linux \texttt{io\_uring} \hfill \textnormal{\textit{Advanced}}}
+\section{Lab 9: Linux \texttt{io\_uring}}
+
+\textit{Level: Advanced.}
 
 This lab requires a Linux host or container where \texttt{io\_uring} setup is
 allowed.
@@ -243,11 +257,13 @@ Try this:
     \item Watch how abandonment and deferred buffer counters change.
 \end{enumerate}
 
-The lesson: completion-based I/O has a different cancellation problem than
+Completion-based I/O has a different cancellation problem than
 readiness-based I/O. The kernel may still own an operation after the future is
 gone.
 
-\section{Lab 10: Sharded index build \hfill \textnormal{\textit{Advanced}}}
+\section{Lab 10: Sharded index build}
+
+\textit{Level: Advanced.}
 
 Run:
 
@@ -284,7 +300,7 @@ Try this:
     \item Compare per-shard partition summaries and final verification output.
 \end{enumerate}
 
-The lesson: the runtime's value appears when a problem splits into owned
+The runtime is most useful when a problem splits into owned
 shard-local work combined through explicit owned results or messages.
 
 \section{After the labs}

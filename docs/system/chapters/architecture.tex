@@ -3,7 +3,7 @@
 
 \section{Invariants}
 
-The project is guided by a small set of invariants:
+The project follows these invariants:
 
 \begin{enumerate}
     \item Each piece of application service state is owned by one shard.
@@ -22,27 +22,50 @@ The project is guided by a small set of invariants:
     \item Unsafe code is isolated behind small safe APIs.
 \end{enumerate}
 
+\section{Workspace layout}
+
+The repository contains four crates:
+
+\begin{description}
+    \item[\texttt{sitas-core}] The runtime kernel. Its default build uses
+        \texttt{no\_std + alloc} and exposes the portable
+        \texttt{ShardRuntime}, reactor, executor, channel, and minimal service
+        contracts. Enabling \texttt{std} adds the host runtime, networking,
+        observability, and Linux \texttt{io\_uring} modules.
+    \item[\texttt{sitas}] The host facade. It enables the \texttt{std} lane,
+        re-exports the public API, and owns the examples and integration tests.
+    \item[\texttt{sitas-unix}] The Unix implementation of
+        \texttt{ShardRuntime}, using threads, a condition-variable parker, and
+        the host reactor. It exercises the portable runtime contract on Linux
+        and macOS.
+    \item[\texttt{sitas-charlotte}] The CharlotteOS backend. It implements the
+        same contract with kernel thread and completion-queue syscalls for the
+        bare-metal AArch64 target.
+\end{description}
+
+The shared contract lives in \filepath{crates/sitas-core/src}. Host examples
+live in \filepath{crates/sitas/examples}. Keeping these paths explicit avoids
+confusing the portable lane with features available only under \texttt{std}.
+
 \section{The shared-nothing rule}
 
-The central design rule: application state has one owner. In the
+The central design rule is that application state has one owner. In the
 standard-library services that owner is a shard thread receiving typed
 commands. In the async runtime it is an executor shard polling futures.
 
-This is why the project avoids \texttt{Arc<Mutex<Service\textgreater{}\textgreater{}}.
-A mutex makes mutation mechanically safe but hides the question the project
-studies: which shard owns this state, where does work run, and when does the
-ownership boundary get crossed?
+The project therefore avoids
+\texttt{Arc<Mutex<Service\textgreater{}\textgreater{}} as its application
+model. A mutex serializes mutation but does not identify the responsible shard
+or the point where ownership crosses a boundary.
 
 Shared-nothing does not mean synchronization-free. While wakers, reply state,
-lifecycle flags, counters, and submission queues use synchronization, application 
+lifecycle flags, counters, and submission queues use synchronization, application
 service state does not. It stays local to its shard.
 
 \begin{notabene}[Why avoid a service mutex?]
-A service mutex answers only one question: can two threads mutate this value at
-the same time? The runtime is asking a stronger question: which shard is
-responsible for this value, which work is allowed to touch it, and how does
-another shard request a change? Keeping service state shard-owned preserves
-that answer in the program structure.
+A service mutex prevents concurrent mutation. Shard ownership additionally
+states which execution context may mutate the value and how other shards
+request a change.
 \end{notabene}
 
 \begin{center}
@@ -64,9 +87,9 @@ that answer in the program structure.
 
 \section{Boundaries and lifetimes}
 
-Most runtime bugs are boundary bugs: a value crosses to another thread without being owned,
-a reference to local state escapes a closure, a future keeps a borrowed value across \texttt{.await}, or a completion
-operation drops a buffer before the kernel has finished with it.
+Many runtime bugs occur at boundaries: a transferred value is not owned, a
+local reference escapes, a future retains a borrow across \texttt{.await}, or
+a completion buffer is freed before the kernel is finished with it.
 
 \texttt{sitas} tries to make those boundaries visible:
 
@@ -91,14 +114,12 @@ the runtime. The project treats observation as a copy boundary. A snapshot is a
 point-in-time value that can be sorted, printed, diffed, or sent to another
 thread without keeping the executor borrowed.
 
-This matters because long-running work needs inspection while it is still
-changing. Owned snapshots let monitoring code be ordinary application code.
-They also prevent a debugging tool from accidentally extending the lifetime of
-task, timer, or shard-local internals.
+Owned snapshots let monitoring code retain and compare observations without
+extending the lifetime of task, timer, or shard-local internals.
 
 \section{Layered model}
 
-The current runtime can be read as a layered system:
+The runtime can be read as a layered system:
 
 \begin{center}
 \begin{tikzpicture}[
@@ -129,13 +150,21 @@ The current runtime can be read as a layered system:
 \end{tikzpicture}
 \end{center}
 
-The standard-library baseline exercises the upper part of the model. The
-custom executor and OS runtime layers fill in the lower layers while preserving
-the same shared-nothing service direction.
+The standard-library services, host executor, and portable
+\texttt{ShardRuntime} lane use different subsets of these layers while sharing
+the same ownership rules.
 
 \section{Primary modules}
 
 \begin{description}
+    \item[\texttt{shard\_runtime}] The portable contract for shard thread
+        creation, typed channels, parking, and per-shard reactors.
+        \texttt{ShardSender} is cloneable and the receiver is single-consumer.
+        Because the backing ring is single-producer, a small lock serializes
+        concurrent senders before they push.
+    \item[\texttt{shard\_executor}] The portable single-threaded executor used
+        with a \texttt{ReactorBackend}, including the minimal
+        \texttt{no\_std} service path.
     \item[\texttt{runtime}] The reusable standard-library kernel for bounded
         shard mailboxes, reply handles, shard startup, and shutdown.
     \item[\texttt{kv}] The reference sharded key-value service.
@@ -153,17 +182,14 @@ the same shared-nothing service direction.
         with \texttt{collect()} and \texttt{fold()} convenience methods.
         Senders use an atomic refcount so intermediate clone drops do not
         prematurely close the stream.
-    \item[\texttt{async\_service}] Async wrappers bridging std-layer services
-        (\texttt{ShardedKv}, \texttt{ShardedCounter}) into the executor via
-        \texttt{submit\_* + reply.wait\_async().await}.
+    \item[\texttt{async\_service}] Adapters that await standard-library
+        service replies from executor tasks.
     \item[\texttt{os}] Unix FFI, wake pipes, readiness backends, affinity, and
-        Linux \texttt{io\_uring} experiments. Readiness backends now cover
+        Linux \texttt{io\_uring}. Readiness backends cover
         \texttt{epoll} (Linux), \texttt{kqueue} (macOS/iOS/FreeBSD/NetBSD/
         OpenBSD), and \texttt{poll} (other Unix).
-    \item[\texttt{executor}] The single-threaded async kernel. Sub-modules
-        include \texttt{tcp}, \texttt{udp}, \texttt{backpressure}, and
-        Linux \texttt{io\_uring} dispatch. \texttt{Spawner::with\_backpressure}
-        integrates a counting semaphore into the spawn path.
+    \item[\texttt{executor}] The host single-threaded async kernel, including
+        TCP, UDP, spawn backpressure, and Linux \texttt{io\_uring} dispatch.
     \item[\texttt{sharded\_executor}] One executor per shard thread, plus
         submission and observation APIs.
     \item[\texttt{shard\_local}] One owned value per executor shard with
@@ -184,6 +210,22 @@ the same shared-nothing service direction.
         owned \texttt{MetricsSnapshot} for observability.
 \end{description}
 
+\section{Portable channel and join safety}
+
+The portable channel is multi-producer and single-consumer. Cloning a sender
+does not clone the application value or receiver. Concurrent producers are
+serialized around the single-producer ring's push operation; the receiver can
+therefore pop without a second queue lock. This synchronization belongs to the
+transport boundary, not application service state.
+
+CharlotteOS shard joins use a kernel completion capability registered against
+the spawned thread. Each staged closure is keyed by the kernel thread id, so a
+thread cannot execute another spawn's closure when scheduling order differs
+from creation order. The closure stores its result before exiting; the kernel
+then reaps the thread and completes the observer. A join waits for that
+completion before taking the result. Generic backends that do not provide a
+join still use the explicit always-error \texttt{RawJoinHandle} placeholder.
+
 \section{How to trace a feature through the layers}
 
 When learning or extending the runtime, trace one feature down the stack. For
@@ -200,6 +242,5 @@ example, a named task in a scheduling group passes through several layers:
     \item a snapshot later resolves the group id back to an owned group name.
 \end{enumerate}
 
-This kind of trace is more useful than reading modules in isolation. It shows
-which layer owns validation, scheduling, and observability, and where the
-public API remains safe.
+This trace identifies which layer owns validation, scheduling, and
+observability, and where the public API crosses a safety boundary.

@@ -91,25 +91,17 @@ generic accept loop.
 
 \section{\texttt{io\_uring}}
 
-The Linux \texttt{io\_uring} backend is experimental. It currently supports a
-narrow executor integration for owned-buffer \texttt{read\_at},
+The Linux \texttt{io\_uring} backend is supported but deliberately narrow. It
+integrates owned-buffer \texttt{read\_at},
 \texttt{read\_exact\_at}, and \texttt{write\_at} style file I/O.
 
-\texttt{io\_uring} is included because it exercises a harder runtime problem
-than readiness. The kernel can own an operation after the Rust future that
-submitted it has been dropped. That forces the runtime to model operation ids,
-owned buffers, late completions, and abandonment---exactly the internals this
-project wants to make visible.
+Unlike readiness, completion I/O can outlive the Rust future that submitted
+it. The runtime must therefore track operation ids, owned buffers, late
+completions, and abandonment.
 
-Host policy is part of the model. Many Linux deployments, especially
-containers and hardened hosts, restrict or disable \texttt{io\_uring} because
-it exposes a broad kernel/user boundary. Newer kernels are adding more
-fine-grained restriction mechanisms, including cBPF-style filtering of allowed
-\texttt{io\_uring} operations, so a host may allow a small opcode set rather
-than enabling every operation. This runtime does not install or manage such
-policy. It keeps the operations narrow and reports setup or submission failure
-as unavailable or as an ordinary I/O error, depending on where the host
-rejects the request.
+Linux hosts and containers may restrict or disable \texttt{io\_uring}. Sitas
+does not manage host policy. Setup rejection is reported as unavailable;
+submission rejection is returned as an I/O error.
 
 Each Linux executor run loop installs a thread-local dispatcher when the host
 allows ring setup. Executor-backed \texttt{io\_uring} futures store operation
@@ -164,43 +156,28 @@ future next poll
 
 If the future is dropped before completion, the operation may still be in the
 kernel. The dispatcher marks it abandoned and defers buffer cleanup until a
-completion or safe discard point. This is one of the most important differences
-between readiness and completion: cancellation involves kernel-owned in-flight
-work, not just waker removal.
+completion or safe discard point. Cancellation therefore includes
+kernel-owned in-flight work, not only waker removal.
 
-The dispatcher is a lifecycle object, not just a syscall wrapper. A thin
-wrapper around \texttt{io\_uring\_enter} would not suffice for async Rust
-integration. The runtime needs somewhere to hold buffers, match completions to
-futures, wake tasks, and account for futures that vanished before the kernel
-answered.
+The dispatcher holds buffers, matches completions to futures, wakes tasks, and
+accounts for futures dropped before the kernel replied.
 
-\section{Current limitation}
+\section{Current limitations}
 
-Timers, readiness waits, and \texttt{io\_uring} completions now share one
-executor idle wait shape on Linux. This is still a staged integration rather
-than a production event loop. 
+Timers, readiness waits, and ring completions share one Linux executor idle
+wait shape, but they are not exposed as one portable event source. Completion
+dispatch uses a fixed per-tick budget. Executor snapshots expose the lifecycle
+state, dispatch counts, budget exhaustion, and the final shutdown-drain result.
 
-Completion dispatch has a fixed internal per-tick budget that is exposed in 
-executor snapshots. Those snapshots also count non-empty completion dispatch 
-batches, dispatched completions, and completion budget exhaustion events. 
+Setting \texttt{SITAS\_REQUIRE\_IO\_URING=1} converts an unavailable backend
+into an executor setup error. During teardown, the dispatcher makes a bounded
+attempt to drain abandoned work when no live task wakers remain. If
+\texttt{run\_until} returns while spawned ring work is pending, the dispatcher
+stays installed on that executor thread so a later run can continue it.
 
-They also expose an executor-owned \texttt{io\_uring} lifecycle status, so 
-callers can distinguish not-started, unavailable, installed, and shutdown states. 
-
-Strict availability requests via \texttt{SITAS\_REQUIRE\_IO\_URING=1} fail executor 
-setup instead of silently falling back to unavailable. 
-
-Executor teardown makes a bounded attempt to drain abandoned completion work 
-before discarding the thread-local dispatcher when no live task wakers remain 
-registered. The final dispatcher snapshot records whether that drain completed, t
-imed out, or was skipped because live wakers remained. 
-
-When a root \texttt{run\_until} future completes with spawned \texttt{io\_uring} work 
-still pending, the dispatcher remains installed for that executor on the current thread 
-so later executor calls can continue the same operations. 
-
-The runtime still does not expose a portable completion source, tunable completion 
-policy, or a deeper shutdown policy for mixed readiness and completion workloads.
+The runtime does not yet provide a portable completion source, caller-tunable
+completion policy, or a production shutdown policy for mixed readiness and
+completion workloads.
 
 \section{Running statistics}
 
@@ -226,20 +203,15 @@ stats.cv()            // Option<f64>,  coefficient of variation in %
 stats.total()         // u64 integral total
 \end{lstlisting}
 
-Duration convenience methods (\texttt{mean\_duration()},
-\texttt{min\_duration()}, \texttt{max\_duration()},
-\texttt{std\_dev\_duration()}) return \texttt{Option<Duration>}
-instead of raw seconds.
+Duration-valued accessors are available for the mean, minimum, maximum, and
+standard deviation; they return \texttt{Option<Duration>} instead of seconds.
 
-The \texttt{merge} method uses Chan et al.'s parallel algorithm so partial
-accumulators from different threads or shards can be combined without
-reprocessing the original samples. This is useful when each shard collects
-statistics independently and the caller wants aggregate numbers.
+The \texttt{merge} method combines per-shard accumulators with Chan et al.'s
+parallel algorithm without revisiting the original samples.
 
 The display format prints count, mean, standard deviation, CV, min, max, and
 total in a single human-readable line, which is how the index build examples
 report per-shard timing statistics.
 
-CV is unit-free. It expresses dispersion relative to the mean, making it useful
-for comparing the stability of metrics with different scales (e.g.\ partition
-scan times versus merge round times).
+CV is unit-free, so it can compare dispersion across differently scaled
+measurements.

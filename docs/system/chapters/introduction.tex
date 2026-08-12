@@ -4,17 +4,15 @@
 \section{Purpose}
 
 \texttt{sitas} is an experimental Rust runtime and service model inspired by
-Seastar's shard-per-core architecture. The project is about understanding the 
-runtime internals: how work is owned by shards, how cross-shard messages 
-move, how a small executor drives futures, and how OS completion and 
-readiness mechanisms can be exposed without depending on a third-party 
-async runtime.
+Seastar's shard-per-core architecture. It explores shard ownership, explicit
+cross-shard transfer, custom future execution, and operating-system I/O without
+depending on a third-party async runtime.
 
-The code base started with a standard-library-only sharded key-value store. The
-current branch extends that baseline with a custom executor, Unix readiness
-primitives, TCP helpers, sharded async execution, shard-local values,
-observability snapshots, CPU placement, and experimental Linux \texttt{io\_uring}
-support.
+The project started as a standard-library-only sharded key-value store. It is
+now a four-crate workspace with a \texttt{no\_std + alloc} runtime contract,
+host and CharlotteOS backends, a custom executor, Unix readiness, TCP and UDP
+helpers, shard-local values, observability, CPU and memory placement, and Linux
+\texttt{io\_uring} support.
 
 \section{Prerequisites}
 
@@ -29,8 +27,8 @@ This manual assumes familiarity with:
 
 \section{How to read this project}
 
-Application code sees typed, owned boundaries. A caller asks a shard to do 
-work. The owning shard mutates its local state and returns an owned reply. The 
+Application code sees typed, owned boundaries. A caller asks a shard to do
+work. The owning shard mutates its local state and returns an owned reply. The
 implementation avoids hiding service state behind a global mutex.
 
 The runtime keeps that model honest:
@@ -44,24 +42,21 @@ The runtime keeps that model honest:
     \item observability returns copies, not borrowed internals.
 \end{enumerate}
 
-This manual follows that path. \autoref{chap:architecture} explains the
-ownership rules. \autoref{chap:executor} explains how futures become runnable
-work. \autoref{chap:sharding} explains how one executor becomes many
-independent shards. \autoref{chap:io-runtime} explains why readiness and
-completion are different mechanisms and how both appear in the runtime.
+The following chapters move from ownership rules to task execution, sharding,
+and I/O. Later chapters provide examples, source-reading paths, labs, and
+validation commands.
 
 \begin{notabene}[Learning goal]
-If you can explain where a future is polled, who owns the state it mutates,
-what wakes it, and what happens when it is dropped, you understand the most
-important parts of this code base.
+You understand the core design when you can explain where a future is polled,
+who owns the state it mutates, what wakes it, and what happens when it is
+dropped.
 \end{notabene}
 
 \section{Why the project has this shape}
 
-The runtime is built from small visible pieces. A mature runtime hides task
-allocation, reactor registration, cross-thread wakeups, cancellation, and
-kernel ownership behind polished APIs. That works in production but obscures
-the machinery.
+The runtime keeps task allocation, reactor registration, cross-thread wakeups,
+cancellation, and kernel ownership visible. This makes the implementation less
+polished than a general-purpose runtime, but easier to inspect.
 
 \texttt{sitas} therefore accepts some explicitness that a general-purpose
 runtime might smooth over:
@@ -78,14 +73,12 @@ runtime might smooth over:
         different contracts with the operating system.
 \end{description}
 
-This is the main design tradeoff. The project prefers APIs that teach the 
-boundary they cross over APIs that hide it.
+The project therefore prefers explicit boundary-crossing APIs.
 
 \section{Scope of this manual}
 
-This manual is a LaTeX companion to the Markdown architecture notes. It is
-intended for longer-form system documentation and for keeping a printable view
-of the evolving runtime design.
+This manual is the printable, long-form companion to the Markdown architecture
+notes.
 
 It focuses on:
 
@@ -99,15 +92,13 @@ It focuses on:
 \end{itemize}
 
 \begin{notabene}
-The project is still deliberately experimental. APIs are allowed to move when
-that exposes cleaner runtime internals or a better teaching experience.
+The API is experimental and may change as the runtime contracts become clearer.
 \end{notabene}
 
 \section{What this project is not}
 
-\texttt{sitas} is not trying to become a production replacement for mature
-Rust runtimes. It is also not trying to copy Seastar. The point is to keep 
-the mechanisms small enough that they can be inspected:
+\texttt{sitas} is neither a production replacement for mature Rust runtimes
+nor a line-by-line Seastar port. Its mechanisms remain small enough to inspect:
 
 \begin{itemize}
     \item no Tokio, async-std, Glommio, Monoio, or actor framework is used as
@@ -118,10 +109,8 @@ the mechanisms small enough that they can be inspected:
     \item mechanisms are introduced only after their semantics can be tested.
 \end{itemize}
 
-This makes the project useful as a learning resource. It has enough machinery
-to demonstrate timers, wakers, readiness, \texttt{io\_uring}, shard-local
-values, scheduling groups, and CPU placement while keeping those mechanisms
-visible in ordinary Rust modules.
+The resulting code demonstrates timers, wakers, readiness, \texttt{io\_uring},
+shard-local values, scheduling groups, and placement in ordinary Rust modules.
 
 \section{Further reading}
 
@@ -131,7 +120,7 @@ visible in ordinary Rust modules.
         \url{https://seastar.io}
     \item[ScyllaDB shard-per-core architecture] Practical discussion of
         shared-nothing database design on top of Seastar.\\
-        \url{https://www.scylladb.com/product/technology/shard-per-core-architecture/}
+        \href{https://www.scylladb.com/product/technology/shard-per-core-architecture/}{ScyllaDB technology overview}
     \item[Glommio] A Rust thread-per-core runtime using \texttt{io\_uring},
         useful for comparing design choices.\\
         \url{https://github.com/DataDog/glommio}

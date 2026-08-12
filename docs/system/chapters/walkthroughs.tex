@@ -3,8 +3,8 @@
 
 \section{Purpose}
 
-This chapter gives concrete source-reading paths. Each walkthrough starts from
-a visible API or example and follows the mechanism through the runtime.
+Each walkthrough starts from a public API or example and follows it through the
+runtime.
 
 \begin{notabene}[How to use these walkthroughs]
 Keep the source tree open while reading. Read the public function first, then
@@ -16,13 +16,13 @@ follow the listed modules in order.
 Start with the smallest async unit: a task spawned onto one executor.
 
 \begin{lstlisting}[language={},caption={Task spawn reading path}]
-examples/executor_sleep.rs
-src/executor.rs
-src/executor/spawner.rs
-src/executor/task.rs
-src/executor/task_state.rs
-src/executor/scheduler.rs
-src/executor/task_set.rs
+crates/sitas/examples/executor_sleep.rs
+crates/sitas-core/src/executor.rs
+crates/sitas-core/src/executor/spawner.rs
+crates/sitas-core/src/executor/task.rs
+crates/sitas-core/src/executor/task_state.rs
+crates/sitas-core/src/executor/scheduler.rs
+crates/sitas-core/src/executor/task_set.rs
 \end{lstlisting}
 
 The public API is \texttt{executor\_and\_spawner}. It returns one executor
@@ -49,10 +49,10 @@ The timer path starts with examples such as \filepath{executor_sleep.rs} and
 \filepath{executor_timeout.rs}. Then read:
 
 \begin{lstlisting}[language={},caption={Timer reading path}]
-src/executor/future.rs
-src/executor/timer.rs
-src/executor/scheduler.rs
-src/executor/driver.rs
+crates/sitas-core/src/executor/future.rs
+crates/sitas-core/src/executor/timer.rs
+crates/sitas-core/src/executor/scheduler.rs
+crates/sitas-core/src/executor/driver.rs
 \end{lstlisting}
 
 \texttt{sleep} creates a future that registers a deadline. When polled before
@@ -70,12 +70,12 @@ future must clean itself up.
 Start from the server helpers rather than the raw reactor:
 
 \begin{lstlisting}[language={},caption={TCP readiness reading path}]
-examples/async_tcp_server.rs
-examples/async_tcp_scoped_server.rs
-src/executor/tcp.rs
-src/executor/unix_io.rs
-src/executor/io_interest.rs
-src/os/reactor.rs
+crates/sitas/examples/async_tcp_server.rs
+crates/sitas/examples/async_tcp_scoped_server.rs
+crates/sitas-core/src/executor/tcp.rs
+crates/sitas-core/src/executor/unix_io.rs
+crates/sitas-core/src/executor/io_interest.rs
+crates/sitas-core/src/os.rs
 \end{lstlisting}
 
 The TCP helper shows the application shape: accept, spawn a handler, wait for
@@ -83,7 +83,7 @@ handlers, propagate errors. The lower layers show the runtime shape: try a
 non-blocking operation, register interest on \texttt{WouldBlock}, sleep in the
 OS reactor, wake the task on readiness.
 
-When reading \filepath{src/executor/tcp.rs}, notice that the accept loop and
+When reading \filepath{crates/sitas-core/src/executor/tcp.rs}, notice that the accept loop and
 handler tasks are distinct. Grouped TCP helpers use this: the accept loop stays
 in the caller's task while accepted handler tasks are spawned into a scheduling
 group.
@@ -101,11 +101,11 @@ cargo run --example sharded_scheduling_groups
 Then read:
 
 \begin{lstlisting}[language={},caption={Scheduling group reading path}]
-src/executor/scheduling_group.rs
-src/executor/spawner.rs
-src/executor/task_set.rs
-src/executor/snapshot.rs
-src/sharded_executor.rs
+crates/sitas-core/src/executor/scheduling_group.rs
+crates/sitas-core/src/executor/spawner.rs
+crates/sitas-core/src/executor/task_set.rs
+crates/sitas-core/src/executor/snapshot.rs
+crates/sitas-core/src/sharded_executor.rs
 \end{lstlisting}
 
 \texttt{scheduling\_group.rs} defines the public handle and its executor
@@ -124,11 +124,11 @@ look similar.
 Start with:
 
 \begin{lstlisting}[language={},caption={Cross-shard reading path}]
-examples/sharded_submit.rs
-examples/sharded_map_reduce.rs
-src/sharded_executor.rs
-src/sharded_executor/join.rs
-src/executor/spawner.rs
+crates/sitas/examples/sharded_submit.rs
+crates/sitas/examples/sharded_map_reduce.rs
+crates/sitas-core/src/sharded_executor.rs
+crates/sitas-core/src/sharded_executor/join.rs
+crates/sitas-core/src/executor/spawner.rs
 \end{lstlisting}
 
 A cross-shard submit is not a function call into borrowed remote state. It is
@@ -141,12 +141,12 @@ boundaries that mark where work can cross threads.
 
 \section{Walkthrough: shard-local state}
 
-Read \filepath{examples/shard_local.rs} first, then:
+Read \filepath{crates/sitas/examples/shard_local.rs} first, then:
 
 \begin{lstlisting}[language={},caption={Shard-local reading path}]
-src/shard_local.rs
-src/sharded_executor.rs
-src/runtime.rs
+crates/sitas-core/src/shard_local.rs
+crates/sitas-core/src/sharded_executor.rs
+crates/sitas-core/src/runtime.rs
 \end{lstlisting}
 
 \texttt{ShardLocal<T>} is the clearest example of the shared-nothing idea in
@@ -169,10 +169,10 @@ SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh cargo run --example os_uring_aband
 Then read:
 
 \begin{lstlisting}[language={},caption={io\_uring reading path}]
-src/os/uring.rs
-src/executor/uring.rs
-src/executor/driver.rs
-src/executor/tests.rs
+crates/sitas-core/src/os/uring.rs
+crates/sitas-core/src/executor/uring.rs
+crates/sitas-core/src/executor/driver.rs
+crates/sitas-core/src/executor/tests.rs
 \end{lstlisting}
 
 The key distinction is ownership. A readiness future borrows a descriptor and
@@ -221,10 +221,10 @@ cargo run --example sharded_index_build -- --records 512 --shards 4 --seed 0xbee
 Then read:
 
 \begin{lstlisting}[language={},caption={Index build reading path}]
-examples/sharded_index_build.rs
-src/shard_local.rs
-src/sharded_executor.rs
-src/running_stats.rs
+crates/sitas/examples/sharded_index_build.rs
+crates/sitas-core/src/shard_local.rs
+crates/sitas-core/src/sharded_executor.rs
+crates/sitas-core/src/running_stats.rs
 \end{lstlisting}
 
 The example demonstrates several runtime mechanisms working together:
@@ -256,7 +256,8 @@ The runtime question is \emph{where} work runs. Partition tasks run on assigned 
 shard and collects owned results. At no point does a shard borrow another
 shard's progress counter.
 
-The \texttt{io\_uring} variant (\filepath{examples/sharded\_index\_build\_uring.rs})
+The \texttt{io\_uring} variant
+(\filepath{crates/sitas/examples/sharded\_index\_build\_uring.rs})
 replaces partition reads, run writes, and merge run I/O with
 \texttt{read\_exact\_at\_uring} and \texttt{write\_all\_at\_uring} futures.
 It keeps the same \texttt{ShardLocal}, \texttt{map\_all}, and
@@ -273,10 +274,10 @@ cargo run --example sharded_index_mailbox -- --records 512 --shards 4 --seed 0xb
 Read:
 
 \begin{lstlisting}[language={},caption={Mailbox index reading path}]
-examples/sharded_index_mailbox.rs
-src/shard_mailbox.rs
-src/placement.rs
-src/sharded_executor.rs
+crates/sitas/examples/sharded_index_mailbox.rs
+crates/sitas-core/src/shard_mailbox.rs
+crates/sitas-core/src/placement.rs
+crates/sitas-core/src/sharded_executor.rs
 \end{lstlisting}
 
 This variant keeps scan work sharded, but replaces intermediate file-mediated
@@ -300,10 +301,34 @@ to \texttt{main} through task handles, not through another mailbox, and their
 sorted data reaches coordination as run files consumed by the final k-way
 merge.
 
-While reading \filepath{src/shard\_mailbox.rs}, distinguish the transport from
+While reading \filepath{crates/sitas-core/src/shard\_mailbox.rs}, distinguish the transport from
 the ownership model. The mailbox queue uses synchronization internally, but
 the message is an owned value and the receiver task is still the only code that
 mutates the work unit's local assembly state.
+
+\section{Walkthrough: portable runtime backends}
+
+The workspace's portable lane is easiest to read from the contract outward:
+
+\begin{lstlisting}[language={},caption={Portable runtime reading path}]
+crates/sitas-core/src/shard_runtime.rs
+crates/sitas-core/src/shard_executor.rs
+crates/sitas-core/src/mailbox_index.rs
+crates/sitas-unix/src/lib.rs
+crates/sitas-charlotte/src/lib.rs
+\end{lstlisting}
+
+\texttt{shard\_runtime.rs} defines the operations each backend must provide.
+The typed channel is multi-producer and single-consumer: cloneable senders are
+serialized before pushing into the ring. \texttt{sitas-unix} implements the
+contract with host threads and a condition variable.
+
+In \texttt{sitas-charlotte}, follow a shard from spawn to join. The backend
+stages each closure under the kernel thread id returned by spawn. The new
+thread retrieves only the closure associated with its own id, writes the
+result, exits, and fires the registered exit-observer completion. The join
+waits for that completion before taking the result. This identity link prevents
+scheduling order from pairing a join handle with another shard's closure.
 
 \section{Debugging checklist}
 \label{sec:debugging-checklist}
