@@ -76,7 +76,9 @@ fn shard_cq_layout() -> (usize, usize) {
 /// order threads happen to be scheduled in. (A plain pop would race: two
 /// shards can be scheduled in either order, and the handle created for spawn
 /// N must observe the value computed by exactly that spawn.)
-static SHARD_ENTRIES: Mutex<Vec<(u64, Box<dyn FnOnce() + Send>)>> = Mutex::new(Vec::new());
+type ShardEntry = (u64, Box<dyn FnOnce() + Send>);
+
+static SHARD_ENTRIES: Mutex<Vec<ShardEntry>> = Mutex::new(Vec::new());
 
 // ---- syscall wrappers -------------------------------------------------------
 
@@ -472,10 +474,13 @@ impl ShardRuntime for CharlotteReactor {
         let result_for_thread = alloc::sync::Arc::clone(&result);
         let entry_vaddr = shard_entry_trampoline as *const () as usize;
         let tid = unsafe { sys_spawn(entry_vaddr as u64, shard_id.0 as u64) };
-        SHARD_ENTRIES.lock().push((tid, Box::new(move || {
-            let value = entry();
-            *result_for_thread.lock() = Some(value);
-        })));
+        SHARD_ENTRIES.lock().push((
+            tid,
+            Box::new(move || {
+                let value = entry();
+                *result_for_thread.lock() = Some(value);
+            }),
+        ));
         // Observe the spawned thread's exit; the returned capability
         // completes when the kernel reaps the thread.
         let cap = unsafe { sys_observe_exit(tid) };

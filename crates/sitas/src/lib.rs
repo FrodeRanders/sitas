@@ -35,7 +35,7 @@
 //!
 //! The host Unix backend is re-exported as [`UnixRuntime`]: the same
 //! `sitas-core` service code runs on Linux and macOS through it, and on
-//! CharlotteOS through the [`sitas-charlotte`] kernel-syscall backend.
+//! CharlotteOS through the `sitas-charlotte` kernel-syscall backend.
 
 pub use sitas_core::*;
 
