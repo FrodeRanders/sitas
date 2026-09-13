@@ -85,6 +85,7 @@ static SHARD_ENTRIES: Mutex<Vec<ShardEntry>> = Mutex::new(Vec::new());
 /// Invoke a syscall with the given SVC immediate and arguments.
 #[inline(always)]
 unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
+    #[cfg(target_arch = "aarch64")]
     macro_rules! svc {
         ($number:literal) => {{
             let ret: u64;
@@ -102,11 +103,32 @@ unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         }};
     }
 
+    #[cfg(target_arch = "x86_64")]
+    macro_rules! svc {
+        ($number:literal) => {{
+            let ret: u64;
+            unsafe {
+                core::arch::asm!(
+                    "syscall",
+                    inlateout("rax") ($number as u64) => ret,
+                    in("rdi") arg1,
+                    in("rsi") arg2,
+                    in("rdx") arg3,
+                    lateout("rcx") _,
+                    lateout("r11") _,
+                    options(preserves_flags),
+                );
+            }
+            ret
+        }};
+    }
+
     match imm {
         SYSCALL_COMPLETION_SUBMIT => svc!(1),
         SYSCALL_COMPLETION_WAIT => svc!(4),
         SYSCALL_COMPLETION_CLOSE => svc!(6),
         SYSCALL_SPAWN_THREAD => svc!(7),
+        SYSCALL_THREAD_EXIT => svc!(8),
         SYSCALL_CQ_WAIT => svc!(12),
         SYSCALL_CQ_WAKE => svc!(41),
         SYSCALL_OBSERVE_THREAD_EXIT => svc!(61),
@@ -128,10 +150,8 @@ unsafe fn sys_spawn(entry_vaddr: u64, target_lp: u64) -> u64 {
 /// observer registered against it. Never returns.
 #[inline(always)]
 unsafe fn sys_thread_exit() -> ! {
-    let _ = SYSCALL_THREAD_EXIT;
-    unsafe {
-        core::arch::asm!("svc #8", options(noreturn));
-    }
+    let _ = unsafe { syscall(SYSCALL_THREAD_EXIT, 0, 0, 0) };
+    unsafe { core::hint::unreachable_unchecked() }
 }
 
 /// Syscall: report the calling thread's kernel thread id.
@@ -167,12 +187,24 @@ unsafe fn sys_poll(cap: u64) -> (u64, u64) {
     let _ = SYSCALL_COMPLETION_POLL;
     let state: u64;
     let result: u64;
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!(
             "svc #3",
             lateout("x0") state,
             inlateout("x1") cap => result,
             options(nostack, nomem, preserves_flags),
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") (SYSCALL_COMPLETION_POLL as u64) => state,
+            inlateout("rdi") cap => result,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(preserves_flags),
         );
     }
     (state, result)
@@ -198,6 +230,7 @@ unsafe fn sys_cq_wait(min_complete: u64, cq: u32) -> u64 {
 unsafe fn sys_cq_wait_timeout(min_complete: u64, timeout_ms: u64, cq: u32) -> (u64, u64) {
     let ret: u64;
     let timed_out: u64;
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!(
             "svc #42",
@@ -206,6 +239,19 @@ unsafe fn sys_cq_wait_timeout(min_complete: u64, timeout_ms: u64, cq: u32) -> (u
             in("x2") timeout_ms,
             in("x3") cq as u64,
             options(nostack, nomem, preserves_flags),
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") (SYSCALL_CQ_WAIT_TIMEOUT as u64) => ret,
+            inlateout("rdi") min_complete => timed_out,
+            in("rsi") timeout_ms,
+            in("rdx") cq as u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(preserves_flags),
         );
     }
     let _ = SYSCALL_CQ_WAIT_TIMEOUT;
