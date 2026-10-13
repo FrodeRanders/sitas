@@ -504,6 +504,21 @@ The TCP server's `SO_INCOMING_CPU` and kTLS ULP hooks are Linux socket options
 on the readiness-based TCP path. They do not make TCP accept, send, or receive
 completion-based `io_uring` operations.
 
+### CharlotteOS checked CQ waits
+
+The Charlotte backend uses runtime ABI 3's checked CQ syscall 88; unchecked
+syscalls 12/42 are retired. Its explicit timed flag distinguishes finite
+milliseconds (including the maximum value) from an event-only wait. Ready and
+deadline are separate from waiter admission rejection and invalid requests.
+Rejected waits log and abort the domain: the portable executor's retry-on-error
+loop must not turn failed admission into spinning or a fake wake. Pending
+operations remain governed by kernel domain retirement, never completion inferred
+from rejection. Reactor waits and runtime sleep retain one monotonic budget;
+completion/peer wakes cannot restart it or end a sleep early. Per-shard reactors
+retain their mapped queue identity. Public parkers sharing a CQ keep the 5 ms
+backstop because its shared generation cursor can be consumed by a competing
+reader; this remains timer-driven recovery, not a per-waiter readiness guarantee.
+
 ## 10. Linux `io_uring` model
 
 The Linux `io_uring` backend is a supported part of the runtime. It has a
