@@ -25,6 +25,33 @@ The repository is a workspace with four crates:
 
 The two lanes share one contract: `reactor_backend`, `shard_runtime`, `shard`, `placement`, `error`, and the `no_std` services are the frozen surface both backends build on. Code behind the `std` feature must never leak into the default lane; `cargo check -p sitas-core -p sitas-charlotte --target aarch64-unknown-none` guards this in the validation script.
 
+## 1.2 Portable ownership and lifecycle
+
+The default lane has its own small executor and services; enabling `std` adds
+another, richer executor rather than replacing the portable one. `ShardRuntime`
+returns `ShardThread<T>` handles. A successful `join` confirms the entry closure
+and its destructors have finished. Portable KV and mailbox-index workers retain
+these handles; KV `shutdown`, `stop`, and best-effort `Drop` close their inbound
+channels and join all started workers, including on partial startup failure.
+Worker failure closes queued reply senders, allowing callers to report failure
+instead of parking forever. Backend thread creation is still infallible at the
+trait boundary: a rejected Charlotte spawn or exit observation aborts the domain.
+
+Portable channels serialize acceptance against closure. The last sender closes
+the channel, accepted messages drain before EOF, receiver destruction rejects
+further sends and releases queued values, and cancelling a receive unregisters
+its waker. The public `RingBuffer` uses safe `VecDeque` storage behind a short
+`spin::Mutex`; it supports shared concurrent calls and drops occupied values.
+For compatibility its slot count still leaves one reserved slot: capacity N
+holds N - 1 values, and capacity must be at least two. It is not lock-free.
+The deprecated `unbounded` spelling remains a bounded 256-slot compatibility API.
+
+The portable executor checks reactor events at each polling budget boundary,
+using a zero timeout while runnable work remains. `try_run` returns reactor
+errors without retrying indefinitely; `run` treats those errors as fatal. Tasks
+remain owned until resumed or the executor is dropped. Like the host executor,
+it cannot preempt a future whose individual poll blocks or never returns.
+
 ## 2. Architectural invariants
 
 These invariants define the project.
@@ -201,7 +228,7 @@ Responsibilities:
 - coalescing repeated wakes to one ready-queue entry per task;
 - budgeting ready-queue polling so self-waking tasks cannot indefinitely starve timers or readiness;
 - implementing custom wakers that re-enqueue tasks;
-- catching task panics at executor boundaries;
+- catching task panics at executor boundaries in builds using panic unwinding;
 - preserving panic payloads through join handles and `block_on` where observable;
 - driving a root future with `block_on` without requiring the root future to be `Send` or `'static`;
 - `Executor::run_until` for polling a root future while still driving spawned tasks;
@@ -224,8 +251,8 @@ Responsibilities:
 - driver-event counters split readiness wakeups from Linux completion wakeups
   in owned executor snapshots, and further split readiness events by whether
   they carried readable or writable fd progress. Linux completion wake counters
-  count driver wake cycles, while dispatched-completion counters count
-  individual operation completions;
+  count driver cycles, including nonblocking intake between poll batches,
+  while dispatched-completion counters count individual operation completions;
 - Linux completion-dispatch counters report non-empty dispatch batches,
   dispatched completion count, completion budget, and completion budget
   exhaustion events;
@@ -359,7 +386,12 @@ Supported higher-level forms:
 
 `ShardLocal<T>` adds one owned value per executor shard.
 
-Access is routed through the sharded submitter. The closure runs synchronously on the owning shard and receives `&mut T`. The implementation uses an internal `UnsafeCell` plus runtime shard-owner checks rather than a mutex. References to the local value cannot escape the closure or cross `.await`.
+Access is routed through the sharded submitter. The closure runs synchronously
+on the owning shard and receives `&mut T`. The implementation uses an internal
+`UnsafeCell` and checks both a non-reused runtime identity and the shard id before
+touching its non-atomic borrow flag or value. A matching shard number in another
+runtime returns `ShardLocalAccessError::WrongRuntime`. Reentrant local access is
+rejected. References cannot escape the closure or cross `.await`.
 
 Capabilities:
 
@@ -470,6 +502,11 @@ Snapshots support simple progress views without a logging framework, Tokio conso
 
 ### Executor tasks
 
+Task panic isolation requires `panic = "unwind"`. The workspace's development
+and release profiles use `panic = "abort"`; those executables terminate on panic.
+The test harness unwinds, so panic-catching tests do not establish isolation for
+an aborting executable.
+
 Executor shutdown tracks spawned tasks, clears timer/readiness registrations, and drops pending task futures. Dropping futures is the normal cancellation path, so timer and readiness cleanup must be implemented through `Drop` where necessary. The scheduler keeps every spawned task in a weak-reference list for observability; it opportunistically compacts dead entries from that list so a long-running executor that churns short-lived tasks keeps the list bounded by the live task count rather than growing without bound until teardown.
 
 `TaskScope` provides cooperative shutdown for grouped children. If bounded shutdown times out, still-owned children may be aborted.
@@ -478,7 +515,17 @@ Executor shutdown tracks spawned tasks, clears timer/readiness registrations, an
 
 Stopping the sharded executor requires dropping owned spawners/submitters and joining shard executor threads. Submitters are explicit lifetime capabilities and can keep the runtime alive if retained.
 
-`shutdown`/`stop` drain cooperatively and will wait indefinitely for a task that never completes. `shutdown_timeout(duration)` and its consuming variant `stop_timeout(duration)` bound this: they drop the owned spawners, wait up to `duration` for shards to drain, then forcibly stop any shard still running by signaling its executor run loop to exit (via a scheduler stop flag plus a reactor wake) and dropping its remaining task futures. The returned `ShardedShutdownOutcome` reports which shards, if any, were forced, so an uncooperative task cannot hang teardown.
+`shutdown`/`stop` drain cooperatively and join every thread; retained submitters
+or non-completing tasks can keep these calls blocked. `shutdown_timeout(duration)`
+and `stop_timeout(duration)` stop waiting at a monotonic deadline, signal remaining
+executor run loops, and join only threads already reported finished. They cannot
+interrupt a blocking or non-returning poll. The returned `ShardedShutdownOutcome`
+owns unfinished thread handles: `unfinished_shards` names them, `failed_shards`
+records observed join failures, and consuming `wait()` performs the optional,
+unbounded join. Dropping the outcome detaches its remaining threads; those threads
+continue owning their tasks and state until actual exit. The legacy `forced_shards`
+field means stop requests were sent, not that termination was confirmed. The
+outcome is therefore an owner, not a cloneable snapshot or a quiescence receipt.
 
 ## 9. I/O readiness model
 
@@ -497,8 +544,10 @@ The readiness path is small:
 
 This is readiness-based, not completion-based. It is separate from the `io_uring` completion path.
 
-Linux uses `epoll`. macOS and iOS use `kqueue`. Other non-Linux Unix targets
-currently use `poll`.
+Linux uses `epoll`. macOS, iOS, FreeBSD, NetBSD and OpenBSD use `kqueue`.
+Other Unix targets currently use `poll`. Both executor loops perform nonblocking
+readiness intake between poll batches, including while a task repeatedly wakes
+itself; waiting for an empty ready queue is not a prerequisite for I/O progress.
 
 The TCP server's `SO_INCOMING_CPU` and kTLS ULP hooks are Linux socket options
 on the readiness-based TCP path. They do not make TCP accept, send, or receive
@@ -510,13 +559,23 @@ The Charlotte backend uses runtime ABI 3's checked CQ syscall 88; unchecked
 syscalls 12/42 are retired. Its explicit timed flag distinguishes finite
 milliseconds (including the maximum value) from an event-only wait. Ready and
 deadline are separate from waiter admission rejection and invalid requests.
-Rejected waits log and abort the domain: the portable executor's retry-on-error
-loop must not turn failed admission into spinning or a fake wake. Pending
+Rejected waits log and abort the domain: failed admission must not become a
+retry loop or a fake wake. Pending
 operations remain governed by kernel domain retirement, never completion inferred
 from rejection. Reactor waits and runtime sleep retain one monotonic budget;
 completion/peer wakes cannot restart it or end a sleep early. Per-shard reactors
-retain their mapped queue identity. Public parkers sharing a CQ keep the 5 ms
-backstop because its shared generation cursor can be consumed by a competing
+retain their mapped queue identity. The CQ header preserves the 16-byte kernel
+ABI using 32-bit atomic fields. Consumers acquire head publication before reading
+an entry and release tail after consumption; the kernel producer must preserve
+the corresponding publication/reuse ordering. A short userspace consumer gate
+serializes competing readers, including legacy reactors sharing queue 0. Raw
+`with_cq` construction is unsafe and requires a live, aligned 4 KiB mapping.
+The safe canonical constructor is only usable under the CharlotteOS launch ABI;
+it panics on hosted targets. Thread joins retain the spawn's numeric id AND
+generation, so recycling cannot redirect exit observation. Dropping a Charlotte
+join handle cancels and terminally closes its exit subscription, not the worker;
+services use explicit joining when worker termination must be established.
+Public parkers sharing a CQ keep the 5 ms backstop because its shared generation cursor can be consumed by a competing
 reader; this remains timer-driven recovery, not a per-waiter readiness guarantee.
 
 ## 10. Linux `io_uring` model
@@ -529,22 +588,25 @@ bridge. It is not yet the single unified I/O engine for all sharded executor
 work; readiness, timers, and `io_uring` remain distinct wait sources.
 
 Each Linux executor run loop installs a thread-local `IoUringDispatcher` when
-the host allows `io_uring_setup`. Executor-backed `io_uring` futures store only
-operation ids and owned buffers, not `Rc` dispatcher handles, so they can remain
-`Send` before being moved onto a shard thread. When polled on the shard, they
-queue operations against the thread-local dispatcher and register their task
-waker. The executor dispatches locally available completions after ready-task
-polling with a fixed per-tick completion budget and gives pending `io_uring`
-work the executor wait slot when the shard has no ready tasks. Executor teardown
-makes a bounded attempt to drain abandoned operations before discarding the
-thread-local dispatcher when no live task wakers remain registered. This avoids
-hiding completion work behind an unrelated timer or readiness wait, but it is
-still a staged integration rather than one combined production wait primitive.
-If `run_until` returns while spawned tasks still have registered `io_uring`
-wakers, the dispatcher remains installed for that executor on the current
-thread so a later `run` or `run_until` can continue driving those operations.
-A different executor may not take over that thread-local dispatcher while it
-still has live state.
+the host allows `io_uring_setup`. Executor-backed `io_uring` futures transfer
+buffers into the originating
+dispatcher before publishing their pointers. Futures retain synchronized result
+handles (`Arc` plus internal bookkeeping mutex), which remain `Send` before and
+after polling. Moving, repolling, or dropping a pending future elsewhere cannot
+release its kernel buffer or redirect its operation to another thread's ring.
+Drop marks that result abandoned and wakes the originating reactor; the dispatcher
+cancels/discards it while retaining its allocation through completion. The origin
+must continue driving its ring while work is pending; sending a future does not
+move its driver. Terminal results and their returned buffers may be consumed on
+another thread.
+
+The executor dispatches available completions after each poll batch and polls the
+completion fd alongside readiness interests. A resumable `run_until` return keeps
+a dispatcher installed while result handles are still pending, so later runs can
+continue their operations. Final executor destruction instead fails remaining
+owned result handles with `BrokenPipe`, transfers their buffers through the
+cancellation/drain path, and tears down that executor's dispatcher. A different
+executor cannot take over an installed dispatcher with live state.
 
 This integration keeps some limits visible:
 
@@ -623,7 +685,7 @@ dispatch_available()
 
 The dispatcher keeps abandoned owned read/write buffers alive until the matching kernel completion is dispatched. This is the safety boundary for owned-buffer futures: dropping the future must not free memory that the kernel may still read from or write to.
 
-Dropping the dispatcher itself preserves the same boundary. A single `IoUringDispatcher::shutdown_drain` routine implements the teardown policy and is shared by explicit shutdown, the executor integration, and `Drop`. It first makes a bounded attempt to drive remaining operations to completion so their buffers are freed normally. If the bounded attempt cannot confirm completion, the deferred buffers backing operations the kernel may still touch are leaked rather than freed, because the ring descriptor and mmaps are torn down immediately afterward. The rule is drain-or-leak, never free while an operation is in flight: leaking an allocation is recoverable, a kernel write to freed memory is not. Confirmed-idle teardown frees everything normally and leaks nothing. When live task wakers are still registered the drain is skipped entirely, because those buffers belong to live futures that release them on drop. The outcome, including a `leaked_buffers` count, is recorded and exposed through the dispatcher snapshot, so a leak is observable rather than silent; `Drop` additionally logs a warning in debug builds when it has to leak.
+Dropping the dispatcher itself preserves the same boundary. A single `IoUringDispatcher::shutdown_drain` routine implements the teardown policy and is shared by explicit shutdown, the executor integration, and `Drop`. It first makes a bounded attempt to drive remaining operations to completion so their buffers are freed normally. Each allowed drain wait contributes at most one millisecond to one monotonic total budget. Pending SQEs are submitted without a blocking completion wait; the ring descriptor is polled with the remaining budget. A bound on wait count alone would not bound teardown. If the bounded attempt cannot confirm completion, the deferred buffers backing operations the kernel may still touch are leaked rather than freed, because the ring descriptor and mmaps are torn down immediately afterward. The rule is drain-or-leak, never free while an operation is in flight: leaking an allocation is recoverable, a kernel write to freed memory is not. Confirmed-idle teardown frees everything normally and leaks nothing. When live task wakers are still registered the drain is skipped entirely, because those buffers belong to live futures that release them on drop. The outcome, including a `leaked_buffers` count, is recorded and exposed through the dispatcher snapshot, so a leak is observable rather than silent; `Drop` additionally logs a warning in debug builds when it has to leak.
 
 Shared SQ/CQ ring indices are accessed as atomics: the submitter releases the SQ tail and the consumer acquires the CQ tail, pairing with the kernel's matching acquire/release so SQE payloads and posted CQEs are observed in order on weakly-ordered targets, not only on x86.
 
@@ -638,8 +700,9 @@ Raw ring snapshot fields represent live ring state:
 
 Dispatcher snapshot fields represent async-facing live and historical state:
 
-- registered wakers;
-- completed operations buffered for futures;
+- registered wakers, including live dispatcher-owned result handles;
+- completed operations buffered in the raw dispatcher (terminal owned results
+  have already transferred into their synchronized future handles);
 - abandoned operations;
 - deferred buffers;
 - optional executor shutdown drain outcome, including status, wait budget,

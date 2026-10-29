@@ -18,6 +18,7 @@ use crate::reactor_backend::{ReactorBackend, ReactorEvent};
 use super::scheduler::Scheduler;
 #[cfg(target_os = "linux")]
 use super::uring;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DriverEvent {
@@ -91,7 +92,19 @@ pub(super) fn wait_for_event<R>(
 where
     R: ReactorBackend<Handle = std::os::unix::io::RawFd>,
 {
-    Some(wait_for_reactor_event(scheduler, reactor, context))
+    Some(wait_for_reactor_event(scheduler, reactor, context, false))
+}
+
+#[cfg(unix)]
+pub(super) fn poll_for_event<R>(scheduler: &Scheduler, reactor: &R) -> Option<DriverEvent>
+where
+    R: ReactorBackend<Handle = std::os::unix::io::RawFd>,
+{
+    let has_interests =
+        !scheduler.read_interest_fds().is_empty() || !scheduler.write_interest_fds().is_empty();
+    #[cfg(target_os = "linux")]
+    let has_interests = has_interests || uring::should_wait();
+    has_interests.then(|| wait_for_reactor_event(scheduler, reactor, "polling ready I/O", true))
 }
 
 #[cfg(not(unix))]
@@ -129,7 +142,12 @@ pub(super) fn apply_event(scheduler: &Scheduler, event: Option<DriverEvent>) {
 }
 
 #[cfg(unix)]
-fn wait_for_reactor_event<R>(scheduler: &Scheduler, reactor: &R, context: &str) -> DriverEvent
+fn wait_for_reactor_event<R>(
+    scheduler: &Scheduler,
+    reactor: &R,
+    context: &str,
+    poll: bool,
+) -> DriverEvent
 where
     R: ReactorBackend<Handle = std::os::unix::io::RawFd>,
 {
@@ -153,7 +171,11 @@ where
         read_fds.push(fd);
     }
 
-    let timeout = scheduler.time_until_next_timer();
+    let timeout = if poll {
+        Some(Duration::ZERO)
+    } else {
+        scheduler.time_until_next_timer()
+    };
     let reactor_event = reactor
         .wait(&read_fds, &write_fds, timeout)
         .unwrap_or_else(|error| panic!("OS reactor wait failed while {context}: {error}"));

@@ -6,8 +6,7 @@
 //! The loop is:
 //!
 //! 1. poll ready tasks, up to a **budget** per iteration;
-//! 2. if ready tasks remain after the budget, loop again (the budget is a
-//!    fairness yield point, not a scheduling boundary);
+//! 2. if ready tasks remain after the budget, poll the reactor without blocking;
 //! 3. otherwise block in [`ReactorBackend::wait`] until an event or a wake
 //!    arrives;
 //! 4. wake the tasks registered for the returned readable handles (drained
@@ -231,6 +230,12 @@ where
     /// Run until every spawned task has completed (§7 loop: budgeted polling,
     /// then one blocking reactor wait, then wake tasks for drained events).
     pub fn run(&mut self) {
+        self.try_run().expect("shard reactor wait failed");
+    }
+
+    /// Drive tasks, returning a reactor error instead of retrying it forever.
+    /// Pending tasks remain owned by this executor until resumed or dropped.
+    pub fn try_run(&mut self) -> crate::io::Result<()> {
         while self.live > 0 {
             // 1) Budgeted polling of ready tasks.
             let mut polled = 0;
@@ -244,21 +249,22 @@ where
             if self.live == 0 {
                 break;
             }
-            // 2) Budget exhausted with work remaining: yield point, no block.
-            if self.shared.has_ready() {
-                continue;
-            }
-            // 3) Nothing runnable: block until an event or a wake arrives.
-            let read = self.io.read_handles();
-            let Ok(event) = self.reactor.wait(&read, &[], self.idle_wait) else {
-                continue;
+            // Poll event intake on every budget boundary. A self-waking task
+            // must not prevent a ready handle from re-queuing its waiter.
+            let timeout = if self.shared.has_ready() {
+                Some(Duration::ZERO)
+            } else {
+                self.idle_wait
             };
+            let read = self.io.read_handles();
+            let event = self.reactor.wait(&read, &[], timeout)?;
             // 4) Drained events wake the tasks that registered interest; an
             //    explicit wake has already queued its task via `mark_ready`.
             for handle in event.readable() {
                 self.io.wake_readable(*handle);
             }
         }
+        Ok(())
     }
 }
 
@@ -372,6 +378,77 @@ mod tests {
         }
         executor.run();
         assert_eq!(done.load(Ordering::Acquire), 5);
+    }
+
+    #[test]
+    fn busy_ready_queue_still_drains_io_at_budget_boundary() {
+        let (executor, readable) = mock_executor();
+        let mut executor = executor.with_poll_budget(2);
+        let io = executor.io();
+        let done = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let spinner_done = Arc::clone(&done);
+        let spinner_polls = Arc::clone(&polls);
+        executor.spawn(core::future::poll_fn(move |cx| {
+            let count = spinner_polls.fetch_add(1, Ordering::Relaxed);
+            if spinner_done.load(Ordering::Relaxed) || count == 1000 {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }));
+        let waiter_done = Arc::clone(&done);
+        let mut registered = false;
+        executor.spawn(core::future::poll_fn(move |cx| {
+            if registered {
+                waiter_done.store(true, Ordering::Relaxed);
+                Poll::Ready(())
+            } else {
+                registered = true;
+                io.register_readable(7, cx.waker().clone());
+                Poll::Pending
+            }
+        }));
+        readable.lock().push(7);
+        executor.run();
+        assert!(done.load(Ordering::Relaxed));
+        assert!(polls.load(Ordering::Relaxed) < 10);
+    }
+
+    #[test]
+    fn reactor_error_returns_without_spinning_and_drop_cancels_tasks() {
+        struct FailedReactor(MockReactor);
+        impl ReactorBackend for FailedReactor {
+            type Waker = MockWaker;
+            type Handle = u64;
+            type Event = MockEvent;
+            fn waker(&self) -> MockWaker {
+                self.0.waker()
+            }
+            fn wait(&self, _: &[u64], _: &[u64], _: Option<Duration>) -> io::Result<MockEvent> {
+                Err(io::ErrorKind::Other)
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let mut executor = ShardExecutor::new(FailedReactor(MockReactor {
+            woken: Arc::new(AtomicBool::new(false)),
+            readable: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let guard = OnDrop(Arc::clone(&dropped));
+        executor.spawn(async move {
+            let _guard = guard;
+            core::future::pending::<()>().await;
+        });
+        assert!(matches!(executor.try_run(), Err(io::ErrorKind::Other)));
+        drop(executor);
+        assert!(dropped.load(Ordering::Relaxed));
     }
 
     /// One task signals another through a waker slot: the waiting task parks

@@ -1,78 +1,127 @@
-//! Minimal lock-free bounded SPSC ring buffer for `sitas-core`.
+//! Bounded owned-value queue for the portable runtime.
 //!
-//! The original `sitas` crate uses `concurrent_queue::ConcurrentQueue` (which
-//! depends on `std` for condition-variable signalling). For the `no_std` core
-//! we provide a simple atomic-based ring buffer that the executor's reactor
-//! (and the `ShardMailbox`) can use. It is single-producer, single-consumer:
-//! the kernel writes completions (CQ ring), the reactor reads them.
-//!
-//! This is NOT a general-purpose MPMC queue — it is just enough for the
-//! executor's wake path and the CharlotteOS reactor.
+//! Both ends may be called concurrently. A short runtime-internal spin lock
+//! serializes queue bookkeeping; application service state is never stored in
+//! this lock. The original SPSC ring exposed shared safe methods without
+//! enforcing its producer/consumer restriction. Keeping the same small API
+//! over safe storage also guarantees that queued values are dropped normally.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use alloc::collections::VecDeque;
+use spin::Mutex;
 
 pub struct RingBuffer<T> {
-    buffer: UnsafeCell<alloc::boxed::Box<[UnsafeCell<core::mem::MaybeUninit<T>>]>>,
-    capacity: usize,
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    queue: Mutex<VecDeque<T>>,
+    limit: usize,
 }
 
-unsafe impl<T: Send> Send for RingBuffer<T> {}
-unsafe impl<T: Send> Sync for RingBuffer<T> {}
-
 impl<T> RingBuffer<T> {
+    /// Allocate `capacity` ring slots. One slot remains reserved, preserving
+    /// the original ring's usable capacity of `capacity - 1`.
     pub fn bounded(capacity: usize) -> Self {
-        let mut v = alloc::vec::Vec::with_capacity(capacity);
-        v.resize_with(capacity, || {
-            UnsafeCell::new(core::mem::MaybeUninit::uninit())
-        });
+        assert!(capacity >= 2, "ring capacity must be at least two");
         Self {
-            buffer: UnsafeCell::new(v.into_boxed_slice()),
-            capacity,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            queue: Mutex::new(VecDeque::with_capacity(capacity - 1)),
+            limit: capacity - 1,
         }
     }
 
+    /// Legacy spelling for a bounded 256-slot ring.
+    #[deprecated(note = "this queue is bounded; use RingBuffer::bounded explicitly")]
     pub fn unbounded() -> Self {
-        Self::bounded(256) // "unbounded" approximation
+        Self::bounded(256)
     }
 
     pub fn try_push(&self, item: T) -> Result<(), T> {
-        let head = self.head.load(Ordering::Relaxed);
-        let next = (head + 1) % self.capacity;
-        let tail = self.tail.load(Ordering::Acquire);
-        if next == tail {
+        let mut queue = self.queue.lock();
+        if queue.len() == self.limit {
             return Err(item);
         }
-        let buf = unsafe { &mut *self.buffer.get() };
-        unsafe { buf[head].get().write(core::mem::MaybeUninit::new(item)) };
-        self.head.store(next, Ordering::Release);
+        queue.push_back(item);
         Ok(())
     }
 
     pub fn pop(&self) -> Option<T> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
-        if tail == head {
-            return None;
-        }
-        let buf = unsafe { &mut *self.buffer.get() };
-        let item = unsafe { buf[tail].get().read().assume_init() };
-        self.tail
-            .store((tail + 1) % self.capacity, Ordering::Release);
-        Some(item)
+        self.queue.lock().pop_front()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tail.load(Ordering::Acquire) == self.head.load(Ordering::Acquire)
+        self.queue.lock().is_empty()
     }
 
     pub fn len(&self) -> usize {
-        let h = self.head.load(Ordering::Relaxed);
-        let t = self.tail.load(Ordering::Relaxed);
-        if h >= t { h - t } else { h + self.capacity - t }
+        self.queue.lock().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountDrop(Arc<AtomicUsize>);
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn queued_and_rejected_values_are_dropped_exactly_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let queue = RingBuffer::bounded(3);
+        assert!(queue.try_push(CountDrop(Arc::clone(&drops))).is_ok());
+        assert!(queue.try_push(CountDrop(Arc::clone(&drops))).is_ok());
+        let rejected = queue.try_push(CountDrop(Arc::clone(&drops))).err().unwrap();
+        drop(queue.pop());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        drop(queue);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        drop(rejected);
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "ring capacity must be at least two")]
+    fn zero_capacity_is_rejected() {
+        let _ = RingBuffer::<u8>::bounded(0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn concurrent_producers_and_consumers_transfer_each_value_once() {
+        let queue = Arc::new(RingBuffer::bounded(33));
+        let received = Arc::new(std::sync::Mutex::new(alloc::vec::Vec::new()));
+        std::thread::scope(|scope| {
+            for producer in 0..4 {
+                let queue = Arc::clone(&queue);
+                scope.spawn(move || {
+                    for value in producer * 100..(producer + 1) * 100 {
+                        while queue.try_push(value).is_err() {
+                            std::thread::yield_now();
+                        }
+                    }
+                });
+            }
+            for _ in 0..4 {
+                let queue = Arc::clone(&queue);
+                let received = Arc::clone(&received);
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        loop {
+                            if let Some(value) = queue.pop() {
+                                received.lock().unwrap().push(value);
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                });
+            }
+        });
+        let mut received = received.lock().unwrap();
+        received.sort_unstable();
+        assert_eq!(*received, (0..400).collect::<alloc::vec::Vec<_>>());
+        assert!(queue.is_empty());
     }
 }

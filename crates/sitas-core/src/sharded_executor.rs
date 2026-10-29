@@ -39,11 +39,25 @@ static NEXT_RUNTIME_ID: AtomicUsize = AtomicUsize::new(1);
 const SHUTDOWN_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ShardedExecutorId(usize);
+pub(crate) struct ShardedExecutorId(usize);
 
 impl ShardedExecutorId {
     fn allocate() -> Self {
-        Self(NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed))
+        let mut id = NEXT_RUNTIME_ID.load(Ordering::Relaxed);
+        loop {
+            let next = id
+                .checked_add(1)
+                .expect("sharded runtime identity space exhausted");
+            match NEXT_RUNTIME_ID.compare_exchange_weak(
+                id,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Self(id),
+                Err(current) => id = current,
+            }
+        }
     }
 }
 
@@ -126,6 +140,7 @@ impl std::error::Error for ShardedSchedulingGroupError {
 }
 
 thread_local! {
+    static CURRENT_EXECUTOR_RUNTIME: std::cell::Cell<Option<ShardedExecutorId>> = const { std::cell::Cell::new(None) };
     static CURRENT_EXECUTOR_SHARD: std::cell::Cell<Option<ShardId>> = const { std::cell::Cell::new(None) };
     static CURRENT_EXECUTOR_CPU_PLACEMENT: std::cell::RefCell<Option<CpuPlacementStatus>> = const { std::cell::RefCell::new(None) };
     static CURRENT_EXECUTOR_MEMORY_PLACEMENT: std::cell::RefCell<Option<MemoryPlacementStatus>> = const { std::cell::RefCell::new(None) };
@@ -135,6 +150,10 @@ thread_local! {
 /// [`ShardedExecutor`] shard thread.
 pub fn current_executor_shard() -> Option<ShardId> {
     CURRENT_EXECUTOR_SHARD.with(std::cell::Cell::get)
+}
+
+pub(crate) fn current_executor_runtime() -> Option<ShardedExecutorId> {
+    CURRENT_EXECUTOR_RUNTIME.with(std::cell::Cell::get)
 }
 
 /// Returns the CPU placement status observed when the current
@@ -352,22 +371,46 @@ struct ShardStartStatus {
 /// Outcome of a bounded [`ShardedExecutor::shutdown_timeout`] or
 /// [`ShardedExecutor::stop_timeout`].
 #[must_use]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct ShardedShutdownOutcome {
     forced_shards: Vec<ShardId>,
+    unfinished_shards: Vec<ShardId>,
+    failed_shards: Vec<ShardId>,
+    pending_joins: Vec<thread::JoinHandle<()>>,
 }
 
 impl ShardedShutdownOutcome {
-    /// Returns whether any shard had to be forcibly stopped because it did not
-    /// drain within the timeout.
+    /// Returns whether any shard received a stop request at the deadline.
+    /// This does not establish that the shard thread has terminated.
     pub fn was_forced(&self) -> bool {
         !self.forced_shards.is_empty()
     }
 
-    /// Returns the shards that were forcibly stopped at the deadline, in shard
-    /// order.
+    /// Returns shards signaled to stop at the deadline, in shard order.
     pub fn forced_shards(&self) -> &[ShardId] {
         &self.forced_shards
+    }
+
+    /// Threads still running when this outcome was returned. Their join
+    /// handles are retained here. Dropping the outcome detaches them; their
+    /// thread-owned state remains alive until they actually exit.
+    pub fn unfinished_shards(&self) -> &[ShardId] {
+        &self.unfinished_shards
+    }
+
+    pub fn failed_shards(&self) -> &[ShardId] {
+        &self.failed_shards
+    }
+
+    /// Confirm termination of every retained thread. This may block forever
+    /// if a task poll never returns. Use only when a blocking join is intended.
+    pub fn wait(self) -> Result<(), ShardError> {
+        let result = join_all(self.pending_joins);
+        if self.failed_shards.is_empty() {
+            result
+        } else {
+            Err(ShardError::ThreadJoinFailed)
+        }
     }
 }
 
@@ -430,6 +473,7 @@ impl ShardedExecutor {
                         &memory_placement_request,
                         &cpu_placement,
                     );
+                    CURRENT_EXECUTOR_RUNTIME.set(Some(runtime_id));
                     CURRENT_EXECUTOR_SHARD.set(Some(shard_id));
                     CURRENT_EXECUTOR_CPU_PLACEMENT.replace(Some(cpu_placement.clone()));
                     CURRENT_EXECUTOR_MEMORY_PLACEMENT.replace(Some(memory_placement.clone()));
@@ -438,9 +482,13 @@ impl ShardedExecutor {
                         memory_placement,
                     });
                     executor.run();
+                    // Drop pending futures and the dispatcher while shard
+                    // identity still identifies their owning runtime thread.
+                    drop(executor);
                     CURRENT_EXECUTOR_MEMORY_PLACEMENT.replace(None);
                     CURRENT_EXECUTOR_CPU_PLACEMENT.replace(None);
                     CURRENT_EXECUTOR_SHARD.set(None);
+                    CURRENT_EXECUTOR_RUNTIME.set(None);
                 }) {
                 Ok(join) => join,
                 Err(_) => {
@@ -1010,18 +1058,19 @@ impl ShardedExecutor {
             shard.spawner.take();
         }
 
-        join_all(self.joins.drain(..).collect())
+        join_all(std::mem::take(&mut self.joins))
     }
 
     /// Stops all owned shard executors, waiting up to `timeout` for them to
-    /// drain gracefully before forcing any that have not finished.
+    /// drain gracefully before requesting cancellation on the remaining shards.
     ///
     /// Like [`ShardedExecutor::shutdown`], this drops the owned spawners so
     /// idle shards drain and exit. It then waits up to `timeout` for every
-    /// shard thread to finish. Any shard still running when the deadline
-    /// elapses is forcibly stopped: its run loop is signaled to exit and its
-    /// remaining task futures are dropped. This bounds shutdown even when a
-    /// spawned task never yields or never completes.
+    /// shard thread to finish. At the deadline remaining run loops are signaled
+    /// to exit. This cannot interrupt a blocking or non-returning task poll.
+    /// Unfinished thread handles are returned in the outcome, whose `wait`
+    /// method can confirm later termination. The timed call never joins a
+    /// thread that has not reported finished.
     ///
     /// Drop any [`ShardedSubmitter`] handles before calling this; outstanding
     /// submitters keep submission open and can keep shards busy. The returned
@@ -1035,9 +1084,9 @@ impl ShardedExecutor {
             shard.spawner.take();
         }
 
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
         while !self.joins.iter().all(thread::JoinHandle::is_finished) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 break;
             }
@@ -1051,8 +1100,21 @@ impl ShardedExecutor {
             }
         }
 
-        join_all(self.joins.drain(..).collect())?;
-        Ok(ShardedShutdownOutcome { forced_shards })
+        let mut outcome = ShardedShutdownOutcome {
+            forced_shards,
+            ..ShardedShutdownOutcome::default()
+        };
+        for (shard, join) in self.shards.iter().zip(std::mem::take(&mut self.joins)) {
+            if join.is_finished() {
+                if join.join().is_err() {
+                    outcome.failed_shards.push(shard.shard_id);
+                }
+            } else {
+                outcome.unfinished_shards.push(shard.shard_id);
+                outcome.pending_joins.push(join);
+            }
+        }
+        Ok(outcome)
     }
 
     /// Consuming variant of [`ShardedExecutor::shutdown_timeout`].
@@ -1099,6 +1161,10 @@ struct ShardSubmitter {
 }
 
 impl ShardedSubmitter {
+    pub(crate) fn runtime_id(&self) -> ShardedExecutorId {
+        self.runtime_id
+    }
+
     /// Returns the number of shards this submitter can address.
     pub fn shard_count(&self) -> usize {
         self.shards.len()
@@ -1727,6 +1793,42 @@ mod tests {
     };
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn timed_shutdown_returns_running_thread_ownership_before_poll_exits() {
+        for consuming in [false, true] {
+            let mut runtime = ShardedExecutor::start(1).unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            runtime
+                .spawn_on(ShardId(0), async move {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (result_tx, result_rx) = mpsc::channel();
+            let shutdown = thread::spawn(move || {
+                let outcome = if consuming {
+                    runtime.stop_timeout(Duration::from_millis(10))
+                } else {
+                    runtime.shutdown_timeout(Duration::from_millis(10))
+                };
+                result_tx.send(outcome).unwrap();
+            });
+            let result = result_rx.recv_timeout(Duration::from_secs(1));
+            // Always release the poll before asserting, so a regression fails
+            // without stranding a blocked test thread.
+            release_tx.send(()).unwrap();
+            shutdown.join().unwrap();
+            let outcome = result
+                .expect("timed shutdown blocked in a running poll")
+                .unwrap();
+            assert_eq!(outcome.unfinished_shards(), &[ShardId(0)]);
+            assert!(outcome.was_forced());
+            outcome.wait().unwrap();
+        }
+    }
 
     #[test]
     fn start_rejects_zero_shards() {

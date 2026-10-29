@@ -1,7 +1,7 @@
 # Sitas
 
-`Sitas` is a pure-Rust (edition 2024), zero-dependency exploration of Seastar-like shard-per-core architecture 
-built on Rust ownership semantics. It explores what shared-nothing looks like when designed around type
+`Sitas` is a pure-Rust (edition 2024), dependency-light exploration of Seastar-like shard-per-core architecture
+built on Rust ownership semantics. The portable core uses `alloc` and `spin`; host services use the standard library. It explores what shared-nothing looks like when designed around type
 boundaries, explicit message passing, and isolated unsafe.
 
 ## Overview
@@ -31,7 +31,7 @@ A sharded executor:
 - ShardedSubmitter for cross-shard async submission
 - CPU affinity on Linux (sched_setaffinity), container cpuset-aware
 - ShardLocal<T> — per-shard owned values with no mutex, closure-based access, stoppable workers
-  
+
 Experimental io_uring (Linux):
 - Full ring, dispatcher lifecycle, tracked operations, abandoned buffer safety, completion counting
 - Integrated for file I/O futures (read_at_uring, write_all_at_uring)
@@ -54,8 +54,8 @@ using only the Rust standard library.
   cancellable tasks, timers, timeouts, OS-backed sleeping, racing futures,
   and read/write-readiness futures
 - root-future driving without requiring `Send` or `'static`
-- budgeted ready-queue polling so timers and I/O can progress under repeated
-  task wakeups
+- budgeted ready-queue polling with nonblocking event intake so timers and I/O
+  can progress under repeated task wakeups
 - task scopes that group child tasks under one cooperative stop signal and
   abort still-owned children when dropped or when bounded shutdown times out
 - a one-shot async notification primitive for waking one or more executor tasks
@@ -141,7 +141,7 @@ All cross-shard interaction happens through typed messages.
 No mutex protects the key-value service state because it is never shared.
 Values returned across shard boundaries are owned values.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current request flow
+See [docs/architecture.md](docs/architecture.md) for the current request flow
 and shutdown model.
 
 ## Deliberately Missing

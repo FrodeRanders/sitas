@@ -14,9 +14,9 @@ use std::time::Duration;
 use crate::executor::{StopSource, StopToken, stop_pair};
 use crate::shard::ShardId;
 use crate::sharded_executor::{
-    ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError, ShardedOperationError,
-    ShardedSpawnError, ShardedSubmitter, current_executor_shard, join_all_shards,
-    join_all_shards_timeout,
+    ShardedExecutorId, ShardedJoinError, ShardedJoinHandle, ShardedJoinTimeoutError,
+    ShardedOperationError, ShardedSpawnError, ShardedSubmitter, current_executor_runtime,
+    current_executor_shard, join_all_shards, join_all_shards_timeout,
 };
 
 /// One value per shard, accessed only on the owning shard executor.
@@ -54,13 +54,15 @@ impl<T> Clone for ShardLocalSlot<T> {
 }
 
 struct ShardLocalCell<T> {
+    runtime: ShardedExecutorId,
     owner: ShardId,
     borrowed: Cell<bool>,
     value: UnsafeCell<T>,
 }
 
 // Safety: `ShardLocalCell` only exposes access through `with_mut`, which checks
-// that the current executor shard is the owner and uses a `borrowed` flag to
+// that the current runtime AND shard identify the owner before touching the
+// non-atomic cells, and uses a `borrowed` flag to
 // reject re-entrant access that would otherwise alias `&mut T`. The public
 // `ShardLocal` API schedules every access closure onto that owner shard and
 // does not let references to `T` escape the closure, so the `value` cell and
@@ -83,6 +85,7 @@ where
                 ShardLocalSlot {
                     shard_id,
                     cell: Arc::new(ShardLocalCell {
+                        runtime: submitter.runtime_id(),
                         owner: shard_id,
                         borrowed: Cell::new(false),
                         value: UnsafeCell::new(make_value(shard_id)),
@@ -348,6 +351,9 @@ where
         &self,
         shard_id: ShardId,
     ) -> Result<&ShardLocalCell<T>, ShardLocalAccessError> {
+        if current_executor_runtime() != Some(self.submitter.runtime_id()) {
+            return Err(ShardLocalAccessError::WrongRuntime);
+        }
         self.shards
             .get(shard_id.0)
             .map(|slot| slot.cell.as_ref())
@@ -659,6 +665,8 @@ impl<T> fmt::Debug for ShardLocal<T> {
 pub enum ShardLocalAccessError {
     /// The caller is not currently running on a sharded executor thread.
     NotOnShard,
+    /// The caller's shard belongs to a different runtime.
+    WrongRuntime,
     /// The current shard id is outside this shard-local handle's shard set.
     InvalidShardId(usize),
 }
@@ -668,6 +676,9 @@ impl fmt::Display for ShardLocalAccessError {
         match self {
             ShardLocalAccessError::NotOnShard => {
                 write!(f, "not running on a sharded executor thread")
+            }
+            ShardLocalAccessError::WrongRuntime => {
+                write!(f, "shard-local value belongs to a different runtime")
             }
             ShardLocalAccessError::InvalidShardId(shard_id) => {
                 write!(f, "invalid shard id: {shard_id}")
@@ -683,6 +694,11 @@ impl<T> ShardLocalCell<T> {
     where
         F: FnOnce(&mut T) -> R,
     {
+        assert_eq!(
+            current_executor_runtime(),
+            Some(self.runtime),
+            "shard-local value accessed from the wrong runtime"
+        );
         assert_eq!(
             current_executor_shard(),
             Some(self.owner),
@@ -729,6 +745,40 @@ mod tests {
     use crate::executor::{block_on, sleep};
     use crate::sharded_executor::{ShardedExecutor, join_all_shards};
     use std::time::Duration;
+
+    #[test]
+    fn current_access_rejects_another_runtime_with_the_same_shard_id() {
+        let owner = ShardedExecutor::start(1).unwrap();
+        let other = ShardedExecutor::start(1).unwrap();
+        let local = ShardLocal::new(owner.submitter(), |_| 0usize);
+        let foreign = local.clone();
+        let results = block_on(
+            other
+                .spawn_with_handle_on(ShardId(0), async move {
+                    (
+                        foreign.with_current(|_, value| {
+                            *value = 1;
+                        }),
+                        foreign.with_current_result(|value| {
+                            *value = 2;
+                        }),
+                        foreign.get_current(),
+                    )
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(results.0, Err(ShardLocalAccessError::WrongRuntime));
+        assert_eq!(results.1, Err(ShardLocalAccessError::WrongRuntime));
+        assert_eq!(results.2, Err(ShardLocalAccessError::WrongRuntime));
+        assert_eq!(
+            block_on(local.map_all(|_, value| *value)).unwrap(),
+            vec![(ShardId(0), 0)]
+        );
+        drop(local);
+        other.stop().unwrap();
+        owner.stop().unwrap();
+    }
 
     #[test]
     fn shard_local_values_are_accessed_on_owning_shards() {

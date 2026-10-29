@@ -17,8 +17,9 @@ use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{OwnedFd, last_os_error};
 
@@ -924,6 +925,53 @@ impl fmt::Debug for IoUring {
     }
 }
 
+/// Thread-safe result handle for an executor-owned buffer. Until completion,
+/// only the originating dispatcher may access the buffer. Keeping an Arc in
+/// that dispatcher makes moving or dropping the future on another thread safe.
+pub(crate) struct OwnedIoOperation {
+    state: Mutex<OwnedIoState>,
+    owner_waker: Waker,
+}
+
+struct OwnedIoState {
+    buffer: Option<Vec<u8>>,
+    completion: Option<io::Result<IoUringOperationCompletion>>,
+    waker: Option<Waker>,
+    abandoned: bool,
+}
+
+impl OwnedIoOperation {
+    pub(crate) fn poll(
+        &self,
+        context: &mut Context<'_>,
+    ) -> Poll<io::Result<(IoUringOperationCompletion, Vec<u8>)>> {
+        let waker = context.waker().clone();
+        let mut state = self.state.lock().expect("owned I/O state mutex poisoned");
+        if let Some(completion) = state.completion.take() {
+            return Poll::Ready(completion.map(|completion| {
+                (
+                    completion,
+                    state.buffer.take().expect("completed owned buffer"),
+                )
+            }));
+        }
+        let previous = state.waker.replace(waker);
+        drop(state);
+        drop(previous);
+        Poll::Pending
+    }
+
+    pub(crate) fn abandon(&self) {
+        let waker = {
+            let mut state = self.state.lock().expect("owned I/O state mutex poisoned");
+            state.abandoned = true;
+            state.waker.take()
+        };
+        drop(waker);
+        self.owner_waker.wake_by_ref();
+    }
+}
+
 /// Dispatches tracked `io_uring` completions to registered task wakers.
 ///
 /// This is the first bridge from the raw completion queue to async scheduling.
@@ -936,6 +984,7 @@ pub struct IoUringDispatcher {
     completions: HashMap<IoUringOperationId, IoUringOperationCompletion>,
     abandoned_operations: HashMap<IoUringOperationId, IoUringOperationKind>,
     deferred_buffers: HashMap<IoUringOperationId, Vec<u8>>,
+    owned_operations: HashMap<IoUringOperationId, Arc<OwnedIoOperation>>,
     last_shutdown_drain: Option<IoUringShutdownDrainSnapshot>,
     total_dispatched_operations: usize,
     total_buffered_operations: usize,
@@ -948,6 +997,97 @@ pub struct IoUringDispatcher {
 }
 
 impl IoUringDispatcher {
+    /// Transfer the buffer to this dispatcher before publishing its pointer to
+    /// the kernel. The returned handle owns only synchronized result access.
+    pub(crate) fn queue_owned_buffer(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        buffer: Vec<u8>,
+        write: bool,
+        owner_waker: Waker,
+    ) -> io::Result<Arc<OwnedIoOperation>> {
+        let operation = Arc::new(OwnedIoOperation {
+            state: Mutex::new(OwnedIoState {
+                buffer: Some(buffer),
+                completion: None,
+                waker: None,
+                abandoned: false,
+            }),
+            owner_waker,
+        });
+        let id = {
+            let mut state = operation
+                .state
+                .lock()
+                .expect("owned I/O state mutex poisoned");
+            let buffer = state.buffer.as_mut().expect("new owned buffer");
+            // SAFETY: the dispatcher retains this operation and its allocation
+            // until the matching CQE. The result handle exposes no buffer
+            // access before completion, even if moved or dropped elsewhere.
+            unsafe {
+                if write {
+                    self.ring.queue_write_operation(fd, buffer, offset)?
+                } else {
+                    self.ring.queue_read_operation(fd, buffer, offset)?
+                }
+            }
+        };
+        self.owned_operations.insert(id, Arc::clone(&operation));
+        Ok(operation)
+    }
+
+    fn reap_abandoned_owned(&mut self) {
+        let abandoned: Vec<_> = self
+            .owned_operations
+            .iter()
+            .filter_map(|(id, operation)| {
+                operation
+                    .state
+                    .lock()
+                    .expect("owned I/O state mutex poisoned")
+                    .abandoned
+                    .then_some(*id)
+            })
+            .collect();
+        for id in abandoned {
+            let operation = self
+                .owned_operations
+                .remove(&id)
+                .expect("owned operation exists");
+            let buffer = operation
+                .state
+                .lock()
+                .expect("owned I/O state mutex poisoned")
+                .buffer
+                .take();
+            if let Some(buffer) = buffer {
+                self.defer_buffer_drop(id, buffer);
+            }
+        }
+    }
+
+    pub(crate) fn retire_owned_operations(&mut self) {
+        for (id, operation) in std::mem::take(&mut self.owned_operations) {
+            let (buffer, waker) = {
+                let mut state = operation
+                    .state
+                    .lock()
+                    .expect("owned I/O state mutex poisoned");
+                state.completion = Some(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "originating I/O dispatcher shut down",
+                )));
+                (state.buffer.take(), state.waker.take())
+            };
+            if let Some(buffer) = buffer {
+                self.defer_buffer_drop(id, buffer);
+            }
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
     /// Creates a dispatcher around an existing ring.
     pub fn new(ring: IoUring) -> Self {
         Self {
@@ -956,6 +1096,7 @@ impl IoUringDispatcher {
             completions: HashMap::new(),
             abandoned_operations: HashMap::new(),
             deferred_buffers: HashMap::new(),
+            owned_operations: HashMap::new(),
             last_shutdown_drain: None,
             total_dispatched_operations: 0,
             total_buffered_operations: 0,
@@ -1072,6 +1213,7 @@ impl IoUringDispatcher {
     /// delivery to have an explicit per-tick budget. A zero limit does not
     /// inspect the completion queue.
     pub fn dispatch_available_limit(&mut self, limit: usize) -> usize {
+        self.reap_abandoned_owned();
         let mut dispatched = 0;
         while dispatched < limit {
             let Some(completion) = self.ring.try_operation_completion() else {
@@ -1080,6 +1222,30 @@ impl IoUringDispatcher {
             let operation = completion.operation;
             self.total_dispatched_operations += 1;
             self.total_dispatched_operation_kinds.add(completion.kind);
+            if let Some(operation) = self.owned_operations.remove(&completion.operation) {
+                let (waker, discarded) = {
+                    let mut state = operation
+                        .state
+                        .lock()
+                        .expect("owned I/O state mutex poisoned");
+                    state.completion = Some(Ok(completion));
+                    (state.waker.take(), state.abandoned)
+                };
+                if discarded {
+                    self.total_discarded_operations += 1;
+                    self.total_discarded_operation_kinds.add(completion.kind);
+                } else {
+                    self.total_buffered_operations += 1;
+                    self.total_buffered_operation_kinds.add(completion.kind);
+                }
+                if let Some(waker) = waker {
+                    self.total_woken_operations += 1;
+                    self.total_woken_operation_kinds.add(completion.kind);
+                    waker.wake();
+                }
+                dispatched += 1;
+                continue;
+            }
             if self.abandoned_operations.remove(&operation).is_some() {
                 self.deferred_buffers.remove(&operation);
                 self.total_discarded_operations += 1;
@@ -1158,7 +1324,9 @@ impl IoUringDispatcher {
     ///   those operations' owned buffers belong to live futures that will
     ///   release them when dropped;
     /// - otherwise it makes a bounded attempt to drive remaining operations to
-    ///   completion so their buffers are freed normally;
+    ///   completion so their buffers are freed normally, using at most
+    ///   `max_waits` nonblocking submission/poll cycles and one monotonic budget
+    ///   of `max_waits` milliseconds (no individual poll exceeds 1 ms);
     /// - if the bounded attempt cannot confirm completion, the owned buffers
     ///   backing operations the kernel may still touch are leaked rather than
     ///   freed. Leaking memory is recoverable; a kernel write to freed memory
@@ -1167,7 +1335,8 @@ impl IoUringDispatcher {
     /// The outcome is also recorded so it appears in later
     /// [`IoUringDispatcher::snapshot`] results.
     pub fn shutdown_drain(&mut self, max_waits: usize) -> IoUringShutdownDrainSnapshot {
-        if !self.waiters.is_empty() {
+        self.reap_abandoned_owned();
+        if !self.waiters.is_empty() || !self.owned_operations.is_empty() {
             let outcome = IoUringShutdownDrainSnapshot {
                 status: IoUringShutdownDrainStatus::SkippedLiveWakers,
                 max_waits,
@@ -1180,6 +1349,9 @@ impl IoUringDispatcher {
 
         let mut dispatched = self.dispatch_available();
         let mut waits = 0;
+        let budget = Duration::from_millis(u64::try_from(max_waits).unwrap_or(u64::MAX));
+        let started = Instant::now();
+        let reactor = super::OsReactor::new();
         while !self.is_idle() && waits < max_waits {
             let snapshot = self.snapshot();
             if snapshot.ring.pending_submissions == 0
@@ -1188,10 +1360,27 @@ impl IoUringDispatcher {
             {
                 break;
             }
-            match self.wait_and_dispatch(1) {
-                Ok(count) => dispatched += count,
-                Err(_) => break,
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() || self.submit_pending().is_err() {
+                break;
             }
+            let Ok(reactor) = reactor.as_ref() else {
+                break;
+            };
+            // Waiting for one CQE through io_uring_enter(GETEVENTS) has no
+            // deadline. Poll the completion fd with the remaining monotonic
+            // budget instead, so one stuck operation cannot hang teardown.
+            if reactor
+                .wait_io(
+                    &[self.raw_fd()],
+                    &[],
+                    Some(remaining.min(Duration::from_millis(1))),
+                )
+                .is_err()
+            {
+                break;
+            }
+            dispatched += self.dispatch_available();
             waits += 1;
         }
 
@@ -1244,7 +1433,18 @@ impl IoUringDispatcher {
 
         IoUringDispatcherSnapshot {
             ring: self.ring.snapshot(),
-            registered_wakers: self.waiters.len(),
+            registered_wakers: self.waiters.len()
+                + self
+                    .owned_operations
+                    .values()
+                    .filter(|operation| {
+                        !operation
+                            .state
+                            .lock()
+                            .expect("owned I/O state mutex poisoned")
+                            .abandoned
+                    })
+                    .count(),
             completed_operations: self.completions.len(),
             completed_operation_kinds,
             abandoned_operations: self.abandoned_operations.len(),
@@ -1274,6 +1474,7 @@ impl Drop for IoUringDispatcher {
         // waker can ever be driven again. Clearing them ensures `shutdown_drain`
         // takes the drain-or-leak path instead of skipping on stale wakers.
         self.waiters.clear();
+        self.retire_owned_operations();
 
         // Bounded best effort to complete in-flight operations and free their
         // buffers; anything still in flight is leaked rather than freed so the
@@ -2728,6 +2929,31 @@ mod tests {
         assert_eq!(dispatcher.borrow().snapshot().deferred_buffers, 0);
         assert_eq!(dispatcher.borrow().snapshot().abandoned_operations, 0);
         assert_eq!(dispatcher.borrow().snapshot().completed_operations, 0);
+    }
+
+    #[test]
+    fn shutdown_drain_deadline_does_not_wait_for_a_long_running_operation() {
+        let Some(ring) = available_ring() else {
+            return;
+        };
+        let mut dispatcher = IoUringDispatcher::new(ring);
+        let operation = dispatcher
+            .ring_mut()
+            .queue_timeout_operation(Duration::from_secs(60))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let outcome = dispatcher.shutdown_drain(2);
+        assert_eq!(outcome.status, super::IoUringShutdownDrainStatus::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Complete both tracked records so the regression test itself leaves
+        // no long-running timer or deferred teardown behind.
+        let cancel = dispatcher
+            .ring_mut()
+            .queue_cancel_operation(operation)
+            .unwrap();
+        dispatcher.wait_and_dispatch(2).unwrap();
+        assert!(dispatcher.take_completion(operation).is_some());
+        assert!(dispatcher.take_completion(cancel).is_some());
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub use uring::{
     block_on_io_uring_all,
 };
 
+#[cfg(target_os = "linux")]
+pub(crate) use uring::OwnedIoOperation;
+
 /// Returns whether `SITAS_REQUIRE_IO_URING` requests strict `io_uring`
 /// availability.
 #[cfg(target_os = "linux")]

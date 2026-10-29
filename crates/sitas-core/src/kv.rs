@@ -19,7 +19,9 @@ use crate::placement::{HashPlacement, Placement, ShardPlacement};
 use crate::reactor_backend::ReactorBackend;
 use crate::shard::ShardId;
 use crate::shard_executor::ShardExecutor;
-use crate::shard_runtime::{ShardParker, ShardReceiver, ShardRuntime, ShardSender};
+use crate::shard_runtime::{
+    ShardParker, ShardReceiver, ShardRuntime, ShardSender, ShardThread, channel,
+};
 
 /// Upper bound on one park/wait while waiting for a message or reply. Parks
 /// are a latency optimisation, not a correctness dependency: a lost or stolen
@@ -50,7 +52,7 @@ impl ShardedKvConfig {
         if self.shard_count == 0 {
             return Err(ShardError::InvalidShardCount);
         }
-        if self.mailbox_capacity == 0 {
+        if self.mailbox_capacity < 2 {
             return Err(ShardError::InvalidMailboxCapacity);
         }
         Ok(self)
@@ -60,6 +62,7 @@ impl ShardedKvConfig {
 pub struct ShardedKv {
     shards: Vec<KvShardHandle>,
     parker: Arc<dyn ShardParker>,
+    joins: Vec<Box<dyn FnOnce() -> Result<(), ShardError> + Send>>,
 }
 
 impl ShardedKv {
@@ -69,7 +72,11 @@ impl ShardedKv {
     {
         let config = config.validate()?;
         let parker = runtime.parker();
-        let mut shards = Vec::with_capacity(config.shard_count);
+        let mut service = Self {
+            shards: Vec::with_capacity(config.shard_count),
+            parker: Arc::clone(&parker),
+            joins: Vec::with_capacity(config.shard_count),
+        };
 
         for index in 0..config.shard_count {
             let (sender, receiver) = runtime
@@ -79,12 +86,15 @@ impl ShardedKv {
             let shard_parker = Arc::clone(&parker);
             let shard_id = ShardId(index);
             let reactor = runtime.shard_reactor(shard_id);
-            runtime.spawn_shard(
+            let join = runtime.spawn_shard(
                 shard_id,
                 ShardPlacement::Sequential,
                 Box::new(move || run_kv_shard(receiver, shard_parker, reactor)),
             );
-            shards.push(KvShardHandle {
+            service.joins.push(Box::new(move || {
+                join.join().map_err(|_| ShardError::ThreadJoinFailed)
+            }));
+            service.shards.push(KvShardHandle {
                 id: shard_id,
                 sender,
                 stopped,
@@ -92,7 +102,28 @@ impl ShardedKv {
             });
         }
 
-        Ok(Self { shards, parker })
+        Ok(service)
+    }
+
+    /// Close all mailboxes and join every serving thread. After this returns
+    /// successfully all shard-local state and task futures have been dropped.
+    pub fn shutdown(&mut self) -> Result<(), ShardError> {
+        for shard in &self.shards {
+            shard.stopped.store(true, Ordering::Release);
+            shard.sender.close();
+        }
+        self.parker.unpark();
+        let mut result = Ok(());
+        for join in self.joins.drain(..) {
+            if let Err(error) = join() {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    pub fn stop(mut self) -> Result<(), ShardError> {
+        self.shutdown()
     }
 
     pub fn put(&self, key: &str, value: &str) -> Result<(), ShardError> {
@@ -140,18 +171,24 @@ impl KvShardHandle {
         if self.stopped.load(Ordering::Acquire) {
             return Err(ShardError::ShardStopped);
         }
-        let reply = Arc::new(crate::ringbuf::RingBuffer::bounded(2));
+        let (reply_sender, reply_receiver) = channel(2).expect("valid one-shot capacity");
         self.sender
             .try_send(KvEnvelope {
                 command,
-                reply: Arc::clone(&reply),
+                reply: reply_sender,
             })
-            .map_err(|_| ShardError::MailboxFull)?;
+            .map_err(|_| {
+                if self.sender.is_closed() {
+                    ShardError::ShardStopped
+                } else {
+                    ShardError::MailboxFull
+                }
+            })?;
         // Release the serving shard's park so it observes the new message.
         self.parker.unpark();
         let _ = self.id;
         Ok(KvReply {
-            reply,
+            reply: reply_receiver,
             parker: Arc::clone(&self.parker),
         })
     }
@@ -165,7 +202,7 @@ enum KvCommand {
 
 struct KvEnvelope {
     command: KvCommand,
-    reply: Arc<crate::ringbuf::RingBuffer<KvReplyValue>>,
+    reply: ShardSender<KvReplyValue>,
 }
 
 enum KvReplyValue {
@@ -175,7 +212,7 @@ enum KvReplyValue {
 }
 
 struct KvReply {
-    reply: Arc<crate::ringbuf::RingBuffer<KvReplyValue>>,
+    reply: ShardReceiver<KvReplyValue>,
     parker: Arc<dyn ShardParker>,
 }
 
@@ -205,10 +242,15 @@ impl KvReply {
     /// checks. The serving shard `unpark`s us after it pushes the reply, so a
     /// park normally lasts only until that wake; the bounded interval makes a
     /// stolen or coalesced wake self-healing.
-    fn recv(self) -> Result<KvReplyValue, ShardError> {
+    fn recv(mut self) -> Result<KvReplyValue, ShardError> {
         loop {
-            if let Some(value) = self.reply.pop() {
+            if let Some(value) = self.reply.try_recv() {
                 return Ok(value);
+            }
+            if self.reply.is_closed() {
+                // Closure can race the first dequeue. Drain a reply accepted
+                // before closure before reporting worker failure.
+                return self.reply.try_recv().ok_or(ShardError::ReplyFailed);
             }
             self.parker.park(Some(PARK_TIMEOUT));
         }
@@ -241,7 +283,7 @@ async fn kv_shard_task(mut receiver: ShardReceiver<KvEnvelope>, parker: Arc<dyn 
             }
             KvCommand::Len => KvReplyValue::Usize(map.len()),
         };
-        let _ = envelope.reply.try_push(value);
+        let _ = envelope.reply.try_send(value);
         // Release the requester parked on this reply.
         parker.unpark();
     }
@@ -249,12 +291,6 @@ async fn kv_shard_task(mut receiver: ShardReceiver<KvEnvelope>, parker: Arc<dyn 
 
 impl Drop for ShardedKv {
     fn drop(&mut self) {
-        for shard in &self.shards {
-            shard.stopped.store(true, Ordering::Release);
-            shard.sender.close();
-        }
-        // Release any shard or requester parked on the shared queue so they
-        // observe the shutdown promptly rather than waiting out an interval.
-        self.parker.unpark();
+        let _ = self.shutdown();
     }
 }

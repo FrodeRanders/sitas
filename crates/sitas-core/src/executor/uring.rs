@@ -13,13 +13,16 @@ use std::io;
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Weak};
+use std::task::{Context, Poll, Wake, Waker};
 
 use crate::os::{
-    IoUringDispatcher, IoUringDispatcherSnapshot, IoUringOperationCompletion, IoUringOperationId,
-    IoUringShutdownDrainSnapshot, IoUringShutdownDrainStatus, available_io_uring,
+    IoUringDispatcher, IoUringDispatcherSnapshot, IoUringShutdownDrainSnapshot,
+    IoUringShutdownDrainStatus, OwnedIoOperation, available_io_uring,
 };
 
+use super::current::current_scheduler;
+use super::scheduler::Scheduler;
 use super::{IoUringExecutorStatus, scheduling_group::ExecutorId};
 
 type SharedDispatcher = crate::os::SharedIoUringDispatcher;
@@ -55,9 +58,12 @@ impl Drop for ExecutorIoUringScope {
 /// Returns a future that reads up to `buffer.len()` bytes from `fd` at
 /// `offset` through the current executor's Linux `io_uring` backend.
 ///
-/// The returned future owns its buffer, so it is safe to move across threads
-/// before it is first polled. It must be polled by a sitas executor running on
-/// Linux with `io_uring` available.
+/// First submission requires a sitas executor on Linux with `io_uring`
+/// available. The originating dispatcher then owns the buffer until completion;
+/// the future may be moved, polled, or dropped on another thread. The origin
+/// must continue driving completions. Destroying it fails pending result handles
+/// with [`io::ErrorKind::BrokenPipe`] while retaining any in-flight buffer safely.
+/// The raw descriptor is borrowed, not owned: keep it open through the operation.
 pub fn read_at_uring(fd: RawFd, offset: u64, buffer: Vec<u8>) -> ReadAtUring {
     ReadAtUring {
         fd,
@@ -138,7 +144,7 @@ pub struct ReadAtUring {
     fd: RawFd,
     offset: u64,
     buffer: Option<Vec<u8>>,
-    operation: Option<IoUringOperationId>,
+    operation: Option<Arc<OwnedIoOperation>>,
 }
 
 impl Future for ReadAtUring {
@@ -146,73 +152,32 @@ impl Future for ReadAtUring {
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let dispatcher = match current_dispatcher() {
-            Some(dispatcher) => dispatcher,
-            None => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "executor io_uring backend is unavailable",
-                )));
-            }
-        };
-
-        if let Err(error) = this.ensure_queued(Rc::clone(&dispatcher)) {
-            return Poll::Ready(Err(error));
-        }
-
-        match poll_operation(Rc::clone(&dispatcher), this.operation.unwrap(), context) {
-            Poll::Ready(Ok(completion)) => {
-                let read = match completion_result_to_usize(completion.result, "read") {
-                    Ok(read) => read,
+        if this.operation.is_none() {
+            this.operation = Some(
+                match queue_owned(this.fd, this.offset, &mut this.buffer, false) {
+                    Ok(operation) => operation,
                     Err(error) => return Poll::Ready(Err(error)),
-                };
-                let mut buffer = this
-                    .buffer
-                    .take()
-                    .expect("read buffer exists until completion");
-                buffer.truncate(read);
+                },
+            );
+        }
+        match this.operation.as_ref().unwrap().poll(context) {
+            Poll::Ready(result) => {
                 this.operation = None;
-                Poll::Ready(Ok(buffer))
+                Poll::Ready(result.and_then(|(completion, mut buffer)| {
+                    let read = completion_result_to_usize(completion.result, "read")?;
+                    buffer.truncate(read);
+                    Ok(buffer)
+                }))
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-impl ReadAtUring {
-    fn ensure_queued(&mut self, dispatcher: SharedDispatcher) -> io::Result<()> {
-        if self.operation.is_some() {
-            return Ok(());
-        }
-
-        let buffer = self
-            .buffer
-            .as_mut()
-            .expect("read buffer exists until queued");
-        let operation = {
-            let mut dispatcher = dispatcher.borrow_mut();
-            // SAFETY: the buffer is owned by this future and remains alive
-            // until the operation completes or is transferred to the dispatcher
-            // on drop.
-            unsafe {
-                dispatcher
-                    .ring_mut()
-                    .queue_read_operation(self.fd, buffer, self.offset)?
-            }
-        };
-        self.operation = Some(operation);
-        Ok(())
-    }
-}
-
 impl Drop for ReadAtUring {
     fn drop(&mut self) {
-        let (Some(operation), Some(buffer)) = (self.operation, self.buffer.take()) else {
-            return;
-        };
-        if let Some(dispatcher) = current_dispatcher() {
-            dispatcher.borrow_mut().defer_buffer_drop(operation, buffer);
+        if let Some(operation) = self.operation.take() {
+            operation.abandon();
         }
     }
 }
@@ -233,7 +198,7 @@ pub struct WriteAtUring {
     fd: RawFd,
     offset: u64,
     buffer: Option<Vec<u8>>,
-    operation: Option<IoUringOperationId>,
+    operation: Option<Arc<OwnedIoOperation>>,
 }
 
 impl Future for WriteAtUring {
@@ -241,95 +206,67 @@ impl Future for WriteAtUring {
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let dispatcher = match current_dispatcher() {
-            Some(dispatcher) => dispatcher,
-            None => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "executor io_uring backend is unavailable",
-                )));
-            }
-        };
-
-        if let Err(error) = this.ensure_queued(Rc::clone(&dispatcher)) {
-            return Poll::Ready(Err(error));
-        }
-
-        match poll_operation(Rc::clone(&dispatcher), this.operation.unwrap(), context) {
-            Poll::Ready(Ok(completion)) => {
-                let bytes = match completion_result_to_usize(completion.result, "write") {
-                    Ok(bytes) => bytes,
+        if this.operation.is_none() {
+            this.operation = Some(
+                match queue_owned(this.fd, this.offset, &mut this.buffer, true) {
+                    Ok(operation) => operation,
                     Err(error) => return Poll::Ready(Err(error)),
-                };
-                let buffer = this
-                    .buffer
-                    .take()
-                    .expect("write buffer exists until completion");
+                },
+            );
+        }
+        match this.operation.as_ref().unwrap().poll(context) {
+            Poll::Ready(result) => {
                 this.operation = None;
-                Poll::Ready(Ok(WriteAtUringCompletion { bytes, buffer }))
+                Poll::Ready(result.and_then(|(completion, buffer)| {
+                    let bytes = completion_result_to_usize(completion.result, "write")?;
+                    Ok(WriteAtUringCompletion { bytes, buffer })
+                }))
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-impl WriteAtUring {
-    fn ensure_queued(&mut self, dispatcher: SharedDispatcher) -> io::Result<()> {
-        if self.operation.is_some() {
-            return Ok(());
-        }
-
-        let buffer = self
-            .buffer
-            .as_ref()
-            .expect("write buffer exists until queued");
-        let operation = {
-            let mut dispatcher = dispatcher.borrow_mut();
-            // SAFETY: the buffer is owned by this future and remains alive
-            // until the operation completes or is transferred to the dispatcher
-            // on drop.
-            unsafe {
-                dispatcher
-                    .ring_mut()
-                    .queue_write_operation(self.fd, buffer, self.offset)?
-            }
-        };
-        self.operation = Some(operation);
-        Ok(())
-    }
-}
-
 impl Drop for WriteAtUring {
     fn drop(&mut self) {
-        let (Some(operation), Some(buffer)) = (self.operation, self.buffer.take()) else {
-            return;
-        };
-        if let Some(dispatcher) = current_dispatcher() {
-            dispatcher.borrow_mut().defer_buffer_drop(operation, buffer);
+        if let Some(operation) = self.operation.take() {
+            operation.abandon();
         }
     }
 }
 
-fn poll_operation(
-    dispatcher: SharedDispatcher,
-    operation: IoUringOperationId,
-    context: &mut Context<'_>,
-) -> Poll<io::Result<IoUringOperationCompletion>> {
-    let mut dispatcher = dispatcher.borrow_mut();
-    dispatcher.dispatch_available();
-
-    if let Some(completion) = dispatcher.take_completion(operation) {
-        return Poll::Ready(Ok(completion));
+struct OwnerWake(Weak<Scheduler>);
+impl Wake for OwnerWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
     }
-
-    if dispatcher.register_waker(operation, context.waker())
-        && let Some(completion) = dispatcher.take_completion(operation)
-    {
-        return Poll::Ready(Ok(completion));
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Some(scheduler) = self.0.upgrade() {
+            scheduler.wake_reactor();
+        }
     }
+}
 
-    Poll::Pending
+fn queue_owned(
+    fd: RawFd,
+    offset: u64,
+    buffer: &mut Option<Vec<u8>>,
+    write: bool,
+) -> io::Result<Arc<OwnedIoOperation>> {
+    let dispatcher = current_dispatcher().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "executor io_uring backend is unavailable",
+        )
+    })?;
+    let waker = Waker::from(Arc::new(OwnerWake(Arc::downgrade(&current_scheduler()))));
+    dispatcher.borrow_mut().queue_owned_buffer(
+        fd,
+        offset,
+        buffer.take().expect("buffer exists until submission"),
+        write,
+        waker,
+    )
 }
 
 fn completion_result_to_usize(result: i32, operation: &str) -> io::Result<usize> {
@@ -399,6 +336,34 @@ pub(super) fn shutdown_current(
             Some(shutdown_dispatcher(&mut dispatcher)),
         )
     })
+}
+
+/// Final executor destruction differs from a resumable run_until return:
+/// no later run can drive its pending operations. Fail result handles and
+/// transfer every still-live buffer through the dispatcher's drain-or-leak path.
+pub(super) fn close_current(
+    owner: ExecutorId,
+) -> (IoUringExecutorStatus, Option<IoUringDispatcherSnapshot>) {
+    let installed = CURRENT_IO_URING.with(|current| {
+        let mut current = current.borrow_mut();
+        if current
+            .as_ref()
+            .is_some_and(|installed| installed.owner == owner)
+        {
+            current.take()
+        } else {
+            None
+        }
+    });
+    let Some(installed) = installed else {
+        return (IoUringExecutorStatus::Unavailable, None);
+    };
+    let mut dispatcher = installed.dispatcher.borrow_mut();
+    dispatcher.retire_owned_operations();
+    (
+        IoUringExecutorStatus::Shutdown,
+        Some(shutdown_dispatcher(&mut dispatcher)),
+    )
 }
 
 pub(super) fn status() -> IoUringExecutorStatus {
@@ -520,5 +485,136 @@ mod tests {
         assert_eq!(drain.status, IoUringShutdownDrainStatus::TimedOut);
         assert_eq!(drain.dispatched, 0);
         assert_eq!(snapshot.completed_operations, 1);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::executor::{executor_and_spawner, sleep};
+    use std::io::{Read, Write};
+    use std::os::unix::{io::AsRawFd, net::UnixStream};
+    use std::time::Duration;
+
+    fn suspend<F: Future + Unpin>(executor: &crate::executor::Executor, mut future: F) -> F {
+        executor.run_until(std::future::poll_fn(|cx| {
+            assert!(Pin::new(&mut future).poll(cx).is_pending());
+            Poll::Ready(())
+        }));
+        future
+    }
+
+    #[test]
+    fn pending_read_can_be_dropped_on_a_foreign_executor() {
+        if available_io_uring(8).unwrap().is_none() {
+            return;
+        }
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let (executor, spawner) = executor_and_spawner();
+        drop(spawner);
+        let future = suspend(
+            &executor,
+            read_at_uring(reader.as_raw_fd(), u64::MAX, vec![0; 32]),
+        );
+        executor.run_until(sleep(Duration::from_millis(1)));
+        assert_eq!(
+            executor
+                .snapshot()
+                .io_uring
+                .unwrap()
+                .ring
+                .pending_submissions,
+            0
+        );
+        std::thread::spawn(move || {
+            crate::executor::block_on(async move {
+                drop(future);
+            })
+        })
+        .join()
+        .unwrap();
+        executor.run();
+        let snapshot = executor.snapshot().io_uring.unwrap();
+        assert_eq!(snapshot.registered_wakers, 0);
+        assert_eq!(snapshot.ring.tracked_operations, 0);
+        assert_eq!(snapshot.deferred_buffers, 0);
+    }
+
+    #[test]
+    fn completed_read_can_be_consumed_on_another_thread_after_origin_shutdown() {
+        if available_io_uring(8).unwrap().is_none() {
+            return;
+        }
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"owned").unwrap();
+        let (executor, spawner) = executor_and_spawner();
+        drop(spawner);
+        let future = suspend(
+            &executor,
+            read_at_uring(reader.as_raw_fd(), u64::MAX, vec![0; 5]),
+        );
+        executor.run_until(async {
+            crate::executor::timeout(Duration::from_secs(2), async {
+                while executor
+                    .snapshot()
+                    .io_uring
+                    .is_some_and(|snapshot| snapshot.registered_wakers > 0)
+                {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        drop(executor);
+        let output = std::thread::spawn(move || crate::executor::block_on(future))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(output, b"owned");
+    }
+
+    #[test]
+    fn pending_write_can_be_dropped_on_another_thread() {
+        if available_io_uring(8).unwrap().is_none() {
+            return;
+        }
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        let (executor, spawner) = executor_and_spawner();
+        drop(spawner);
+        let future = suspend(
+            &executor,
+            write_at_uring(writer.as_raw_fd(), u64::MAX, b"owned".to_vec()),
+        );
+        std::thread::spawn(move || drop(future)).join().unwrap();
+        executor.run();
+        let snapshot = executor.snapshot().io_uring.unwrap();
+        assert_eq!(snapshot.registered_wakers, 0);
+        assert_eq!(snapshot.ring.tracked_operations, 0);
+        assert_eq!(snapshot.deferred_buffers, 0);
+        // A submitted write may win its cancellation race. Closing the writer
+        // makes either result observable without waiting on a missing payload.
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty() || bytes == b"owned");
+    }
+
+    #[test]
+    fn origin_drop_fails_a_live_future_without_releasing_an_inflight_buffer() {
+        if available_io_uring(8).unwrap().is_none() {
+            return;
+        }
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let (executor, spawner) = executor_and_spawner();
+        drop(spawner);
+        let future = suspend(
+            &executor,
+            read_at_uring(reader.as_raw_fd(), u64::MAX, vec![0; 32]),
+        );
+        executor.run_until(sleep(Duration::from_millis(1)));
+        drop(executor);
+        let error = crate::executor::block_on(future).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 }

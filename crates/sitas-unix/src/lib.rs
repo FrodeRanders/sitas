@@ -49,7 +49,7 @@ impl Default for UnixRuntime {
 }
 
 impl ShardRuntime for UnixRuntime {
-    type JoinHandle<T: Send> = ShardJoinHandle<T>;
+    type JoinHandle<T: Send + 'static> = ShardJoinHandle<T>;
     type Reactor = OsReactor;
 
     fn spawn_shard<T: Send + 'static>(
@@ -213,5 +213,169 @@ mod tests {
     fn park_with_timeout_returns() {
         let runtime = UnixRuntime::new();
         runtime.parker().park(Some(Duration::from_millis(10)));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use sitas_core::{ShardError, shard_runtime::ShardChannelError};
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    struct ObservedRuntime {
+        inner: UnixRuntime,
+        completed: Arc<AtomicUsize>,
+        channels: AtomicUsize,
+        fail_channel_at: usize,
+        exit_gate: Option<Arc<Barrier>>,
+        exits: Option<mpsc::Sender<()>>,
+        panic_worker: bool,
+    }
+    impl ObservedRuntime {
+        fn new() -> Self {
+            Self {
+                inner: UnixRuntime::new(),
+                completed: Arc::new(AtomicUsize::new(0)),
+                channels: AtomicUsize::new(0),
+                fail_channel_at: usize::MAX,
+                exit_gate: None,
+                exits: None,
+                panic_worker: false,
+            }
+        }
+    }
+    impl ShardRuntime for ObservedRuntime {
+        type JoinHandle<T: Send + 'static> = ShardJoinHandle<T>;
+        type Reactor = OsReactor;
+        fn spawn_shard<T: Send + 'static>(
+            &self,
+            shard: ShardId,
+            placement: ShardPlacement,
+            entry: Box<dyn FnOnce() -> T + Send>,
+        ) -> ShardJoinHandle<T> {
+            let completed = Arc::clone(&self.completed);
+            let exit_gate = self.exit_gate.clone();
+            let exits = self.exits.clone();
+            let panic_worker = self.panic_worker;
+            self.inner.spawn_shard(
+                shard,
+                placement,
+                Box::new(move || {
+                    struct Completed(Arc<AtomicUsize>);
+                    impl Drop for Completed {
+                        fn drop(&mut self) {
+                            self.0.fetch_add(1, Ordering::Release);
+                        }
+                    }
+                    let _completed = Completed(completed);
+                    if panic_worker {
+                        drop(entry);
+                        panic!("injected worker failure");
+                    }
+                    let result = entry();
+                    if let Some(exits) = exits {
+                        exits.send(()).unwrap();
+                    }
+                    if let Some(gate) = exit_gate {
+                        gate.wait();
+                    }
+                    result
+                }),
+            )
+        }
+        fn channel<M: Send + 'static>(&self, capacity: usize) -> ShardChannelResult<M> {
+            if self.channels.fetch_add(1, Ordering::Relaxed) == self.fail_channel_at {
+                Err(ShardChannelError::InvalidCapacity)
+            } else {
+                channel(capacity)
+            }
+        }
+        fn sleep(&self, duration: Duration) {
+            self.inner.sleep(duration);
+        }
+        fn parker(&self) -> Arc<dyn ShardParker> {
+            self.inner.parker()
+        }
+        fn shard_reactor(&self, shard: ShardId) -> OsReactor {
+            self.inner.shard_reactor(shard)
+        }
+    }
+
+    #[test]
+    fn kv_explicit_stop_and_drop_join_worker_destructors() {
+        use sitas_core::kv::{ShardedKv, ShardedKvConfig};
+        for explicit in [false, true] {
+            let mut runtime = ObservedRuntime::new();
+            let gate = Arc::new(Barrier::new(3));
+            let (exit_tx, exit_rx) = mpsc::channel();
+            runtime.exit_gate = Some(Arc::clone(&gate));
+            runtime.exits = Some(exit_tx);
+            let kv = ShardedKv::start_with_runtime(ShardedKvConfig::new(2), &runtime).unwrap();
+            kv.put("key", "value").unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let shutdown = std::thread::spawn(move || {
+                if explicit {
+                    kv.stop().unwrap();
+                } else {
+                    drop(kv);
+                }
+                done_tx.send(()).unwrap();
+            });
+            exit_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            exit_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let returned_early = done_rx.try_recv().is_ok();
+            gate.wait();
+            shutdown.join().unwrap();
+            assert!(
+                !returned_early,
+                "KV returned before worker destructors finished"
+            );
+            assert_eq!(runtime.completed.load(Ordering::Acquire), 2);
+        }
+    }
+
+    #[test]
+    fn kv_partial_startup_closes_and_joins_started_workers() {
+        use sitas_core::kv::{ShardedKv, ShardedKvConfig};
+        let mut runtime = ObservedRuntime::new();
+        runtime.fail_channel_at = 1;
+        let error = ShardedKv::start_with_runtime(ShardedKvConfig::new(2), &runtime).err();
+        assert_eq!(error, Some(ShardError::InvalidMailboxCapacity));
+        assert_eq!(runtime.completed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn kv_worker_failure_rejects_requests_and_reports_join_failure() {
+        use sitas_core::kv::{ShardedKv, ShardedKvConfig};
+        let mut runtime = ObservedRuntime::new();
+        runtime.panic_worker = true;
+        let mut kv = ShardedKv::start_with_runtime(ShardedKvConfig::new(1), &runtime).unwrap();
+        let start = std::time::Instant::now();
+        while runtime.completed.load(Ordering::Acquire) == 0
+            && start.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(runtime.completed.load(Ordering::Acquire), 1);
+        assert_eq!(kv.put("key", "value"), Err(ShardError::ShardStopped));
+        assert_eq!(kv.shutdown(), Err(ShardError::ThreadJoinFailed));
+        assert_eq!(kv.shutdown(), Ok(()));
+    }
+
+    #[test]
+    fn mailbox_index_worker_failure_closes_channels_and_joins() {
+        let mut runtime = ObservedRuntime::new();
+        runtime.panic_worker = true;
+        let mut result = 0;
+        // SAFETY: result remains a live, uniquely borrowed u32 for this call.
+        unsafe {
+            sitas_core::mailbox_index::mailbox_index_test(&runtime, &mut result);
+        }
+        assert_eq!(result, sitas_core::mailbox_index::FAILURE_SENTINEL);
+        assert_eq!(runtime.completed.load(Ordering::Acquire), 5);
     }
 }

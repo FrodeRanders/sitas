@@ -24,17 +24,21 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 
 use sitas_core::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker};
 use sitas_core::shard::ShardId;
-use sitas_core::shard_runtime::{ShardParker, ShardRuntime};
+use sitas_core::shard_runtime::{ShardParker, ShardRuntime, ShardThread};
 use spin::Mutex;
 
 /// The virtual address where the default (queue 0) CQ ring is mapped.
+#[cfg(target_os = "none")]
 const CQ_RING_VADDR: usize = 0x0000_0000_0001_1000;
 /// The canonical config page (kernel↔user contract).
 const CONFIG_VADDR: usize = 0x0000_0000_0001_0000;
@@ -48,6 +52,7 @@ const SYSCALL_COMPLETION_SUBMIT: u16 = 1;
 const SYSCALL_COMPLETION_POLL: u16 = 3;
 const SYSCALL_COMPLETION_WAIT: u16 = 4;
 const SYSCALL_COMPLETION_CLOSE: u16 = 6;
+const SYSCALL_COMPLETION_CANCEL: u16 = 5;
 const SYSCALL_SPAWN_THREAD: u16 = 7;
 const SYSCALL_THREAD_EXIT: u16 = 8;
 const SYSCALL_CQ_WAIT_CHECKED: u16 = 88;
@@ -78,6 +83,9 @@ fn shard_cq_layout() -> (usize, usize) {
 type ShardEntry = (u64, Box<dyn FnOnce() + Send>);
 
 static SHARD_ENTRIES: Mutex<Vec<ShardEntry>> = Mutex::new(Vec::new());
+// Serializes userspace consumers, including legacy reactors sharing CQ 0.
+// Never held across a syscall or a task poll; kernel producers do not use it.
+static CQ_CONSUMER: Mutex<()> = Mutex::new(());
 
 // ---- syscall wrappers -------------------------------------------------------
 
@@ -92,10 +100,10 @@ unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 core::arch::asm!(
                     concat!("svc #", stringify!($number)),
                     lateout("x0") ret,
-                    in("x1") arg1,
-                    in("x2") arg2,
-                    in("x3") arg3,
-                    options(nostack, nomem, preserves_flags),
+                    inlateout("x1") arg1 => _,
+                    inlateout("x2") arg2 => _,
+                    inlateout("x3") arg3 => _,
+                    options(nostack, preserves_flags),
                 );
             }
             ret
@@ -110,9 +118,9 @@ unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
                 core::arch::asm!(
                     "syscall",
                     inlateout("rax") ($number as u64) => ret,
-                    in("rdi") arg1,
-                    in("rsi") arg2,
-                    in("rdx") arg3,
+                    inlateout("rdi") arg1 => _,
+                    inlateout("rsi") arg2 => _,
+                    inlateout("rdx") arg3 => _,
                     lateout("rcx") _,
                     lateout("r11") _,
                     options(preserves_flags),
@@ -126,6 +134,7 @@ unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
         SYSCALL_COMPLETION_SUBMIT => svc!(1),
         SYSCALL_COMPLETION_WAIT => svc!(4),
         SYSCALL_COMPLETION_CLOSE => svc!(6),
+        SYSCALL_COMPLETION_CANCEL => svc!(5),
         SYSCALL_SPAWN_THREAD => svc!(7),
         SYSCALL_THREAD_EXIT => svc!(8),
         SYSCALL_DOMAIN_ABORT => svc!(68),
@@ -142,8 +151,9 @@ unsafe fn syscall(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 
 /// Syscall: spawn a thread pinned to a specific LP.
 #[inline(always)]
-unsafe fn sys_spawn(entry_vaddr: u64, target_lp: u64) -> u64 {
-    unsafe { syscall(SYSCALL_SPAWN_THREAD, entry_vaddr, target_lp, 0) }
+unsafe fn sys_spawn(entry_vaddr: u64, target_lp: u64) -> (u64, u64) {
+    // SAFETY: the caller supplies this domain's executable trampoline.
+    unsafe { syscall_pair(SYSCALL_SPAWN_THREAD, entry_vaddr, target_lp, 0) }
 }
 
 /// Terminate the calling thread; the kernel reaps it and fires any exit
@@ -151,7 +161,14 @@ unsafe fn sys_spawn(entry_vaddr: u64, target_lp: u64) -> u64 {
 #[inline(always)]
 unsafe fn sys_thread_exit() -> ! {
     let _ = unsafe { syscall(SYSCALL_THREAD_EXIT, 0, 0, 0) };
-    unsafe { core::hint::unreachable_unchecked() }
+    // SAFETY: the kernel ABI is terminal. Trap if it is violated rather than
+    // giving the optimizer permission to assume an impossible Rust execution.
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("udf #0", options(noreturn));
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("ud2", options(noreturn));
+    }
 }
 
 /// Syscall: report the calling thread's kernel thread id.
@@ -163,8 +180,10 @@ unsafe fn sys_get_tid() -> u64 {
 /// Register a completion capability that fires when thread `tid` exits.
 /// Returns the capability, or `u64::MAX` when the thread id is invalid.
 #[inline(always)]
-unsafe fn sys_observe_exit(tid: u64) -> u64 {
-    unsafe { syscall(SYSCALL_OBSERVE_THREAD_EXIT, tid, 0, 0) }
+unsafe fn sys_observe_exit(tid: u64, generation: u64) -> u64 {
+    // SAFETY: retain the exact identity returned by SPAWN_THREAD, so a
+    // recycled numeric tid cannot redirect the exit observation.
+    unsafe { syscall(SYSCALL_OBSERVE_THREAD_EXIT, tid, generation, 0) }
 }
 
 /// Block the calling thread until the given completion capability reaches a
@@ -193,7 +212,7 @@ unsafe fn sys_poll(cap: u64) -> (u64, u64) {
             "svc #3",
             lateout("x0") state,
             inlateout("x1") cap => result,
-            options(nostack, nomem, preserves_flags),
+            options(nostack, preserves_flags),
         );
     }
     #[cfg(target_arch = "x86_64")]
@@ -262,6 +281,7 @@ unsafe fn syscall_pair(imm: u16, arg1: u64, arg2: u64, arg3: u64) -> (u64, u64) 
             };
         }
         match imm {
+            SYSCALL_SPAWN_THREAD => pair!(7),
             SYSCALL_MONOTONIC_CLOCK => pair!(79),
             SYSCALL_CQ_WAIT_CHECKED => pair!(88),
             _ => unreachable!(),
@@ -291,6 +311,10 @@ fn abort_wait(reason: CqWaitError) -> ! {
         CqWaitError::InvalidRequest => b"[sitas] invalid CQ wait request\n",
         CqWaitError::InvalidStatus => b"[sitas] invalid CQ wait outcome/clock\n",
     };
+    abort_runtime(message)
+}
+
+fn abort_runtime(message: &[u8]) -> ! {
     // SAFETY: the static diagnostic stays borrowed through the synchronous
     // logging ABI. Domain abort is terminal: do not unwind pending operation
     // owners or turn rejection into a wake that the executor would retry.
@@ -403,17 +427,29 @@ impl CharlotteReactor {
     /// Default constructor: process-wide queue 0 at the canonical ring
     /// address. For single-shard services and the pre-per-shard legacy path.
     pub fn new(lp_id: u32) -> Self {
-        Self {
-            lp_id,
-            ring_vaddr: CQ_RING_VADDR,
-            cq_id: 0,
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = lp_id;
+            panic!("CharlotteReactor requires the CharlotteOS launch mappings");
+        }
+        #[cfg(target_os = "none")]
+        {
+            Self {
+                lp_id,
+                ring_vaddr: CQ_RING_VADDR,
+                cq_id: 0,
+            }
         }
     }
 
     /// Per-shard constructor: the reactor blocks on queue `cq_id` and drains
     /// the ring page at `ring_vaddr`. `lp_id` records the intended core
     /// affinity.
-    pub fn with_cq(lp_id: u32, ring_vaddr: usize, cq_id: u32) -> Self {
+    /// # Safety
+    /// `ring_vaddr` must identify a writable, aligned 4 KiB CQ page mapped by
+    /// CharlotteOS for `cq_id`. The mapping must outlive the reactor and every
+    /// borrowed header. The kernel owns head/entries; userspace owns tail.
+    pub unsafe fn with_cq(lp_id: u32, ring_vaddr: usize, cq_id: u32) -> Self {
         Self {
             lp_id,
             ring_vaddr,
@@ -423,6 +459,8 @@ impl CharlotteReactor {
 
     /// Returns the underlying CQ ring header at the shard's ring address.
     pub fn cq(&self) -> &CqHeader {
+        // SAFETY: `new` uses the canonical Charlotte launch mapping;
+        // `with_cq` requires the same mapping lifetime from its caller.
         unsafe { &*(self.ring_vaddr as *const CqHeader) }
     }
 
@@ -443,10 +481,10 @@ impl CharlotteReactor {
 /// The CQ header is public so userspace code (test binaries) can poll and drain.
 #[repr(C)]
 pub struct CqHeader {
-    head: u32,
-    tail: u32,
-    capacity: u32,
-    overflow: u32,
+    head: AtomicU32,
+    tail: AtomicU32,
+    capacity: AtomicU32,
+    overflow: AtomicU32,
 }
 
 #[repr(C)]
@@ -462,26 +500,36 @@ pub struct CqEntry {
 
 impl CqHeader {
     pub fn pending(&self) -> u32 {
-        let h = unsafe { core::ptr::read_volatile(&self.head) };
-        let t = unsafe { core::ptr::read_volatile(&self.tail) };
-        if h >= t { h - t } else { h + self.capacity - t }
+        let h = self.head.load(Ordering::Acquire);
+        let t = self.tail.load(Ordering::Relaxed);
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        if !(2..=127).contains(&capacity) || h >= capacity || t >= capacity {
+            return 0;
+        }
+        if h >= t { h - t } else { h + capacity - t }
     }
 
     pub fn read_one(&self) -> Option<CqEntry> {
+        let _consumer = CQ_CONSUMER.lock();
         if self.pending() == 0 {
             return None;
         }
-        let t = unsafe { core::ptr::read_volatile(&self.tail) };
+        let t = self.tail.load(Ordering::Relaxed);
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        // SAFETY: constructors establish a full CQ page, and pending checked
+        // the slot index/capacity. The acquire head load observes publication
+        // of this entry; the consumer gate excludes competing tail updates.
         let entry_ptr = unsafe {
             let base = self as *const Self as *const u8;
             let entries_offset = core::mem::offset_of!(Self, overflow) + 4;
             base.add(entries_offset)
                 .add(t as usize * core::mem::size_of::<CqEntry>()) as *const CqEntry
         };
+        // SAFETY: this slot is initialized by the kernel before publishing
+        // head and cannot be reused until our release store advances tail.
         unsafe {
             let entry = core::ptr::read_volatile(entry_ptr);
-            let this = self as *const Self as *mut Self;
-            core::ptr::write_volatile(&raw mut (*this).tail, (t + 1) % self.capacity);
+            self.tail.store((t + 1) % capacity, Ordering::Release);
             Some(entry)
         }
     }
@@ -592,7 +640,7 @@ impl ReactorBackend for CharlotteReactor {
 // ---- ShardRuntime implementation -------------------------------------------
 
 impl ShardRuntime for CharlotteReactor {
-    type JoinHandle<T: Send> = CharlotteJoinHandle<T>;
+    type JoinHandle<T: Send + 'static> = CharlotteJoinHandle<T>;
     type Reactor = CharlotteReactor;
 
     fn spawn_shard<T: Send + 'static>(
@@ -607,7 +655,12 @@ impl ShardRuntime for CharlotteReactor {
         let result = alloc::sync::Arc::new(spin::Mutex::new(None::<T>));
         let result_for_thread = alloc::sync::Arc::clone(&result);
         let entry_vaddr = shard_entry_trampoline as *const () as usize;
-        let tid = unsafe { sys_spawn(entry_vaddr as u64, shard_id.0 as u64) };
+        // SAFETY: the trampoline is executable for this domain; placement
+        // failures are rejected by the kernel before publishing a thread.
+        let (tid, generation) = unsafe { sys_spawn(entry_vaddr as u64, shard_id.0 as u64) };
+        if tid == u64::MAX || generation == 0 {
+            abort_runtime(b"[sitas] shard spawn rejected\n");
+        }
         SHARD_ENTRIES.lock().push((
             tid,
             Box::new(move || {
@@ -617,8 +670,16 @@ impl ShardRuntime for CharlotteReactor {
         ));
         // Observe the spawned thread's exit; the returned capability
         // completes when the kernel reaps the thread.
-        let cap = unsafe { sys_observe_exit(tid) };
-        CharlotteJoinHandle { cap, result }
+        // SAFETY: these are the exact spawn publication identity, not a later
+        // lookup of a recyclable numeric tid.
+        let cap = unsafe { sys_observe_exit(tid, generation) };
+        if cap == u64::MAX {
+            abort_runtime(b"[sitas] shard exit observation rejected\n");
+        }
+        CharlotteJoinHandle {
+            cap: Some(cap),
+            result,
+        }
     }
 
     fn channel<M: Send + 'static>(
@@ -655,7 +716,11 @@ impl ShardRuntime for CharlotteReactor {
         let shard = shard_id.0;
         if base != 0 && shard < count {
             // Per-shard ring: `cq_id = shard + 1`, ring at `base + shard * 4096`.
-            CharlotteReactor::with_cq(shard as u32, base + shard * 4096, (shard as u32) + 1)
+            // SAFETY: the trusted launch config supplies this mapped CQ page
+            // for the domain lifetime and its matching kernel queue id.
+            unsafe {
+                CharlotteReactor::with_cq(shard as u32, base + shard * 4096, (shard as u32) + 1)
+            }
         } else {
             // Fallback for shard counts beyond the pre-allocated rings, or when
             // the loader did not map per-shard CQ pages (legacy single-ring path).
@@ -675,24 +740,55 @@ impl ShardRuntime for CharlotteReactor {
 /// always-error `RawJoinHandle` placeholder: joining is real, and the waiting
 /// side parks in the kernel's completion wait rather than spinning.
 pub struct CharlotteJoinHandle<T> {
-    cap: u64,
+    cap: Option<u64>,
     result: alloc::sync::Arc<spin::Mutex<Option<T>>>,
 }
 
 impl<T> CharlotteJoinHandle<T> {
     /// Returns `true` once the shard thread has exited and been reaped.
     pub fn is_finished(&self) -> bool {
-        let (state, _) = unsafe { sys_poll(self.cap) };
+        // SAFETY: this handle exclusively owns its exit-observation cap.
+        let (state, _) = unsafe { sys_poll(self.cap.expect("live join capability")) };
         state == 0
     }
 
     /// Blocks until the shard thread exits and returns its closure's value.
-    pub fn join(self) -> core::result::Result<T, Box<dyn core::error::Error + Send + Sync>> {
-        unsafe { sys_wait(self.cap) };
-        unsafe { sys_close(self.cap) };
+    pub fn join(mut self) -> core::result::Result<T, Box<dyn core::error::Error + Send + Sync>> {
+        let cap = self.cap.take().expect("live join capability");
+        // SAFETY: retain the exit capability through its terminal wait, then
+        // release it exactly once. Only that wait establishes thread exit.
+        unsafe {
+            sys_wait(cap);
+            sys_close(cap);
+        }
         self.result.lock().take().ok_or_else(|| {
             Box::new(sitas_core::io::ErrorKind::Other) as Box<dyn core::error::Error + Send + Sync>
         })
+    }
+}
+
+impl<T: Send> ShardThread<T> for CharlotteJoinHandle<T> {
+    fn join(self) -> core::result::Result<T, Box<dyn core::error::Error + Send + Sync>> {
+        CharlotteJoinHandle::join(self)
+    }
+    fn is_finished(&self) -> bool {
+        CharlotteJoinHandle::is_finished(self)
+    }
+}
+
+impl<T> Drop for CharlotteJoinHandle<T> {
+    fn drop(&mut self) {
+        if let Some(cap) = self.cap.take() {
+            // SAFETY: cancel only this handle's exit subscription, not the
+            // thread. Its producer terminates the observation on cancellation.
+            // Retain it through terminal wait before closing the capability;
+            // cancellation is not evidence that the thread itself has exited.
+            unsafe {
+                syscall(SYSCALL_COMPLETION_CANCEL, cap, 0, 0);
+                sys_wait(cap);
+                sys_close(cap);
+            }
+        }
     }
 }
 
@@ -773,5 +869,107 @@ mod checked_wait_tests {
             millis: u64::MAX,
         };
         assert_eq!(wide.remaining_at(0), Some(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod cq_tests {
+    use super::*;
+    use alloc::sync::Arc;
+
+    fn ring() -> (Vec<u64>, CharlotteReactor) {
+        let mut page = alloc::vec![0u64; 512];
+        let address = page.as_mut_ptr() as usize;
+        // SAFETY: the allocation is aligned and contains a full writable page.
+        // It stays alive in the caller while the reactor/header is used.
+        unsafe {
+            core::ptr::write(
+                address as *mut CqHeader,
+                CqHeader {
+                    head: AtomicU32::new(0),
+                    tail: AtomicU32::new(0),
+                    capacity: AtomicU32::new(127),
+                    overflow: AtomicU32::new(0),
+                },
+            );
+        }
+        // SAFETY: this fixture supplies the page normally mapped by the loader.
+        let reactor = unsafe { CharlotteReactor::with_cq(0, address, 0) };
+        (page, reactor)
+    }
+
+    #[test]
+    fn cq_layout_matches_kernel_and_release_publishes_entries() {
+        assert_eq!(core::mem::size_of::<CqHeader>(), 16);
+        assert_eq!(core::mem::size_of::<CqEntry>(), 32);
+        let (_page, reactor) = ring();
+        let header = reactor.cq();
+        let entries = (header as *const CqHeader)
+            .cast::<u8>()
+            .wrapping_add(16)
+            .cast_mut()
+            .cast::<CqEntry>();
+        // SAFETY: slot 0 is inside this owned fixture's page, and no consumer
+        // can read it before the release publication below.
+        unsafe {
+            entries.write(CqEntry {
+                operation: 1,
+                cookie: 42,
+                status: 0,
+                flags: 0,
+                result: 7,
+            });
+        }
+        header.head.store(1, Ordering::Release);
+        assert_eq!(header.pending(), 1);
+        let entry = header.read_one().unwrap();
+        assert_eq!((entry.cookie, entry.result), (42, 7));
+        assert_eq!(header.tail.load(Ordering::Acquire), 1);
+        assert!(header.read_one().is_none());
+        header.capacity.store(0, Ordering::Relaxed);
+        assert!(header.read_one().is_none());
+    }
+
+    #[test]
+    fn shared_reactors_consume_each_slot_once() {
+        let (_page, reactor) = ring();
+        let header = reactor.cq();
+        let entries = (header as *const CqHeader)
+            .cast::<u8>()
+            .wrapping_add(16)
+            .cast_mut()
+            .cast::<CqEntry>();
+        for cookie in 0..80 {
+            // SAFETY: these initialized entries fit inside the owned CQ page;
+            // publication and all consumers follow the initialization.
+            unsafe {
+                entries.add(cookie).write(CqEntry {
+                    operation: 0,
+                    cookie: cookie as u64,
+                    status: 0,
+                    flags: 0,
+                    result: 0,
+                });
+            }
+        }
+        header.head.store(80, Ordering::Release);
+        let reactor = Arc::new(reactor);
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let reactor = Arc::clone(&reactor);
+            threads.push(std::thread::spawn(move || {
+                let mut cookies = Vec::new();
+                while let Some(entry) = reactor.cq().read_one() {
+                    cookies.push(entry.cookie);
+                }
+                cookies
+            }));
+        }
+        let mut cookies: Vec<_> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
+        cookies.sort_unstable();
+        assert_eq!(cookies, (0..80).collect::<Vec<_>>());
     }
 }

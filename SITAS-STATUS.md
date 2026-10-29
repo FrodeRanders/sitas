@@ -1,9 +1,9 @@
 # sitas — status
 
-## Current state (restoration complete)
+## Current state (ownership and lifecycle hardening)
 
-The workspace split and the full runtime restoration are both done. All lanes
-build and are validated by `tools/linux-docker.sh`:
+The workspace split and runtime restoration are complete. The runtime remains
+experimental. `tools/linux-docker.sh` covers the host and portable build lanes:
 
 - **`sitas-core` default (`no_std` + `alloc`)** — the CharlotteOS lane:
   `ShardRuntime`, `ReactorBackend`, `ShardExecutor`, ring-buffer channels,
@@ -22,6 +22,32 @@ build and are validated by `tools/linux-docker.sh`:
   path (`kv` over `ShardExecutor`) is tested on Unix hosts.
 - **charlotte-os integration** — `catten-user` builds against this tree with
   `cargo +nightly build --target aarch64-unknown-none.json -Z build-std=core,alloc`.
+
+## Hardening changes
+
+- Shard-local access checks runtime identity as well as shard number before
+  touching non-atomic state. Cross-runtime current-shard access is rejected.
+- The portable queue has safe synchronized storage and normal payload cleanup.
+  Channels handle last-sender and receiver destruction, serialize close against
+  accepted sends, and remove cancelled receive wakers.
+- `ShardRuntime` join handles implement `ShardThread<T>`. Portable KV and the
+  mailbox-index fixture retain and join workers. KV startup failure and worker
+  failure have host regressions through `UnixRuntime`.
+- Both executor loops poll readiness between ready-task batches. Portable
+  `try_run` returns reactor failures instead of spinning.
+- Timed host shutdown returns an owning outcome for unfinished threads. Its
+  `wait()` confirms later termination; dropping it detaches those threads. A
+  stop request never claims to interrupt a running poll.
+- Executor `io_uring` buffers belong to their originating dispatcher until
+  completion. Synchronized result handles support movement and cancellation
+  across threads. Final origin destruction fails pending results safely, and
+  completion draining uses a monotonic deadline rather than an unbounded CQE wait.
+- Charlotte CQ consumption has atomic publication/reuse ordering and serialized
+  readers. Joins retain spawn generations and release abandoned subscriptions.
+  Raw CQ mapping construction is an explicitly unsafe boundary.
+
+See `docs/architecture.md` for the guarantees and limits. These changes do not
+turn host test success or cross-compilation into guest boot qualification.
 
 ## How the restoration was done
 
@@ -46,8 +72,17 @@ build and are validated by `tools/linux-docker.sh`:
 
 ## Remaining known gaps
 
-- `RawJoinHandle::join` on CharlotteOS reports an error (kernel thread
-  lifecycle is cooperative; joining is not implemented).
+- CharlotteOS uses real kernel-backed joins; the placeholder `RawJoinHandle`
+  remains available only for incomplete foreign backends. Thread creation is
+  still infallible in `ShardRuntime`; Charlotte rejects failure by aborting the
+  domain rather than returning a partially started worker set.
+- The portable public queue uses a spin lock for bookkeeping. Its retained ring
+  slot convention provides N - 1 usable entries for capacity N; it is not a
+  lock-free data-plane queue.
+- A timed host shutdown may return running threads. Only joining its outcome
+  confirms their termination; a non-returning poll cannot be safely preempted.
+- Workspace executable profiles abort on panic; panic-catching tests run with
+  unwinding and do not establish per-task isolation in those executables.
 - `ShardRuntime` placement is advisory in `UnixRuntime` (no pinning); CPU
   pinning remains an explicit experiment in `sitas_core::sharded_executor`.
 - The std `sharded_executor` is not generic over `ShardRuntime`; running the
@@ -58,6 +93,21 @@ build and are validated by `tools/linux-docker.sh`:
   yet.
 
 ## Validation
+
+Hardening pass checked on 2026-10-29:
+
+- macOS workspace library/integration tests: **423 passed**; all-target build/test
+  coverage and strict workspace Clippy also passed.
+- Isolated `sitas-core` without default features: **10 passed**.
+- Full `SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh`: passed, including **474**
+  workspace tests (**392** core tests, including **49** `io_uring` tests), strict
+  Clippy, the AArch64 default-lane guard, docs and every scripted example.
+- AArch64 and x86-64 default-lane checks passed locally. The sibling CharlotteOS
+  `catten-user` source also passed a locked Cargo check for `aarch64-unknown-none`
+  with build output isolated under `/private/tmp`.
+- Formatting, documentation generation and whitespace checks passed. No fresh
+  CharlotteOS guest boot was performed; source compatibility is not boot evidence.
+
 
 ```sh
 tools/linux-docker.sh                        # full lane: fmt, clippy, tests, bare-metal guard, doc, examples

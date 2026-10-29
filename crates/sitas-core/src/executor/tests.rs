@@ -2575,3 +2575,35 @@ impl<T> Future for CatchJoinPanic<T> {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn ready_io_progresses_while_another_task_keeps_waking() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    writer.write_all(b"x").unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let (executor, spawner) = executor_and_spawner();
+    let spinner_done = Arc::clone(&done);
+    let spinner_polls = Arc::clone(&polls);
+    spawner
+        .spawn(std::future::poll_fn(move |cx| {
+            let count = spinner_polls.fetch_add(1, Ordering::Relaxed);
+            if spinner_done.load(Ordering::Relaxed) || count == 10000 {
+                std::task::Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }))
+        .unwrap();
+    drop(spawner);
+    executor.run_until(async {
+        readable(reader.as_raw_fd()).await;
+        done.store(true, Ordering::Relaxed);
+    });
+    executor.run();
+    assert!(polls.load(Ordering::Relaxed) < 1000);
+}

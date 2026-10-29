@@ -217,7 +217,7 @@ async fn read_partition_entries_uring(
             read_exact_at_uring(fd, record_offset(next_record), chunk_records * RECORD_SIZE)
                 .await?;
 
-        for (chunk_idx, record_bytes) in buffer.chunks_exact(RECORD_SIZE).enumerate() {
+        for (chunk_idx, record_bytes) in buffer.as_chunks::<RECORD_SIZE>().0.iter().enumerate() {
             let record_idx = next_record + chunk_idx;
             let record = record_from_bytes(record_bytes)?;
             entries.push(IndexEntry {

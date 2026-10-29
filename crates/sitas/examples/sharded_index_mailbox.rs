@@ -218,7 +218,7 @@ async fn scan_and_send(
         let mut buffer = vec![0u8; chunk_records * RECORD_SIZE];
         data.read_exact(&mut buffer)?;
 
-        for (chunk_idx, record_bytes) in buffer.chunks_exact(RECORD_SIZE).enumerate() {
+        for (chunk_idx, record_bytes) in buffer.as_chunks::<RECORD_SIZE>().0.iter().enumerate() {
             let record_idx = next_record + chunk_idx;
             let record = record_from_bytes(record_bytes)?;
             let destination = router.route(&record.key).0;

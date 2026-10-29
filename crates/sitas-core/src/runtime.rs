@@ -432,7 +432,7 @@ impl<H> ShardSet<H> {
     }
 
     pub(crate) fn join_drained(&mut self) -> Result<(), ShardError> {
-        join_all(self.joins.drain(..).collect())
+        join_all(std::mem::take(&mut self.joins))
     }
 
     pub(crate) fn stop_and_join<F>(&mut self, mut stop_one: F) -> Result<(), ShardError>

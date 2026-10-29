@@ -20,7 +20,7 @@ use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use crate::placement::ShardPlacement;
@@ -88,6 +88,24 @@ impl<T> fmt::Debug for ShardJoinHandle<T> {
     }
 }
 
+/// Thread lifecycle contract shared by host and foreign-runtime backends.
+/// A successful join establishes that the entry closure and its destructors
+/// have finished. Dropping a handle may detach; services retain and join it.
+pub trait ShardThread<T>: Send {
+    fn join(self) -> core::result::Result<T, Box<dyn core::error::Error + Send + Sync>>;
+    fn is_finished(&self) -> bool;
+}
+
+impl<T: Send> ShardThread<T> for ShardJoinHandle<T> {
+    fn join(self) -> core::result::Result<T, Box<dyn core::error::Error + Send + Sync>> {
+        ShardJoinHandle::join(self)
+    }
+
+    fn is_finished(&self) -> bool {
+        ShardJoinHandle::is_finished(self)
+    }
+}
+
 /// A raw join handle for no_std targets. This is the placeholder handle for
 /// backends that have not implemented thread joining yet: it never reports
 /// finished and `join` always errors. `sitas-charlotte` does not use it —
@@ -134,6 +152,7 @@ pub fn channel<M: Send + 'static>(capacity: usize) -> ShardChannelResult<M> {
         push_lock: spin::Mutex::new(()),
         recv_waker: spin::Mutex::new(None),
         closed: AtomicBool::new(false),
+        senders: AtomicUsize::new(1),
     });
     Ok((
         ShardSender {
@@ -147,18 +166,26 @@ pub fn channel<M: Send + 'static>(capacity: usize) -> ShardChannelResult<M> {
 /// task's registered waker (taken and invoked on send/close so the receiver's
 /// executor re-polls it), and the closed flag.
 ///
-/// `ShardSender` is cloneable, so a channel is multi-producer: the backing
-/// [`RingBuffer`] is single-producer, and `push_lock` serializes concurrent
-/// producers instead. The receiver side is single-consumer (`ShardReceiver`
-/// is not cloneable), so `pop` needs no lock.
+/// `push_lock` orders send acceptance against closure and receiver destruction.
+/// The ring itself supports concurrent access. No waker or message destructor
+/// is invoked while holding the channel gate.
 struct ChannelShared<M> {
     queue: RingBuffer<M>,
     push_lock: spin::Mutex<()>,
     recv_waker: spin::Mutex<Option<Waker>>,
     closed: AtomicBool,
+    senders: AtomicUsize,
 }
 
 impl<M> ChannelShared<M> {
+    fn close(&self) {
+        {
+            let _guard = self.push_lock.lock();
+            self.closed.store(true, Ordering::Release);
+        }
+        self.wake_receiver();
+    }
+
     fn wake_receiver(&self) {
         let waker = self.recv_waker.lock().take();
         if let Some(waker) = waker {
@@ -180,6 +207,7 @@ impl<M> fmt::Debug for ShardSender<M> {
 
 impl<M> Clone for ShardSender<M> {
     fn clone(&self) -> Self {
+        self.shared.senders.fetch_add(1, Ordering::Relaxed);
         Self {
             shared: Arc::clone(&self.shared),
         }
@@ -188,12 +216,12 @@ impl<M> Clone for ShardSender<M> {
 
 impl<M> ShardSender<M> {
     pub fn try_send(&self, msg: M) -> Result<(), M> {
+        let guard = self.shared.push_lock.lock();
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(msg);
         }
-        let _guard = self.shared.push_lock.lock();
         self.shared.queue.try_push(msg)?;
-        drop(_guard);
+        drop(guard);
         // Re-poll a receiver task parked in `recv().await`.
         self.shared.wake_receiver();
         Ok(())
@@ -203,8 +231,19 @@ impl<M> ShardSender<M> {
     /// drains any queued messages and then resolves to `None`, so closing is
     /// the shutdown signal for a shard's message loop.
     pub fn close(&self) {
-        self.shared.closed.store(true, Ordering::Release);
-        self.shared.wake_receiver();
+        self.shared.close();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
+}
+
+impl<M> Drop for ShardSender<M> {
+    fn drop(&mut self) {
+        if self.shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.close();
+        }
     }
 }
 
@@ -220,6 +259,11 @@ impl<M> fmt::Debug for ShardReceiver<M> {
 }
 
 impl<M> ShardReceiver<M> {
+    /// Whether sends have ended. Already accepted messages may still remain.
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
+    }
+
     pub fn try_recv(&mut self) -> Option<M> {
         self.shared.queue.pop()
     }
@@ -233,6 +277,19 @@ impl<M> ShardReceiver<M> {
     }
 }
 
+impl<M> Drop for ShardReceiver<M> {
+    fn drop(&mut self) {
+        self.shared.close();
+        // Closure holds the send gate, so no later send can enqueue. Drop
+        // payloads outside both the channel gate and the queue lock.
+        while let Some(message) = self.shared.queue.pop() {
+            drop(message);
+        }
+        let waker = self.shared.recv_waker.lock().take();
+        drop(waker);
+    }
+}
+
 /// Future returned by [`ShardReceiver::recv`].
 pub struct Recv<'a, M> {
     receiver: &'a mut ShardReceiver<M>,
@@ -242,7 +299,9 @@ impl<M> Future for Recv<'_, M> {
     type Output = Option<M>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<M>> {
+        let waker = cx.waker().clone();
         let shared = &self.get_mut().receiver.shared;
+        let guard = shared.push_lock.lock();
         if let Some(msg) = shared.queue.pop() {
             return Poll::Ready(Some(msg));
         }
@@ -250,22 +309,25 @@ impl<M> Future for Recv<'_, M> {
         if shared.closed.load(Ordering::Acquire) {
             return Poll::Ready(None);
         }
-        *shared.recv_waker.lock() = Some(cx.waker().clone());
-        // Re-check after registering: a send or close racing the
-        // registration may have missed the waker.
-        if let Some(msg) = shared.queue.pop() {
-            return Poll::Ready(Some(msg));
-        }
-        if shared.closed.load(Ordering::Acquire) {
-            return Poll::Ready(None);
-        }
+        let previous = shared.recv_waker.lock().replace(waker);
+        // Send and close share this gate: publication of the waker closes
+        // the lost-wake window before producers may proceed.
+        drop(guard);
+        drop(previous);
         Poll::Pending
+    }
+}
+
+impl<M> Drop for Recv<'_, M> {
+    fn drop(&mut self) {
+        let waker = self.receiver.shared.recv_waker.lock().take();
+        drop(waker);
     }
 }
 
 /// The OS thread-spawning interface the sharded executor requires.
 pub trait ShardRuntime: Send + Sync {
-    type JoinHandle<T: Send>: Send;
+    type JoinHandle<T: Send + 'static>: ShardThread<T> + 'static;
 
     /// The per-shard reactor this runtime provides (see
     /// [`shard_reactor`](ShardRuntime::shard_reactor)).
@@ -318,4 +380,69 @@ pub trait ShardParker: Send + Sync {
     /// Waking more shards than strictly necessary is permitted (they simply
     /// re-check and re-park).
     fn unpark(&self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::task::Wake;
+
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn last_sender_drop_wakes_receiver_and_drains_before_eof() {
+        let (sender, mut receiver) = channel(3).unwrap();
+        let clone = sender.clone();
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+        let mut recv = receiver.recv();
+        assert_eq!(Pin::new(&mut recv).poll(&mut cx), Poll::Pending);
+        drop(sender);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        assert_eq!(clone.try_send(42), Ok(()));
+        drop(clone);
+        assert_eq!(Pin::new(&mut recv).poll(&mut cx), Poll::Ready(Some(42)));
+        drop(recv);
+        assert_eq!(
+            Pin::new(&mut receiver.recv()).poll(&mut cx),
+            Poll::Ready(None)
+        );
+        assert!(wakes.0.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn dropping_receiver_releases_messages_and_rejects_sends() {
+        let (sender, receiver) = channel(3).unwrap();
+        let value = Arc::new(());
+        assert!(sender.try_send(Arc::clone(&value)).is_ok());
+        assert_eq!(Arc::strong_count(&value), 2);
+        drop(receiver);
+        assert_eq!(Arc::strong_count(&value), 1);
+        assert!(sender.is_closed());
+        assert!(sender.try_send(Arc::clone(&value)).is_err());
+        assert_eq!(Arc::strong_count(&value), 1);
+    }
+
+    #[test]
+    fn cancelled_receive_removes_its_waker() {
+        let (sender, mut receiver) = channel::<usize>(2).unwrap();
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+        let mut recv = receiver.recv();
+        assert_eq!(Pin::new(&mut recv).poll(&mut cx), Poll::Pending);
+        drop(recv);
+        sender.close();
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            Pin::new(&mut receiver.recv()).poll(&mut cx),
+            Poll::Ready(None)
+        );
+    }
 }

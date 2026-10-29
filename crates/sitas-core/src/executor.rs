@@ -201,6 +201,8 @@ impl<R: ReactorBackend<Handle = std::os::unix::io::RawFd>> Executor<R> {
         self.poll_ready_tasks();
         self.scheduler.wake_expired_timers();
         driver::dispatch_available(&self.scheduler);
+        let event = driver::poll_for_event(&self.scheduler, &self.reactor);
+        driver::apply_event(&self.scheduler, event);
     }
 
     fn wait_for_idle_driver_event(&self, context: &str) {
@@ -251,7 +253,11 @@ impl<R: ReactorBackend<Handle = std::os::unix::io::RawFd>> Executor<R> {
 impl<R: ReactorBackend<Handle = std::os::unix::io::RawFd>> Drop for Executor<R> {
     fn drop(&mut self) {
         self.scheduler.close();
-        self.shutdown_io_uring();
+        #[cfg(target_os = "linux")]
+        {
+            let (status, snapshot) = uring::close_current(self.scheduler.id());
+            self.scheduler.record_io_uring_snapshot(status, snapshot);
+        }
     }
 }
 

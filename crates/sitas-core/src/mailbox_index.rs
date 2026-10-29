@@ -31,7 +31,7 @@ use crate::placement::{ShardPlacement, shard_for_hash};
 use crate::reactor_backend::ReactorBackend;
 use crate::shard::ShardId;
 use crate::shard_executor::ShardExecutor;
-use crate::shard_runtime::{ShardParker, ShardReceiver, ShardRuntime, ShardSender};
+use crate::shard_runtime::{ShardParker, ShardReceiver, ShardRuntime, ShardSender, ShardThread};
 
 /// Number of records in the in-memory data set.
 pub const RECORD_COUNT: usize = 1024;
@@ -79,6 +79,7 @@ pub unsafe fn mailbox_index_test<R: ShardRuntime + ?Sized>(runtime: &R, result_p
 /// returns the number of verified index entries.
 fn build_index_with_mailboxes<R: ShardRuntime + ?Sized>(runtime: &R) -> Result<usize, ()> {
     let parker = runtime.parker();
+    let mut joins = Vec::new();
 
     // One typed mailbox per logical assembler. Senders are cloned into the
     // scanner threads; receivers move into the assembler shards.
@@ -100,13 +101,13 @@ fn build_index_with_mailboxes<R: ShardRuntime + ?Sized>(runtime: &R) -> Result<u
         let parker = Arc::clone(&parker);
         let result_sender = result_sender.clone();
         let reactor = runtime.shard_reactor(placement);
-        runtime.spawn_shard(
+        joins.push(runtime.spawn_shard(
             placement,
             ShardPlacement::Sequential,
             Box::new(move || {
                 run_assembler_shard(receiver, parker, result_sender, work_unit, reactor)
             }),
-        );
+        ));
     }
 
     // One producer thread per shard; each routes its partition by key to the
@@ -114,22 +115,39 @@ fn build_index_with_mailboxes<R: ShardRuntime + ?Sized>(runtime: &R) -> Result<u
     for shard_idx in 0..SHARD_COUNT {
         let senders = assembler_senders.clone();
         let parker = Arc::clone(&parker);
-        runtime.spawn_shard(
+        joins.push(runtime.spawn_shard(
             ShardId(shard_idx),
             ShardPlacement::Sequential,
             Box::new(move || run_scanner_shard(senders, parker, shard_idx)),
-        );
+        ));
     }
+    // Only workers retain producers from this point. Worker failure must be
+    // observable as EOF instead of a coordinator-owned sender hiding it.
+    drop(assembler_senders);
+    drop(result_sender);
 
     // Wait for every assembler run, parking (never spinning) between polls.
     let mut runs = Vec::with_capacity(ASSEMBLER_COUNT);
     while runs.len() < ASSEMBLER_COUNT {
         match result_receiver.try_recv() {
             Some(run) => runs.push(run),
+            None if result_receiver.is_closed() => {
+                while let Some(run) = result_receiver.try_recv() {
+                    runs.push(run);
+                }
+                break;
+            }
             None => parker.park(Some(PARK_TIMEOUT)),
         }
     }
 
+    let mut joined = true;
+    for join in joins {
+        joined &= join.join().is_ok();
+    }
+    if !joined {
+        return Err(());
+    }
     verify_runs(&runs)
 }
 
@@ -164,39 +182,49 @@ fn run_scanner_shard(
             key,
             offset: record_idx as u64,
         });
-        if batches[assembler].len() == SEND_BATCH_ENTRIES {
-            send_message(
+        if batches[assembler].len() == SEND_BATCH_ENTRIES
+            && send_message(
                 &senders[assembler],
                 parker.as_ref(),
                 IndexMessage::Entries {
                     from: shard_id,
                     batch: core::mem::take(&mut batches[assembler]),
                 },
-            );
+            )
+            .is_err()
+        {
+            return;
         }
     }
 
     // Flush the trailing partial batches.
     for (assembler, batch) in batches.into_iter().enumerate() {
-        if !batch.is_empty() {
-            send_message(
+        if !batch.is_empty()
+            && send_message(
                 &senders[assembler],
                 parker.as_ref(),
                 IndexMessage::Entries {
                     from: shard_id,
                     batch,
                 },
-            );
+            )
+            .is_err()
+        {
+            return;
         }
     }
 
     // Signal completion to every assembler.
     for sender in &senders {
-        send_message(
+        if send_message(
             sender,
             parker.as_ref(),
             IndexMessage::ProducerDone { from: shard_id },
-        );
+        )
+        .is_err()
+        {
+            return;
+        }
     }
 }
 
@@ -257,11 +285,14 @@ fn send_message(
     sender: &ShardSender<IndexMessage>,
     parker: &dyn ShardParker,
     mut message: IndexMessage,
-) {
+) -> Result<(), ()> {
     loop {
         match sender.try_send(message) {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(returned) => {
+                if sender.is_closed() {
+                    return Err(());
+                }
                 parker.park(Some(SEND_BACKOFF));
                 message = returned;
             }
@@ -276,6 +307,9 @@ fn send_run(sender: &ShardSender<RunResult>, parker: &dyn ShardParker, mut run: 
         match sender.try_send(run) {
             Ok(()) => return,
             Err(returned) => {
+                if sender.is_closed() {
+                    return;
+                }
                 parker.park(Some(SEND_BACKOFF));
                 run = returned;
             }
