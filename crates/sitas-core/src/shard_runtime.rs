@@ -109,7 +109,7 @@ impl<T: Send> ShardThread<T> for ShardJoinHandle<T> {
 /// A raw join handle for no_std targets. This is the placeholder handle for
 /// backends that have not implemented thread joining yet: it never reports
 /// finished and `join` always errors. `sitas-knytos` does not use it —
-/// that backend provides its own kernel-backed `CharlotteJoinHandle`, whose
+/// that backend provides its own kernel-backed `KnytosJoinHandle`, whose
 /// `join` blocks on a completion capability fired when the kernel reaps the
 /// thread.
 #[derive(Debug)]

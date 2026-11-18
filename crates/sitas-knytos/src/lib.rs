@@ -43,10 +43,10 @@ const CQ_RING_VADDR: usize = 0x0000_0000_0001_1000;
 /// The canonical config page (kernel↔user contract).
 const CONFIG_VADDR: usize = 0x0000_0000_0001_0000;
 /// Byte offset in the config page of the per-shard CQ ring base virtual
-/// address (matches `catten_rt::config::SHARD_CQ_BASE_OFFSET`).
+/// address (matches `knytos_rt::config::SHARD_CQ_BASE_OFFSET`).
 const SHARD_CQ_BASE_OFFSET: usize = 2064;
 /// Byte offset of the per-shard CQ ring count
-/// (matches `catten_rt::config::SHARD_CQ_COUNT_OFFSET`).
+/// (matches `knytos_rt::config::SHARD_CQ_COUNT_OFFSET`).
 const SHARD_CQ_COUNT_OFFSET: usize = 2072;
 const SYSCALL_COMPLETION_SUBMIT: u16 = 1;
 const SYSCALL_COMPLETION_POLL: u16 = 3;
@@ -403,7 +403,7 @@ extern "C" fn shard_entry_trampoline() {
     // "returned" trap: if this function simply returned, the thread would
     // re-enter the trampoline forever. Terminate explicitly so the kernel
     // reaps the thread and fires any exit observer registered against it
-    // (this is what makes `CharlotteJoinHandle::join` complete). Never
+    // (this is what makes `KnytosJoinHandle::join` complete). Never
     // returns.
     unsafe { sys_thread_exit() };
 }
@@ -415,7 +415,7 @@ extern "C" fn shard_entry_trampoline() {
 /// that ring's queue id releases it; where they are not (legacy path) the
 /// process-wide default queue 0 is used. All state is in the CQ ring mapped
 /// in the user AS and the per-LP kernel completion table.
-pub struct CharlotteReactor {
+pub struct KnytosReactor {
     lp_id: u32,
     /// The virtual address of this shard's CQ ring page.
     ring_vaddr: usize,
@@ -423,14 +423,14 @@ pub struct CharlotteReactor {
     cq_id: u32,
 }
 
-impl CharlotteReactor {
+impl KnytosReactor {
     /// Default constructor: process-wide queue 0 at the canonical ring
     /// address. For single-shard services and the pre-per-shard legacy path.
     pub fn new(lp_id: u32) -> Self {
         #[cfg(not(target_os = "none"))]
         {
             let _ = lp_id;
-            panic!("CharlotteReactor requires the Knytos launch mappings");
+            panic!("KnytosReactor requires the Knytos launch mappings");
         }
         #[cfg(target_os = "none")]
         {
@@ -585,7 +585,7 @@ impl ReactorEvent for CharlEvent {
     }
 }
 
-impl ReactorBackend for CharlotteReactor {
+impl ReactorBackend for KnytosReactor {
     type Waker = CharlWaker;
     type Handle = u64;
     type Event = CharlEvent;
@@ -639,16 +639,16 @@ impl ReactorBackend for CharlotteReactor {
 
 // ---- ShardRuntime implementation -------------------------------------------
 
-impl ShardRuntime for CharlotteReactor {
-    type JoinHandle<T: Send + 'static> = CharlotteJoinHandle<T>;
-    type Reactor = CharlotteReactor;
+impl ShardRuntime for KnytosReactor {
+    type JoinHandle<T: Send + 'static> = KnytosJoinHandle<T>;
+    type Reactor = KnytosReactor;
 
     fn spawn_shard<T: Send + 'static>(
         &self,
         shard_id: ShardId,
         _placement: sitas_core::placement::ShardPlacement,
         entry: alloc::boxed::Box<dyn FnOnce() -> T + Send>,
-    ) -> CharlotteJoinHandle<T> {
+    ) -> KnytosJoinHandle<T> {
         // The result slot is filled by the shard thread before it terminates;
         // the exit observer fires only after the closure completed, so `join`
         // can read the value without racing the thread.
@@ -676,7 +676,7 @@ impl ShardRuntime for CharlotteReactor {
         if cap == u64::MAX {
             abort_runtime(b"[sitas] shard exit observation rejected\n");
         }
-        CharlotteJoinHandle {
+        KnytosJoinHandle {
             cap: Some(cap),
             result,
         }
@@ -703,15 +703,15 @@ impl ShardRuntime for CharlotteReactor {
 
     fn parker(&self) -> alloc::sync::Arc<dyn ShardParker> {
         // The parker always uses the process-wide default queue (0). The
-        // requester thread (main / catten-user) parks there waiting for
+        // requester thread (main / knytos-user) parks there waiting for
         // replies, and each serving shard's reply code unpark()s CQ 0; only
         // one non-shard waiter exists per process so wake-stealing is not a
         // concern. Cross-shard wakes flow through the executor's TaskWaker →
         // ReactorWaker targeting each shard's own CQ.
-        alloc::sync::Arc::new(CharlotteParker::new(0))
+        alloc::sync::Arc::new(KnytosParker::new(0))
     }
 
-    fn shard_reactor(&self, shard_id: ShardId) -> CharlotteReactor {
+    fn shard_reactor(&self, shard_id: ShardId) -> KnytosReactor {
         let (base, count) = shard_cq_layout();
         let shard = shard_id.0;
         if base != 0 && shard < count {
@@ -719,12 +719,12 @@ impl ShardRuntime for CharlotteReactor {
             // SAFETY: the trusted launch config supplies this mapped CQ page
             // for the domain lifetime and its matching kernel queue id.
             unsafe {
-                CharlotteReactor::with_cq(shard as u32, base + shard * 4096, (shard as u32) + 1)
+                KnytosReactor::with_cq(shard as u32, base + shard * 4096, (shard as u32) + 1)
             }
         } else {
             // Fallback for shard counts beyond the pre-allocated rings, or when
             // the loader did not map per-shard CQ pages (legacy single-ring path).
-            CharlotteReactor::new(shard as u32)
+            KnytosReactor::new(shard as u32)
         }
     }
 }
@@ -739,12 +739,12 @@ impl ShardRuntime for CharlotteReactor {
 /// result slot, which the thread fills before terminating. This replaces the
 /// always-error `RawJoinHandle` placeholder: joining is real, and the waiting
 /// side parks in the kernel's completion wait rather than spinning.
-pub struct CharlotteJoinHandle<T> {
+pub struct KnytosJoinHandle<T> {
     cap: Option<u64>,
     result: alloc::sync::Arc<spin::Mutex<Option<T>>>,
 }
 
-impl<T> CharlotteJoinHandle<T> {
+impl<T> KnytosJoinHandle<T> {
     /// Returns `true` once the shard thread has exited and been reaped.
     pub fn is_finished(&self) -> bool {
         // SAFETY: this handle exclusively owns its exit-observation cap.
@@ -767,16 +767,16 @@ impl<T> CharlotteJoinHandle<T> {
     }
 }
 
-impl<T: Send> ShardThread<T> for CharlotteJoinHandle<T> {
+impl<T: Send> ShardThread<T> for KnytosJoinHandle<T> {
     fn join(self) -> core::result::Result<T, Box<dyn core::error::Error + Send + Sync>> {
-        CharlotteJoinHandle::join(self)
+        KnytosJoinHandle::join(self)
     }
     fn is_finished(&self) -> bool {
-        CharlotteJoinHandle::is_finished(self)
+        KnytosJoinHandle::is_finished(self)
     }
 }
 
-impl<T> Drop for CharlotteJoinHandle<T> {
+impl<T> Drop for KnytosJoinHandle<T> {
     fn drop(&mut self) {
         if let Some(cap) = self.cap.take() {
             // SAFETY: cancel only this handle's exit subscription, not the
@@ -803,11 +803,11 @@ impl<T> Drop for CharlotteJoinHandle<T> {
 /// consumes a shared work-generation cursor, so a competing reader can consume
 /// that generation. Private per-shard reactors use their own rings and can wait
 /// without a timer. Removing this backstop needs a per-waiter wake contract.
-pub struct CharlotteParker {
+pub struct KnytosParker {
     cq_id: u32,
 }
 
-impl CharlotteParker {
+impl KnytosParker {
     pub fn new(cq_id: u32) -> Self {
         Self { cq_id }
     }
@@ -818,7 +818,7 @@ impl CharlotteParker {
 /// cheap (a single kernel wait, no spinning).
 const PARK_INTERVAL_MS: u64 = 5;
 
-impl ShardParker for CharlotteParker {
+impl ShardParker for KnytosParker {
     fn park(&self, timeout: Option<Duration>) {
         let ms = match timeout {
             Some(duration) => u64::try_from(duration.as_millis())
@@ -877,7 +877,7 @@ mod cq_tests {
     use super::*;
     use alloc::sync::Arc;
 
-    fn ring() -> (Vec<u64>, CharlotteReactor) {
+    fn ring() -> (Vec<u64>, KnytosReactor) {
         let mut page = alloc::vec![0u64; 512];
         let address = page.as_mut_ptr() as usize;
         // SAFETY: the allocation is aligned and contains a full writable page.
@@ -894,7 +894,7 @@ mod cq_tests {
             );
         }
         // SAFETY: this fixture supplies the page normally mapped by the loader.
-        let reactor = unsafe { CharlotteReactor::with_cq(0, address, 0) };
+        let reactor = unsafe { KnytosReactor::with_cq(0, address, 0) };
         (page, reactor)
     }
 

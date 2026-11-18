@@ -7,7 +7,7 @@
 //!   channels, parking, and reactors; [`shard_executor::ShardExecutor`] drives
 //!   futures over a [`reactor_backend::ReactorBackend`]; [`kv`] and
 //!   [`basic_kv`] provide the minimal sharded key-value service used by the
-//!   `catten-user` smoke test.
+//!   `knytos-user` smoke test.
 //!
 //! - The **`std` lane** (feature `std`) restores the original host runtime:
 //!   bounded-mailbox sharded services ([`runtime`], [`kv_service`],
@@ -36,7 +36,7 @@ pub mod shard_runtime;
 #[cfg(feature = "std")]
 pub mod async_service;
 #[cfg(feature = "std")]
-pub mod charlotte_abi;
+pub mod knytos_abi;
 #[cfg(feature = "std")]
 pub mod counter;
 #[cfg(feature = "std")]

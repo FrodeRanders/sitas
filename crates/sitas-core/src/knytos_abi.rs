@@ -20,9 +20,9 @@
 //! - bounded, non-lossy backpressure on both submission and completion.
 //!
 //! [`MockKernel`] models the kernel;
-//! [`CharlotteReactor`] is the
-//! [`ReactorBackend`] a `sitas-knytos`
-//! backend would provide. The tests validate the decision-gate claims recorded
+//! [`KnytosReactor`] is the
+//! [`ReactorBackend`] that a `sitas-knytos` backend would provide.
+//! The tests validate the decision-gate claims recorded
 //! in `docs/sitas-runtime-model.md` §11 (Phase 2).
 
 use std::collections::HashMap;
@@ -459,9 +459,9 @@ impl MockKernel {
             .unwrap_or(false)
     }
 
-    /// Builds a [`CharlotteReactor`] bound to `cq` over this kernel.
-    pub fn reactor(&self, cq: CompletionQueueId) -> CharlotteReactor {
-        CharlotteReactor {
+    /// Builds a [`KnytosReactor`] bound to `cq` over this kernel.
+    pub fn reactor(&self, cq: CompletionQueueId) -> KnytosReactor {
+        KnytosReactor {
             kernel: self.clone(),
             cq,
         }
@@ -480,12 +480,12 @@ impl MockKernel {
 /// Satisfies sitas's `ReactorWaker: Clone + Send + Sync`; `wake()` is the
 /// `wake(cq)` syscall (a cross-LP IPI in the real kernel).
 #[derive(Clone)]
-pub struct CharlotteWaker {
+pub struct KnytosWaker {
     kernel: MockKernel,
     cq: CompletionQueueId,
 }
 
-impl ReactorWaker for CharlotteWaker {
+impl ReactorWaker for KnytosWaker {
     fn wake(&self) -> crate::io::Result<()> {
         self.kernel
             .wake(self.cq)
@@ -493,15 +493,15 @@ impl ReactorWaker for CharlotteWaker {
     }
 }
 
-/// The owned result of one [`CharlotteReactor::wait`], reporting whether a wake
+/// The owned result of one [`KnytosReactor::wait`], reporting whether a wake
 /// was drained and which capabilities became ready.
-pub struct CharlotteEvent {
+pub struct KnytosEvent {
     woke: bool,
     readable: Vec<CompletionCap>,
     writable: Vec<CompletionCap>,
 }
 
-impl ReactorEvent for CharlotteEvent {
+impl ReactorEvent for KnytosEvent {
     type Handle = CompletionCap;
 
     fn woke(&self) -> bool {
@@ -528,12 +528,12 @@ impl ReactorEvent for CharlotteEvent {
 /// queue, and the waker is a cross-shard wake. Interests are registered at
 /// submit-time (via [`MockKernel::submit`]), not passed to `wait`, so the
 /// `read`/`write` handle slices are unused — the shard watches its single queue.
-pub struct CharlotteReactor {
+pub struct KnytosReactor {
     kernel: MockKernel,
     cq: CompletionQueueId,
 }
 
-impl CharlotteReactor {
+impl KnytosReactor {
     /// The kernel this reactor's shard belongs to (for submitting work).
     pub fn kernel(&self) -> &MockKernel {
         &self.kernel
@@ -545,13 +545,13 @@ impl CharlotteReactor {
     }
 }
 
-impl ReactorBackend for CharlotteReactor {
-    type Waker = CharlotteWaker;
+impl ReactorBackend for KnytosReactor {
+    type Waker = KnytosWaker;
     type Handle = CompletionCap;
-    type Event = CharlotteEvent;
+    type Event = KnytosEvent;
 
-    fn waker(&self) -> CharlotteWaker {
-        CharlotteWaker {
+    fn waker(&self) -> KnytosWaker {
+        KnytosWaker {
             kernel: self.kernel.clone(),
             cq: self.cq,
         }
@@ -562,14 +562,14 @@ impl ReactorBackend for CharlotteReactor {
         _read: &[CompletionCap],
         _write: &[CompletionCap],
         timeout: Option<Duration>,
-    ) -> crate::io::Result<CharlotteEvent> {
+    ) -> crate::io::Result<KnytosEvent> {
         let deadline = timeout.map(|d| Instant::now() + d);
         self.kernel
             .wait(self.cq, 0, deadline)
             .map_err(|_| crate::io::ErrorKind::NotFound)?;
         let woke = self.kernel.take_woke(self.cq);
         let readable = self.kernel.ready_caps(self.cq);
-        Ok(CharlotteEvent {
+        Ok(KnytosEvent {
             woke,
             readable,
             writable: Vec::new(),

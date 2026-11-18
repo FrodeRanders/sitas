@@ -13,7 +13,7 @@ experimental. `tools/linux-docker.sh` covers the host and portable build lanes:
   monolith): `executor` + `os` (readiness I/O, TCP/UDP, Linux `io_uring`),
   `runtime`, `kv_service`, `counter`, `sharded`, `sharded_executor`,
   `shard_local`, `shard_mailbox`, `sharded_tcp`, `stream_reply`,
-  `async_service`, `metrics`, `running_stats`, `charlotte_abi`. 330+ unit
+  `async_service`, `metrics`, `running_stats`, `knytos_abi`. 330+ unit
   tests.
 - **`crates/sitas`** — the `sitas` facade package: re-exports core with `std`
   and owns all examples and integration tests (`use sitas::...` unchanged).
@@ -88,7 +88,7 @@ turn host test success or cross-compilation into guest boot qualification.
 - The std `sharded_executor` is not generic over `ShardRuntime`; running the
   full shard-per-thread runtime on Knytos is future work layered on
   `ShardExecutor`.
-- `charlotte_abi` (the in-memory ABI reference model) and `sitas-knytos`
+- `knytos_abi` (the in-memory ABI reference model) and `sitas-knytos`
   (the real backend) are validated separately; no combined conformance suite
   yet.
 
@@ -103,7 +103,7 @@ Hardening pass checked on 2026-10-29:
   workspace tests (**392** core tests, including **49** `io_uring` tests), strict
   Clippy, the AArch64 default-lane guard, docs and every scripted example.
 - AArch64 and x86-64 default-lane checks passed locally. The sibling Knytos
-  `catten-user` source also passed a locked Cargo check for `aarch64-unknown-none`
+  `knytos-user` source also passed a locked Cargo check for `aarch64-unknown-none`
   with build output isolated under `/private/tmp`.
 - Formatting, documentation generation and whitespace checks passed. No fresh
   Knytos guest boot was performed; source compatibility is not boot evidence.
