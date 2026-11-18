@@ -20,10 +20,10 @@ The repository is a workspace with four crates:
 
 - **`crates/sitas-core`** — the runtime kernel. Its default build is `no_std` + `alloc` and carries the portable lane used by foreign runtimes: the `ShardRuntime` trait (thread spawn, channels, parking, reactors), the `ReactorBackend` contract, the single-threaded `ShardExecutor`, and the minimal `kv`/`basic_kv` service. The `std` feature (`#![cfg_attr(not(feature = "std"), no_std)]`) additionally compiles the full host runtime: the bounded-mailbox services (`runtime`, `kv_service`, `counter`, `sharded`), the custom async executor with readiness I/O, TCP/UDP and Linux `io_uring` (`executor`, `os`), and the shard-per-thread async runtime (`sharded_executor`, `shard_local`, `shard_mailbox`, `sharded_tcp`).
 - **`crates/sitas`** — the batteries-included host facade (package `sitas`). It re-exports `sitas-core` with `std` enabled and owns the examples and integration tests.
-- **`crates/sitas-unix`** — the Unix `ShardRuntime` backend (`UnixRuntime`): `std::thread` spawn, a `Mutex`/`Condvar` parker, and the portable `OsReactor` per shard. It exists so the exact code path CharlotteOS uses runs and is tested on Linux and macOS hosts.
-- **`crates/sitas-charlotte`** — the CharlotteOS `no_std` backend: `CharlotteReactor` implements `ReactorBackend` and `ShardRuntime` over the kernel's completion-queue syscalls. The `catten-user` binary in the charlotte-os repository links `sitas-core` (default features) plus this crate for the bare-metal `aarch64-unknown-none` target.
+- **`crates/sitas-unix`** — the Unix `ShardRuntime` backend (`UnixRuntime`): `std::thread` spawn, a `Mutex`/`Condvar` parker, and the portable `OsReactor` per shard. It exists so the exact code path Knytos uses runs and is tested on Linux and macOS hosts.
+- **`crates/sitas-knytos`** — the Knytos `no_std` backend: `CharlotteReactor` implements `ReactorBackend` and `ShardRuntime` over the kernel's completion-queue syscalls. The `knytos-user` binary in the knytos repository links `sitas-core` (default features) plus this crate for the bare-metal `aarch64-unknown-none` target.
 
-The two lanes share one contract: `reactor_backend`, `shard_runtime`, `shard`, `placement`, `error`, and the `no_std` services are the frozen surface both backends build on. Code behind the `std` feature must never leak into the default lane; `cargo check -p sitas-core -p sitas-charlotte --target aarch64-unknown-none` guards this in the validation script.
+The two lanes share one contract: `reactor_backend`, `shard_runtime`, `shard`, `placement`, `error`, and the `no_std` services are the frozen surface both backends build on. Code behind the `std` feature must never leak into the default lane; `cargo check -p sitas-core -p sitas-knytos --target aarch64-unknown-none` guards this in the validation script.
 
 ## 1.2 Portable ownership and lifecycle
 
@@ -35,7 +35,7 @@ these handles; KV `shutdown`, `stop`, and best-effort `Drop` close their inbound
 channels and join all started workers, including on partial startup failure.
 Worker failure closes queued reply senders, allowing callers to report failure
 instead of parking forever. Backend thread creation is still infallible at the
-trait boundary: a rejected Charlotte spawn or exit observation aborts the domain.
+trait boundary: a rejected Knytos spawn or exit observation aborts the domain.
 
 Portable channels serialize acceptance against closure. The last sender closes
 the channel, accepted messages drain before EOF, receiver destruction rejects
@@ -553,9 +553,9 @@ The TCP server's `SO_INCOMING_CPU` and kTLS ULP hooks are Linux socket options
 on the readiness-based TCP path. They do not make TCP accept, send, or receive
 completion-based `io_uring` operations.
 
-### CharlotteOS checked CQ waits
+### Knytos checked CQ waits
 
-The Charlotte backend uses runtime ABI 3's checked CQ syscall 88; unchecked
+The Knytos backend uses runtime ABI 3's checked CQ syscall 88; unchecked
 syscalls 12/42 are retired. Its explicit timed flag distinguishes finite
 milliseconds (including the maximum value) from an event-only wait. Ready and
 deadline are separate from waiter admission rejection and invalid requests.
@@ -570,9 +570,9 @@ an entry and release tail after consumption; the kernel producer must preserve
 the corresponding publication/reuse ordering. A short userspace consumer gate
 serializes competing readers, including legacy reactors sharing queue 0. Raw
 `with_cq` construction is unsafe and requires a live, aligned 4 KiB mapping.
-The safe canonical constructor is only usable under the CharlotteOS launch ABI;
+The safe canonical constructor is only usable under the Knytos launch ABI;
 it panics on hosted targets. Thread joins retain the spawn's numeric id AND
-generation, so recycling cannot redirect exit observation. Dropping a Charlotte
+generation, so recycling cannot redirect exit observation. Dropping a Knytos
 join handle cancels and terminally closes its exit subscription, not the worker;
 services use explicit joining when worker termination must be established.
 Public parkers sharing a CQ keep the 5 ms backstop because its shared generation cursor can be consumed by a competing

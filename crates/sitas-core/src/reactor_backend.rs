@@ -195,7 +195,7 @@ mod unix_impls {
 mod tests {
     //! A minimal in-memory backend proving the contract is implementable
     //! without any OS descriptors — the stand-in for a future foreign backend
-    //! (for example a CharlotteOS completion-capability reactor).
+    //! (for example a Knytos completion-capability reactor).
 
     use super::{ReactorBackend, ReactorEvent, ReactorWaker};
     use crate::io;

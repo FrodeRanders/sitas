@@ -315,7 +315,7 @@ crates/sitas-core/src/shard_runtime.rs
 crates/sitas-core/src/shard_executor.rs
 crates/sitas-core/src/mailbox_index.rs
 crates/sitas-unix/src/lib.rs
-crates/sitas-charlotte/src/lib.rs
+crates/sitas-knytos/src/lib.rs
 \end{lstlisting}
 
 \texttt{shard\_runtime.rs} defines the operations each backend must provide.
@@ -323,7 +323,7 @@ The typed channel is multi-producer and single-consumer: cloneable senders are
 serialized before pushing into the ring. \texttt{sitas-unix} implements the
 contract with host threads and a condition variable.
 
-In \texttt{sitas-charlotte}, follow a shard from spawn to join. The backend
+In \texttt{sitas-knytos}, follow a shard from spawn to join. The backend
 stages each closure under the kernel thread id returned by spawn. The new
 thread retrieves only the closure associated with its own id, writes the
 result, exits, and fires the registered exit-observer completion. The join

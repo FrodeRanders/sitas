@@ -5,10 +5,10 @@
 The workspace split and runtime restoration are complete. The runtime remains
 experimental. `tools/linux-docker.sh` covers the host and portable build lanes:
 
-- **`sitas-core` default (`no_std` + `alloc`)** — the CharlotteOS lane:
+- **`sitas-core` default (`no_std` + `alloc`)** — the Knytos lane:
   `ShardRuntime`, `ReactorBackend`, `ShardExecutor`, ring-buffer channels,
   `kv`/`basic_kv`. Guarded by
-  `cargo check -p sitas-core -p sitas-charlotte --target aarch64-unknown-none`.
+  `cargo check -p sitas-core -p sitas-knytos --target aarch64-unknown-none`.
 - **`sitas-core --features std`** — the restored host runtime (the former
   monolith): `executor` + `os` (readiness I/O, TCP/UDP, Linux `io_uring`),
   `runtime`, `kv_service`, `counter`, `sharded`, `sharded_executor`,
@@ -18,9 +18,9 @@ experimental. `tools/linux-docker.sh` covers the host and portable build lanes:
 - **`crates/sitas`** — the `sitas` facade package: re-exports core with `std`
   and owns all examples and integration tests (`use sitas::...` unchanged).
 - **`crates/sitas-unix`** — `UnixRuntime: ShardRuntime` (std threads,
-  `Mutex`/`Condvar` parker, `OsReactor` per shard), so the CharlotteOS code
+  `Mutex`/`Condvar` parker, `OsReactor` per shard), so the Knytos code
   path (`kv` over `ShardExecutor`) is tested on Unix hosts.
-- **charlotte-os integration** — `catten-user` builds against this tree with
+- **knytos integration** — `knytos-user` builds against this tree with
   `cargo +nightly build --target aarch64-unknown-none.json -Z build-std=core,alloc`.
 
 ## Hardening changes
@@ -42,7 +42,7 @@ experimental. `tools/linux-docker.sh` covers the host and portable build lanes:
   completion. Synchronized result handles support movement and cancellation
   across threads. Final origin destruction fails pending results safely, and
   completion draining uses a monotonic deadline rather than an unbounded CQE wait.
-- Charlotte CQ consumption has atomic publication/reuse ordering and serialized
+- Knytos CQ consumption has atomic publication/reuse ordering and serialized
   readers. Joins retain spawn generations and release abandoned subscriptions.
   Raw CQ mapping construction is an explicitly unsafe boundary.
 
@@ -57,7 +57,7 @@ turn host test success or cross-compilation into guest boot qualification.
 - The old monolith modules were transplanted from the pre-split tree
   (`2e30ff5~1` lineage) into `crates/sitas-core` behind the `std` feature.
   The old rich kv service was renamed `kv_service`; the `no_std` `kv` keeps
-  its name and its CharlotteOS callers.
+  its name and its Knytos callers.
 - The monolith's `ReactorBackend` impls were adapted to the `no_std` error
   type (`crate::io::ErrorKind`); `From<std::io::Error>` conversions live in
   `sitas_core::io`.
@@ -65,16 +65,16 @@ turn host test success or cross-compilation into guest boot qualification.
   assigning a `Sharded` into a `ShardSet` field) were removed; the generic
   runtime lane is the `no_std` `kv`, not the std services.
 - `ShardJoinHandle::from_raw` and the `Raw` variant are available in all
-  feature combinations so `sitas-charlotte` survives feature unification with
+  feature combinations so `sitas-knytos` survives feature unification with
   std-enabled builds in one workspace.
 - The root `src/`, `examples/`, `tests/` monolith reference tree was removed;
   examples/tests moved verbatim to `crates/sitas`.
 
 ## Remaining known gaps
 
-- CharlotteOS uses real kernel-backed joins; the placeholder `RawJoinHandle`
+- Knytos uses real kernel-backed joins; the placeholder `RawJoinHandle`
   remains available only for incomplete foreign backends. Thread creation is
-  still infallible in `ShardRuntime`; Charlotte rejects failure by aborting the
+  still infallible in `ShardRuntime`; Knytos rejects failure by aborting the
   domain rather than returning a partially started worker set.
 - The portable public queue uses a spin lock for bookkeeping. Its retained ring
   slot convention provides N - 1 usable entries for capacity N; it is not a
@@ -86,9 +86,9 @@ turn host test success or cross-compilation into guest boot qualification.
 - `ShardRuntime` placement is advisory in `UnixRuntime` (no pinning); CPU
   pinning remains an explicit experiment in `sitas_core::sharded_executor`.
 - The std `sharded_executor` is not generic over `ShardRuntime`; running the
-  full shard-per-thread runtime on CharlotteOS is future work layered on
+  full shard-per-thread runtime on Knytos is future work layered on
   `ShardExecutor`.
-- `charlotte_abi` (the in-memory ABI reference model) and `sitas-charlotte`
+- `charlotte_abi` (the in-memory ABI reference model) and `sitas-knytos`
   (the real backend) are validated separately; no combined conformance suite
   yet.
 
@@ -102,16 +102,16 @@ Hardening pass checked on 2026-10-29:
 - Full `SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh`: passed, including **474**
   workspace tests (**392** core tests, including **49** `io_uring` tests), strict
   Clippy, the AArch64 default-lane guard, docs and every scripted example.
-- AArch64 and x86-64 default-lane checks passed locally. The sibling CharlotteOS
+- AArch64 and x86-64 default-lane checks passed locally. The sibling Knytos
   `catten-user` source also passed a locked Cargo check for `aarch64-unknown-none`
   with build output isolated under `/private/tmp`.
 - Formatting, documentation generation and whitespace checks passed. No fresh
-  CharlotteOS guest boot was performed; source compatibility is not boot evidence.
+  Knytos guest boot was performed; source compatibility is not boot evidence.
 
 
 ```sh
 tools/linux-docker.sh                        # full lane: fmt, clippy, tests, bare-metal guard, doc, examples
 SITAS_DOCKER_IO_URING=1 tools/linux-docker.sh sh -c \
   'cargo test -p sitas-core --features std uring && cargo run -p sitas --example os_uring'
-cargo check -p sitas-core -p sitas-charlotte --target aarch64-unknown-none
+cargo check -p sitas-core -p sitas-knytos --target aarch64-unknown-none
 ```

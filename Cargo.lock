@@ -26,17 +26,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "sitas-charlotte"
+name = "sitas-core"
 version = "0.2.0"
 dependencies = [
- "sitas-core",
  "spin",
 ]
 
 [[package]]
-name = "sitas-core"
+name = "sitas-knytos"
 version = "0.2.0"
 dependencies = [
+ "sitas-core",
  "spin",
 ]
 

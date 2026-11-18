@@ -31,11 +31,11 @@
 //! The `no_std` + `alloc` lane of [`sitas_core`] (the [`kv`],
 //! [`shard_executor`], [`shard_runtime`], and [`reactor_backend`] modules)
 //! is re-exported unchanged; it is the surface foreign runtimes such as
-//! CharlotteOS build against.
+//! Knytos build against.
 //!
 //! The host Unix backend is re-exported as [`UnixRuntime`]: the same
 //! `sitas-core` service code runs on Linux and macOS through it, and on
-//! CharlotteOS through the `sitas-charlotte` kernel-syscall backend.
+//! Knytos through the `sitas-knytos` kernel-syscall backend.
 
 pub use sitas_core::*;
 

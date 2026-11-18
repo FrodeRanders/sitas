@@ -1,7 +1,7 @@
 //! # ShardRuntime trait — OS-thread abstraction for the sharded executor.
 //!
 //! The sharded executor spawns one OS thread per shard. On Unix this delegates
-//! to `std::thread::spawn`; on `no_std` targets (CharlotteOS) it delegates to
+//! to `std::thread::spawn`; on `no_std` targets (Knytos) it delegates to
 //! the kernel's `spawn_thread` via SVC. This trait is the seam.
 //!
 //! ## Design
@@ -51,7 +51,7 @@ impl<T> ShardJoinHandle<T> {
     }
 
     /// Wraps a raw (foreign-runtime) join handle. Always available so that
-    /// `no_std` backends such as `sitas-charlotte` keep compiling when a
+    /// `no_std` backends such as `sitas-knytos` keep compiling when a
     /// std-enabled `sitas-core` is unified into the same build graph.
     pub fn from_raw(handle: RawJoinHandle) -> Self {
         Self {
@@ -108,7 +108,7 @@ impl<T: Send> ShardThread<T> for ShardJoinHandle<T> {
 
 /// A raw join handle for no_std targets. This is the placeholder handle for
 /// backends that have not implemented thread joining yet: it never reports
-/// finished and `join` always errors. `sitas-charlotte` does not use it —
+/// finished and `join` always errors. `sitas-knytos` does not use it —
 /// that backend provides its own kernel-backed `CharlotteJoinHandle`, whose
 /// `join` blocks on a completion capability fired when the kernel reaps the
 /// thread.
@@ -355,7 +355,7 @@ pub trait ShardRuntime: Send + Sync {
 
     /// Construct the reactor a shard's executor blocks on. Each shard owns
     /// one reactor (one wait point, §7 of the co-designed architecture); on
-    /// CharlotteOS this is the completion-queue reactor for that shard's LP.
+    /// Knytos this is the completion-queue reactor for that shard's LP.
     fn shard_reactor(&self, shard_id: ShardId) -> Self::Reactor;
 }
 

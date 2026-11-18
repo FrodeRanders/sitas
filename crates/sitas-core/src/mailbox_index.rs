@@ -60,7 +60,7 @@ const PARK_TIMEOUT: Duration = Duration::from_millis(5);
 /// Park interval a producer sleeps before retrying a full mailbox.
 const SEND_BACKOFF: Duration = Duration::from_millis(1);
 
-/// Runs the CharlotteOS mailbox index demo and writes its result to
+/// Runs the Knytos mailbox index demo and writes its result to
 /// `result_page` (the verified record count, or [`FAILURE_SENTINEL`]).
 ///
 /// # Safety

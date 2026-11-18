@@ -1,8 +1,8 @@
 [package]
-name = "sitas-charlotte"
+name = "sitas-knytos"
 version = "0.2.0"
 edition = "2024"
-description = "sitas CharlotteOS backend (kernel syscall ABI)"
+description = "Sitas Knytos backend (kernel syscall ABI)"
 license = "MIT"
 repository = "https://github.com/FrodeRanders/sitas"
 

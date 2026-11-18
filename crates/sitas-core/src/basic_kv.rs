@@ -1,4 +1,4 @@
-//! basic_kv on CharlotteOS — exercises sitas ShardedKv via ShardRuntime.
+//! basic_kv on Knytos — exercises sitas ShardedKv via ShardRuntime.
 //!
 //! Creates a single-shard KV using the given runtime, sets three keys, reads
 //! one back, and writes the result count to the result page.
@@ -8,7 +8,7 @@ use core::ptr;
 use crate::kv::{ShardedKv, ShardedKvConfig};
 use crate::shard_runtime::ShardRuntime;
 
-/// Runs the CharlotteOS KV smoke test and writes its result to `result_page`.
+/// Runs the Knytos KV smoke test and writes its result to `result_page`.
 ///
 /// # Safety
 ///

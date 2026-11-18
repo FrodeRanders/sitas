@@ -14,7 +14,7 @@
 
     \item[Shard runtime] The portable \texttt{no\_std} contract for spawning
         shard threads, creating typed channels, parking, and constructing a
-        reactor for each shard. Unix and CharlotteOS provide separate
+        reactor for each shard. Unix and Knytos provide separate
         implementations.
 
     \item[Reactor backend] The portable interface through which a shard
@@ -60,7 +60,7 @@
         also aborts the underlying task.
 
     \item[Shard thread join handle] A backend-provided blocking join for a
-        shard thread. The Unix backend uses a thread join. CharlotteOS waits on
+        shard thread. The Unix backend uses a thread join. Knytos waits on
         a kernel exit-observer completion and returns the closure result.
 
     \item[Task scope] A structured owner for child tasks. It gives a group of

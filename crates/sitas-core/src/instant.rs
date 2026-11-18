@@ -1,6 +1,6 @@
 //! Polyfill for `std::time::Instant` — not available in `core`.
 //! Uses a monotonically increasing counter (atomically). On a real backend
-//! (e.g. the CharlotteOS kernel), `Instant` would be provided by the kernel.
+//! (e.g. the Knytos kernel), `Instant` would be provided by the kernel.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;

@@ -3,7 +3,7 @@
 //! The crate has two lanes:
 //!
 //! - The default **`no_std` + `alloc` lane** used by foreign runtimes such as
-//!   CharlotteOS: [`shard_runtime::ShardRuntime`] abstracts thread spawn,
+//!   Knytos: [`shard_runtime::ShardRuntime`] abstracts thread spawn,
 //!   channels, parking, and reactors; [`shard_executor::ShardExecutor`] drives
 //!   futures over a [`reactor_backend::ReactorBackend`]; [`kv`] and
 //!   [`basic_kv`] provide the minimal sharded key-value service used by the

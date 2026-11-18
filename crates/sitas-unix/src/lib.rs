@@ -5,11 +5,11 @@
 //! a `Mutex`/`Condvar` parker for requester blocking, and the portable
 //! [`OsReactor`] (`epoll`/`kqueue`/`poll`) as the per-shard reactor.
 //!
-//! This is the host-platform mirror of `sitas-charlotte`: the same
+//! This is the host-platform mirror of `sitas-knytos`: the same
 //! `sitas-core` service code (for example [`sitas_core::kv::ShardedKv`])
 //! runs unmodified on Linux and macOS through this backend and on
-//! CharlotteOS through the kernel-syscall backend. That makes the
-//! CharlotteOS code path testable with plain `cargo test` on a Unix host.
+//! Knytos through the kernel-syscall backend. That makes the
+//! Knytos code path testable with plain `cargo test` on a Unix host.
 
 use std::sync::{Condvar, Mutex};
 
@@ -26,7 +26,7 @@ use std::time::Duration;
 /// A [`ShardRuntime`] backed by `std::thread` and [`OsReactor`].
 ///
 /// All parkers handed out by [`ShardRuntime::parker`] share one wake channel,
-/// mirroring the process-wide completion-queue wake used by the CharlotteOS
+/// mirroring the process-wide completion-queue wake used by the Knytos
 /// backend.
 #[derive(Debug, Clone)]
 pub struct UnixRuntime {

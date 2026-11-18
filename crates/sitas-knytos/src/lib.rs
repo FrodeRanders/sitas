@@ -1,8 +1,8 @@
-//! sitas-charlotte: CharlotteOS backend for the sitas shard-per-core runtime.
+//! sitas-knytos: Knytos backend for the sitas shard-per-core runtime.
 //!
 //! Implements the `ReactorBackend` and `ShardRuntime` traits against the
-//! CharlotteOS kernel's async syscall ABI. This is the runtime that actually
-//! runs sitas's executor on CharlotteOS.
+//! Knytos kernel's async syscall ABI. This is the runtime that actually
+//! runs sitas's executor on Knytos.
 //!
 //! ## Design
 //!
@@ -430,7 +430,7 @@ impl CharlotteReactor {
         #[cfg(not(target_os = "none"))]
         {
             let _ = lp_id;
-            panic!("CharlotteReactor requires the CharlotteOS launch mappings");
+            panic!("CharlotteReactor requires the Knytos launch mappings");
         }
         #[cfg(target_os = "none")]
         {
@@ -447,7 +447,7 @@ impl CharlotteReactor {
     /// affinity.
     /// # Safety
     /// `ring_vaddr` must identify a writable, aligned 4 KiB CQ page mapped by
-    /// CharlotteOS for `cq_id`. The mapping must outlive the reactor and every
+    /// Knytos for `cq_id`. The mapping must outlive the reactor and every
     /// borrowed header. The kernel owns head/entries; userspace owns tail.
     pub unsafe fn with_cq(lp_id: u32, ring_vaddr: usize, cq_id: u32) -> Self {
         Self {
@@ -459,7 +459,7 @@ impl CharlotteReactor {
 
     /// Returns the underlying CQ ring header at the shard's ring address.
     pub fn cq(&self) -> &CqHeader {
-        // SAFETY: `new` uses the canonical Charlotte launch mapping;
+        // SAFETY: `new` uses the canonical Knytos launch mapping;
         // `with_cq` requires the same mapping lifetime from its caller.
         unsafe { &*(self.ring_vaddr as *const CqHeader) }
     }
@@ -731,7 +731,7 @@ impl ShardRuntime for CharlotteReactor {
 
 // ---- join handles -----------------------------------------------------------
 
-/// A kernel-backed join handle for a CharlotteOS shard thread.
+/// A kernel-backed join handle for a Knytos shard thread.
 ///
 /// `join` blocks on a completion capability that fires when the kernel reaps
 /// the thread (the exit observer registered by `SPAWN_THREAD` + a dedicated

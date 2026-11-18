@@ -1,7 +1,7 @@
 //! Minimal per-shard futures executor driven by a [`ReactorBackend`].
 //!
 //! This is the sitas-side half of the co-designed unified shard wait
-//! (CharlotteOS architecture doc §7): one executor runs one shard's tasks,
+//! (Knytos architecture doc §7): one executor runs one shard's tasks,
 //! and when nothing is runnable the shard blocks in a single reactor wait.
 //! The loop is:
 //!
@@ -94,7 +94,7 @@ impl<W: ReactorWaker + 'static> Wake for TaskWaker<W> {
 }
 
 /// Tasks waiting for an I/O handle (a drained completion-queue cookie on
-/// CharlotteOS, a readable descriptor on Unix) register here; the run loop
+/// Knytos, a readable descriptor on Unix) register here; the run loop
 /// wakes them when [`ReactorBackend::wait`] reports the handle ready.
 pub struct IoInterests<H> {
     interests: Mutex<Vec<(H, Waker)>>,

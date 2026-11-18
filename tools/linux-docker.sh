@@ -27,7 +27,7 @@ if [ "$#" -eq 0 ]; then
         cargo clippy -p sitas-core --features std --all-targets -- -D warnings
         cargo test
         cargo test -p sitas-core --features std
-        cargo check -p sitas-core -p sitas-charlotte --target aarch64-unknown-none
+        cargo check -p sitas-core -p sitas-knytos --target aarch64-unknown-none
         cargo doc --no-deps
         cargo run -p sitas --example basic_kv
         cargo run -p sitas --example concurrent_kv

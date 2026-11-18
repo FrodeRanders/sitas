@@ -1,7 +1,7 @@
-//! Reference model of the CharlotteOS async syscall / completion-capability ABI.
+//! Reference model of the Knytos async syscall / completion-capability ABI.
 //!
 //! This module is the sitas-side *executable specification* of the ABI drafted
-//! in the CharlotteOS repository (`docs/async-syscall-abi.md`, Option C). It is
+//! in the Knytos repository (`docs/async-syscall-abi.md`, Option C). It is
 //! not a Unix backend and it talks to no kernel: it is an in-memory model of the
 //! kernel's completion machinery, written so that sitas's reactor contract
 //! ([`crate::reactor_backend`]) can be implemented against it with
@@ -21,7 +21,7 @@
 //!
 //! [`MockKernel`] models the kernel;
 //! [`CharlotteReactor`] is the
-//! [`ReactorBackend`] a `sitas-charlotte`
+//! [`ReactorBackend`] a `sitas-knytos`
 //! backend would provide. The tests validate the decision-gate claims recorded
 //! in `docs/sitas-runtime-model.md` §11 (Phase 2).
 
@@ -34,7 +34,7 @@ use crate::reactor_backend::{ReactorBackend, ReactorEvent, ReactorWaker};
 
 /// A per-address-space handle naming an in-flight or completed async operation.
 ///
-/// This is the CharlotteOS realization of the reactor backend's associated
+/// This is the Knytos realization of the reactor backend's associated
 /// `Handle` type (see [`ReactorBackend`]):
 /// the value that crosses the syscall boundary and identifies a waitable
 /// interest, backed in the kernel by an object implementing its `Observable`
@@ -193,7 +193,7 @@ impl Default for MockKernelConfig {
     }
 }
 
-/// An in-memory model of the CharlotteOS completion machinery, shared (cloneably)
+/// An in-memory model of the Knytos completion machinery, shared (cloneably)
 /// across the shards of one modelled address space.
 ///
 /// Cloning shares the same underlying kernel state, so a waker cloned onto
@@ -520,7 +520,7 @@ impl ReactorEvent for CharlotteEvent {
     }
 }
 
-/// The [`ReactorBackend`] a `sitas-charlotte` backend would provide: one shard's
+/// The [`ReactorBackend`] a `sitas-knytos` backend would provide: one shard's
 /// view of the modelled kernel.
 ///
 /// This is the concrete rendering of the sketch in `docs/async-syscall-abi.md`
@@ -730,7 +730,7 @@ mod tests {
         handle.join().unwrap();
     }
 
-    /// Proves a consumer can drive the CharlotteOS reactor purely through the
+    /// Proves a consumer can drive the Knytos reactor purely through the
     /// [`ReactorBackend`] contract with `Handle = CompletionCap`, exactly as the
     /// executor relies on `OsReactor` today — the Option-C shape validation.
     fn drive_through_contract<B>(reactor: &B)
@@ -751,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn charlotte_reactor_satisfies_reactor_backend_contract() {
+    fn knytos_reactor_satisfies_reactor_backend_contract() {
         let k = kernel();
         let cq = k.register_shard(16);
         let reactor = k.reactor(cq);

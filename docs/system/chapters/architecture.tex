@@ -38,7 +38,7 @@ The repository contains four crates:
         \texttt{ShardRuntime}, using threads, a condition-variable parker, and
         the host reactor. It exercises the portable runtime contract on Linux
         and macOS.
-    \item[\texttt{sitas-charlotte}] The CharlotteOS backend. It implements the
+    \item[\texttt{sitas-knytos}] The Knytos backend. It implements the
         same contract with kernel thread and completion-queue syscalls for the
         bare-metal AArch64 target.
 \end{description}
@@ -218,7 +218,7 @@ serialized around the single-producer ring's push operation; the receiver can
 therefore pop without a second queue lock. This synchronization belongs to the
 transport boundary, not application service state.
 
-CharlotteOS shard joins use a kernel completion capability registered against
+Knytos shard joins use a kernel completion capability registered against
 the spawned thread. Each staged closure is keyed by the kernel thread id, so a
 thread cannot execute another spawn's closure when scheduling order differs
 from creation order. The closure stores its result before exiting; the kernel
