@@ -1,11 +1,11 @@
 [package]
 name = "sitas-knytos"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Sitas Knytos backend (kernel syscall ABI)"
 license = "MIT"
 repository = "https://github.com/FrodeRanders/sitas"
 
 [dependencies]
-sitas-core = { version = "0.2.0", path = "../sitas-core" }
-spin = "0.9"
+sitas-core = { version = "0.2.1", path = "../sitas-core" }
+spin = "0.12.3"
