@@ -718,9 +718,7 @@ impl ShardRuntime for KnytosReactor {
             // Per-shard ring: `cq_id = shard + 1`, ring at `base + shard * 4096`.
             // SAFETY: the trusted launch config supplies this mapped CQ page
             // for the domain lifetime and its matching kernel queue id.
-            unsafe {
-                KnytosReactor::with_cq(shard as u32, base + shard * 4096, (shard as u32) + 1)
-            }
+            unsafe { KnytosReactor::with_cq(shard as u32, base + shard * 4096, (shard as u32) + 1) }
         } else {
             // Fallback for shard counts beyond the pre-allocated rings, or when
             // the loader did not map per-shard CQ pages (legacy single-ring path).

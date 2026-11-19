@@ -36,11 +36,11 @@ pub mod shard_runtime;
 #[cfg(feature = "std")]
 pub mod async_service;
 #[cfg(feature = "std")]
-pub mod knytos_abi;
-#[cfg(feature = "std")]
 pub mod counter;
 #[cfg(feature = "std")]
 pub mod executor;
+#[cfg(feature = "std")]
+pub mod knytos_abi;
 #[cfg(feature = "std")]
 pub mod kv_service;
 #[cfg(feature = "std")]

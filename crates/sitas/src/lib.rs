@@ -40,7 +40,7 @@
 pub use sitas_core::*;
 
 pub use sitas_core::{
-    async_service, basic_kv, knytos_abi, counter, error, executor, instant, io, kv, kv_service,
+    async_service, basic_kv, counter, error, executor, instant, io, knytos_abi, kv, kv_service,
     metrics, placement, reactor_backend, ringbuf, running_stats, runtime, shard, shard_executor,
     shard_local, shard_mailbox, shard_runtime, sharded, sharded_executor, stream_reply,
 };
